@@ -36,8 +36,8 @@ The optional CUDA [GDN prefill adapter](DETAILS.md#strata-poly-chunked-gdn-prefi
 ### Groot 19B-A3B 261023 (not yet hardware validated)
 
 `python setup.py --family groot` offers the same setup questions as Tiel Coder and Qwen3.6: choose one of Bartowski's
-20 quantizations (6.7 to 20.2 GB, Q4_K_M by default) and the optional 0.9 GB image projector through the existing
-`qwen35moe` path. Their tensor headers match
+three quantizations (Q4_K_M by default, Q6_K or Q8_0, 12.5 to 20.2 GB) and the optional 0.9 GB image projector
+through the existing `qwen35moe` path. Their tensor headers match
 that backend; real inference, tool calls, images and memory peaks still need validation. The shared context menu
 offers 8K, 32K (default), 64K and 128K; `--context` overrides it. The engine detects the embedded MTP block normally.
 Hardware-aware expert caching, CPU experts, parallel requests and multi-GPU settings use the shared paths, not a

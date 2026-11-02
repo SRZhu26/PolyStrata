@@ -17,9 +17,7 @@ from tools import test_setup_glm as glm_tests
 FILE = "GrootTeam_Groot-19B-A3B-261023-Q4_K_M.gguf"
 PROJECTOR = "mmproj-GrootTeam_Groot-19B-A3B-261023-bf16.gguf"
 REV = "0025df0d03fb385344394f4e5afd73ce47da0680"
-QUANTS = ("Q4_K_M", "IQ2_S", "IQ2_M", "Q2_K", "IQ3_XXS", "Q3_K_S", "IQ3_XS", "Q3_K_M", "Q3_K_L",
-          "IQ3_M", "IQ4_XS", "Q4_K_S", "IQ4_NL", "Q4_K_L", "Q5_K_S", "Q5_K_M", "Q6_K_S", "Q6_K",
-          "Q6_K_L", "Q8_0")
+QUANTS = ("Q4_K_M", "Q6_K", "Q8_0")
 
 
 class Pins(unittest.TestCase):
@@ -69,9 +67,9 @@ class Pins(unittest.TestCase):
     def test_default_and_low_ram_selection(self):
         sizes = setup.family_models("groot")
         self.assertEqual(setup.poly_default(sizes, 32.0, 8.0), "Q4_K_M")
-        self.assertEqual(setup.poly_default(sizes, 12.0, 8.0), "IQ2_S")
-        self.assertEqual(setup.poly_default(sizes, 4.0, 8.0), "IQ2_S")
-        self.assertLess(setup.poly_ram_need(sizes["IQ2_S"], 8.0),
+        self.assertEqual(setup.poly_default(sizes, 24.0, 8.0), "Q4_K_M")
+        self.assertEqual(setup.poly_default(sizes, 4.0, 8.0), "Q4_K_M")   # nothing fits: the smallest
+        self.assertLess(setup.poly_ram_need(sizes["Q4_K_M"], 8.0),
                         setup.poly_ram_need(sizes["Q8_0"], 8.0))
 
     def test_choices_round_trip(self):
