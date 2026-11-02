@@ -414,6 +414,19 @@ class Install(FakeRoot):
                              ("groot", "Q4_K_M", context or 32768, "cpu"))
             self.assertIn("--vision cpu", plan["setup_command"])
 
+    def test_groot_quantization_choices(self):
+        card = {**FAKE_HW["gpus"][0], "vram_gb": 8.0}
+        self.strata._hardware = lambda: {**FAKE_HW, "ram_gb": 32.0, "gpus": [card]}
+        for model, download in (("IQ2_S", 6.7), ("Q3_K_M", 9.6), ("Q6_K", 16.8), ("Q8_0", 20.2)):
+            res, err = self.call("strata_install", {"family": "groot", "model": model})
+            self.assertFalse(err, res)
+            self.assertEqual((res["plan"]["model"], res["plan"]["download_gb"]), (model, download))
+        res, err = self.call("strata_models", {})
+        self.assertFalse(err, res)
+        groot = next(f for f in res["families"] if f["family"] == "groot")
+        self.assertEqual(len(groot["sizes"]), 20)
+        self.assertEqual(groot["sizes"][0]["model"], "Q4_K_M")
+
     def test_a_family_with_sizes_of_its_own(self):
         """Qwen3.6, Ornith 1.5 and Gemma 4: three sizes each, two families' of the same names; a 32 GB PC with an
         8 GB card."""

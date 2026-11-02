@@ -94,7 +94,7 @@ HF_REVISIONS = {
     "Diffuspace/Clover-35B-A3B-Preview": "4b0402b65e523d0183a14c431955438714cb16ff",                     # 2026-10-28
     "unsloth/Ornith-1.5-122B-GGUF": "3842d003341507c216295c6f28dfcd30349925c6",                          # 2026-10-20
     "ornith-ai/Ornith-1.5-122B": "dfa07bab90e90746ffbfc0b0cba3126eb9265de2",                              # 2026-10-20
-    "GrootTeam/Groot-19B-A3B-261023-GGUF": "2fa1ec958e3bbf7312cf0af97802ff26bfdc5260",
+    "bartowski/GrootTeam_Groot-19B-A3B-261023-GGUF": "0025df0d03fb385344394f4e5afd73ce47da0680",
 }
 
 
@@ -623,22 +623,120 @@ FAMILIES = {
                            (28634017760, "de2fac5230621125f0309046175a17f8cc554ee2fc2a199c0e6528f2e4aadd79"),
                            "Kolibri-1-Q3_K_M.gguf":
                            (37523996640, "b797de9cebb5f8b6e12e32a57c76776c83c2c077e6804fa4835aa6ab5e9e79da")}},
-    "groot": {"title": "Groot 19B-A3B 261023", "by": "GrootTeam",
-              "about": "experimental qwen35moe on strata-poly; Q4_K_M, 11.7 GB; hardware validation pending",
-              "hf": hf("GrootTeam/Groot-19B-A3B-261023-GGUF"), "file": "Groot-19B-A3B-261023-{q}.gguf",
+    "groot": {"title": "Groot 19B-A3B 261023", "by": "GrootTeam; quantized by bartowski",
+              "about": "experimental qwen35moe on strata-poly; 20 sizes, 6.7 to 20.2 GB; hardware validation pending",
+              "hf": hf("bartowski/GrootTeam_Groot-19B-A3B-261023-GGUF"),
+              "file": "GrootTeam_Groot-19B-A3B-261023-{q}.gguf",
               "shards": 1, "tag": "groot-", "name": "groot-19b-a3b-261023", "engine": "poly",
+              "pack_tag": "groot-bartowski-",
               "vision": True, "experimental": True, "unverified": True, "row_bytes": 22528,
-              "mmproj_hf": hf("GrootTeam/Groot-19B-A3B-261023-GGUF"),
-              "mmproj": "mmproj-Groot-19B-A3B-261023-BF16.gguf", "vision_gb": 0.9, "vision_vram_gb": 1.6,
-              # Expert bytes from the pinned tensor directory; 4 GiB beside them is a conservative budget,
-              # not a measurement: 1.52 GiB of other weights plus recurrent state, KV rows and scratch.
-              "models": {"Q4_K_M": {"about": "4-bit GGUF, its draft block in the file",
-                                    "download_gb": 11.7, "ram_gb": 16, "arena_gb": 10.012852224,
-                                    "vram_beside_gb": 4.0, "memory_estimate": True, "draft": "own"}},
-              "sha256": {"Groot-19B-A3B-261023-Q4_K_M.gguf":
-                         (11657618560, "0716cae1f19a39a786a463f7b8c068d50b3d7a74532fce73e5ea23ed98130796"),
-                         "mmproj-Groot-19B-A3B-261023-BF16.gguf":
-                         (902822016, "05a5c8a279b2589306824864d76d663063ba69ff1f399e6a283fae988fdff360")}},
+              "mmproj_hf": hf("bartowski/GrootTeam_Groot-19B-A3B-261023-GGUF"),
+              "mmproj": "mmproj-GrootTeam_Groot-19B-A3B-261023-bf16.gguf", "vision_gb": 0.9, "vision_vram_gb": 1.6,
+              # Expert bytes come from each pinned tensor directory. VRAM beside them is the other weights
+              # plus a 2.5 GiB budget for state, 32K KV rows and scratch, rounded up to 0.1 GiB; not measured.
+              # Q4_0/Q4_1 contain type-3 experts and BF16 type-30 experts, outside the native GPU cache path.
+              "models": {"Q4_K_M": {"about": "4-bit mixed precision; the default, with embedded MTP",
+                                    "download_gb": 12.5, "ram_gb": 17, "arena_gb": 9.937354752,
+                                    "vram_beside_gb": 4.9, "memory_estimate": True, "draft": "own"},
+                         "IQ2_S": {"about": "2-bit i-quant; the smallest download, with embedded MTP",
+                                   "download_gb": 6.7, "ram_gb": 11, "arena_gb": 5.192548352,
+                                   "vram_beside_gb": 4.0, "memory_estimate": True, "draft": "own"},
+                         "IQ2_M": {"about": "2-bit mixed i-quant, with embedded MTP",
+                                   "download_gb": 7.3, "ram_gb": 11, "arena_gb": 5.6885248,
+                                   "vram_beside_gb": 4.0, "memory_estimate": True, "draft": "own"},
+                         "Q2_K": {"about": "2-bit K-quant, with embedded MTP",
+                                  "download_gb": 7.9, "ram_gb": 12, "arena_gb": 5.951717376,
+                                  "vram_beside_gb": 4.3, "memory_estimate": True, "draft": "own"},
+                         "IQ3_XXS": {"about": "compact 3-bit i-quant, with embedded MTP",
+                                     "download_gb": 8.8, "ram_gb": 13, "arena_gb": 6.757023744,
+                                     "vram_beside_gb": 4.5, "memory_estimate": True, "draft": "own"},
+                         "Q3_K_S": {"about": "small 3-bit K-quant, with embedded MTP",
+                                    "download_gb": 9.0, "ram_gb": 13, "arena_gb": 7.147094016,
+                                    "vram_beside_gb": 4.3, "memory_estimate": True, "draft": "own"},
+                         "IQ3_XS": {"about": "3-bit i-quant, with embedded MTP",
+                                    "download_gb": 9.0, "ram_gb": 13, "arena_gb": 7.147094016,
+                                    "vram_beside_gb": 4.3, "memory_estimate": True, "draft": "own"},
+                         "Q3_K_M": {"about": "medium 3-bit K-quant, with embedded MTP",
+                                    "download_gb": 9.6, "ram_gb": 14, "arena_gb": 7.51828992,
+                                    "vram_beside_gb": 4.5, "memory_estimate": True, "draft": "own"},
+                         "Q3_K_L": {"about": "large 3-bit K-quant, with embedded MTP",
+                                    "download_gb": 10.1, "ram_gb": 14, "arena_gb": 7.96393472,
+                                    "vram_beside_gb": 4.5, "memory_estimate": True, "draft": "own"},
+                         "IQ3_M": {"about": "mixed 3-bit i-quant, with embedded MTP",
+                                   "download_gb": 10.7, "ram_gb": 15, "arena_gb": 8.411676672,
+                                   "vram_beside_gb": 4.6, "memory_estimate": True, "draft": "own"},
+                         "IQ4_XS": {"about": "compact 4-bit i-quant, with embedded MTP",
+                                    "download_gb": 10.9, "ram_gb": 15, "arena_gb": 8.782872576,
+                                    "vram_beside_gb": 4.5, "memory_estimate": True, "draft": "own"},
+                         "Q4_K_S": {"about": "small 4-bit K-quant, with embedded MTP",
+                                    "download_gb": 11.5, "ram_gb": 16, "arena_gb": 9.286189056,
+                                    "vram_beside_gb": 4.6, "memory_estimate": True, "draft": "own"},
+                         "IQ4_NL": {"about": "mixed 4-bit nonlinear quant, with embedded MTP",
+                                    "download_gb": 12.5, "ram_gb": 17, "arena_gb": 9.937354752,
+                                    "vram_beside_gb": 4.9, "memory_estimate": True, "draft": "own"},
+                         "Q4_K_L": {"about": "large 4-bit K-quant, with embedded MTP",
+                                    "download_gb": 13.3, "ram_gb": 17, "arena_gb": 10.8003328,
+                                    "vram_beside_gb": 4.9, "memory_estimate": True, "draft": "own"},
+                         "Q5_K_S": {"about": "small 5-bit K-quant, with embedded MTP",
+                                    "download_gb": 13.8, "ram_gb": 18, "arena_gb": 11.299454976,
+                                    "vram_beside_gb": 4.8, "memory_estimate": True, "draft": "own"},
+                         "Q5_K_M": {"about": "medium 5-bit K-quant, with embedded MTP",
+                                    "download_gb": 14.7, "ram_gb": 19, "arena_gb": 12.172918784,
+                                    "vram_beside_gb": 4.9, "memory_estimate": True, "draft": "own"},
+                         "Q6_K_S": {"about": "small 6-bit K-quant, with embedded MTP",
+                                    "download_gb": 16.1, "ram_gb": 20, "arena_gb": 13.438550016,
+                                    "vram_beside_gb": 5.0, "memory_estimate": True, "draft": "own"},
+                         "Q6_K": {"about": "6-bit K-quant, with embedded MTP",
+                                  "download_gb": 16.8, "ram_gb": 21, "arena_gb": 14.121172992,
+                                  "vram_beside_gb": 5.0, "memory_estimate": True, "draft": "own"},
+                         "Q6_K_L": {"about": "large 6-bit K-quant, with embedded MTP",
+                                    "download_gb": 17.6, "ram_gb": 22, "arena_gb": 14.933819392,
+                                    "vram_beside_gb": 5.0, "memory_estimate": True, "draft": "own"},
+                         "Q8_0": {"about": "8-bit throughout, including MTP",
+                                  "download_gb": 20.2, "ram_gb": 24, "arena_gb": 17.540579328,
+                                  "vram_beside_gb": 5.0, "memory_estimate": True, "draft": "own"}},
+              "sha256": {"GrootTeam_Groot-19B-A3B-261023-Q4_K_M.gguf":
+                         (12484339584, "c941e12a231b40b8fb9f6ad7f6601878d72db39c2c62aefb185fbe5c7d0c2e29"),
+                         "GrootTeam_Groot-19B-A3B-261023-IQ2_S.gguf":
+                         (6710667136, "61236abd2a05750914583c85a25c876e450e7a17596500841367c9251d325242"),
+                         "GrootTeam_Groot-19B-A3B-261023-IQ2_M.gguf":
+                         (7278307200, "d73d0584247bf789707355b5ec5b9ae39c83cc7c56aed42fd8e91241af5b1755"),
+                         "GrootTeam_Groot-19B-A3B-261023-Q2_K.gguf":
+                         (7881901952, "db696ba2bb10c21fcbf67672a2eece50117bdfdc4bfa5bd23a26584720426d88"),
+                         "GrootTeam_Groot-19B-A3B-261023-IQ3_XXS.gguf":
+                         (8845805440, "cf0441c90e511a7410755b1cc7196797531531c336eb2a2192e764e2837cc1c4"),
+                         "GrootTeam_Groot-19B-A3B-261023-Q3_K_S.gguf":
+                         (9018566528, "60ffbcb8e9398971ea3ebc5ece18bcd963b5545c412b43af652230fd8590978e"),
+                         "GrootTeam_Groot-19B-A3B-261023-IQ3_XS.gguf":
+                         (9042732928, "395adeaf51c4a3e99a344e3a6abbebebf1f4a73099c86bf786ef0123de4095c0"),
+                         "GrootTeam_Groot-19B-A3B-261023-Q3_K_M.gguf":
+                         (9616312192, "28536558c516c67ce0045d8f6b9a3aa60358e3b4d33bb79106b614c480d41fe9"),
+                         "GrootTeam_Groot-19B-A3B-261023-Q3_K_L.gguf":
+                         (10094397312, "07c173079c0a8f71e7ffac101adfff5b8e8887b3d78991aca1355fc436f5706a"),
+                         "GrootTeam_Groot-19B-A3B-261023-IQ3_M.gguf":
+                         (10670393216, "336450e03c6af5ca718754a8f5e4d678f8fcb24991d43906bdc45e3473bcc8b0"),
+                         "GrootTeam_Groot-19B-A3B-261023-IQ4_XS.gguf":
+                         (10939524992, "0d3615a017c880643656bb44b1b2696981a0604dbc47d049aa7a8e27447a9302"),
+                         "GrootTeam_Groot-19B-A3B-261023-Q4_K_S.gguf":
+                         (11534591872, "e0503d9815a889250d4f74d0a620b6bab05f76e2270c83cd0fb4f4d582c47075"),
+                         "GrootTeam_Groot-19B-A3B-261023-IQ4_NL.gguf":
+                         (12484339584, "fe64d2bd8a23240198152a614dbc1734cb4146a5030de180c24a31161a869356"),
+                         "GrootTeam_Groot-19B-A3B-261023-Q4_K_L.gguf":
+                         (13347317632, "4118a3bd6e533edc84e3602cdcbb5c23a6e534bb408d90d0173d510bb631e0fe"),
+                         "GrootTeam_Groot-19B-A3B-261023-Q5_K_S.gguf":
+                         (13758359424, "29a1ec6195a199e15192cd1e3957d2a102f4078506b18b79e953039cbdd45047"),
+                         "GrootTeam_Groot-19B-A3B-261023-Q5_K_M.gguf":
+                         (14719903616, "31a31651f73f5e80435b18da2c18cc28f818a0e106ed09b4f6332b9e180b75cc"),
+                         "GrootTeam_Groot-19B-A3B-261023-Q6_K_S.gguf":
+                         (16102606720, "f3134ba5e29a067887d6091ab4d2e89299925c8f255b7d91c28816453b105be9"),
+                         "GrootTeam_Groot-19B-A3B-261023-Q6_K.gguf":
+                         (16791324544, "f784a74600c6a2986006909330aed5eeb1b931893c84505077f2595ad8e861fc"),
+                         "GrootTeam_Groot-19B-A3B-261023-Q6_K_L.gguf":
+                         (17603970944, "911e6ce705530f50702e72342f56d5b39b070035ab900a179640e14c48072e2f"),
+                         "GrootTeam_Groot-19B-A3B-261023-Q8_0.gguf":
+                         (20230129536, "7e414a5e4dbb5aa3074a69b36104b2c8cdc188432527956a6ed9c916906a1882"),
+                         "mmproj-GrootTeam_Groot-19B-A3B-261023-bf16.gguf":
+                         (902822208, "0140cef0473d63595a030c68b75b2c8d110bb623bb12ae5993c0cfdfb2d2b0a7")}},
     "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen; quantized by Unsloth",
                "about": "on the strata-poly engine: one NVIDIA card, Linux or Windows; a 17 GB file, ~21 GB of RAM "
                         "beside an 8 GB card; a smaller and a larger size too",
@@ -6964,7 +7062,8 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     ok("model file present")
 
     step(6, "preparing the model for PolyStrata")
-    pack = find_in([data, *elsewhere], f"packs/{tag.lower()}") or data / "packs" / tag.lower()
+    pack_tag = fam.get("pack_tag", fam["tag"]) + custom_gguf_tag(_sg, model)
+    pack = find_in([data, *elsewhere], f"packs/{pack_tag.lower()}") or data / "packs" / pack_tag.lower()
     if not (pack / "tokenizer" / "vocab.json").exists():
         run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(gguf), "--out", str(pack)],
             env=dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py")))   # writes <pack>/tokenizer/

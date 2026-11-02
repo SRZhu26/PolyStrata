@@ -1,7 +1,7 @@
 # Groot 19B-A3B 261023 (experimental)
 
-[GrootTeam's GGUF](https://huggingface.co/GrootTeam/Groot-19B-A3B-261023-GGUF) uses `qwen35moe`,
-already implemented by `strata-poly`. Setup offers its Q4_K_M file and optional BF16 image projector.
+[Bartowski's Groot GGUFs](https://huggingface.co/bartowski/GrootTeam_Groot-19B-A3B-261023-GGUF) use `qwen35moe`,
+already implemented by `strata-poly`. Setup offers 20 quantizations and their optional BF16 image projector.
 This integration has not yet been validated by real inference on Windows, Linux or an RTX 5060.
 Matching tensor headers are not an inference correctness or speed measurement.
 
@@ -16,8 +16,9 @@ python setup.py --family groot
 ```
 
 Like Tiel Coder and Qwen3.6, setup checks the hardware, offers the shared context menu (8K, 32K, 64K and 128K),
-asks whether to download the image encoder, downloads and verifies the selected files, extracts the tokenizer
-and writes the run config and launcher. Q4_K_M is currently the only quantization published in this repository.
+asks which quantization to download and whether to include the image encoder, verifies the selected files,
+extracts the tokenizer and writes the run config and launcher.
+Q4_K_M is the default when RAM permits; setup selects a smaller size when its usual RAM estimate requires one.
 The default context is 32K, the same as the other `strata-poly` families; an explicit `--context` overrides it.
 
 For an unattended install with a chosen context and images:
@@ -32,17 +33,56 @@ the projector is then neither downloaded nor loaded. An existing model folder ca
 `--gguf-dir "C:\Models\Groot"`. Keep the published filenames in that folder.
 Subsequent starts reuse the downloaded files and saved config.
 
-The model download is 11,657,618,560 bytes (11.66 GB decimal); the optional projector adds 902,822,016 bytes
+## Quantization choices
+
+Select a size interactively, or pass its name, for example `--model IQ2_S`, `--model Q3_K_M`,
+`--model Q6_K` or `--model Q8_0`. Each size has its own config and launcher, just like Tiel Coder.
+All sizes below are single-file GGUFs with an embedded MTP block and the same vision-projector pairing.
+
+| Size | Download (GB) | RAM beside an 8 GiB card (GB, estimate) |
+| --- | ---: | ---: |
+| **Q4_K_M** (default) | 12.5 | 17 |
+| IQ2_S | 6.7 | 11 |
+| IQ2_M | 7.3 | 11 |
+| Q2_K | 7.9 | 12 |
+| IQ3_XXS | 8.8 | 13 |
+| Q3_K_S | 9.0 | 13 |
+| IQ3_XS | 9.0 | 13 |
+| Q3_K_M | 9.6 | 14 |
+| Q3_K_L | 10.1 | 14 |
+| IQ3_M | 10.7 | 15 |
+| IQ4_XS | 10.9 | 15 |
+| Q4_K_S | 11.5 | 16 |
+| IQ4_NL | 12.5 | 17 |
+| Q4_K_L | 13.3 | 17 |
+| Q5_K_S | 13.8 | 18 |
+| Q5_K_M | 14.7 | 19 |
+| Q6_K_S | 16.1 | 20 |
+| Q6_K | 16.8 | 21 |
+| Q6_K_L | 17.6 | 22 |
+| Q8_0 | 20.2 | 24 |
+
+These are Bartowski's mixed-precision layouts, not uniform bit widths. The MTP layer uses Q4_0 except in Q8_0,
+where it uses Q8_0. All offered files' headers were checked for the same geometry and MTP tensors.
+BF16, Q4_0 and Q4_1 are not offered: they contain routed-expert types outside the existing native GPU cache path
+(type 30 for BF16, type 3 in the two older Q4 formats). An imatrix is calibration data, not a model.
+
+The default download is 12,484,339,584 bytes (12.48 GB decimal); the optional projector adds 902,822,208 bytes
 (0.90 GB). Allow extra disk space for the engine, Python packages, tokenizer and installation files.
-Both downloads are pinned to revision `2fa1ec958e3bbf7312cf0af97802ff26bfdc5260` and checked by SHA-256.
+All downloads are pinned to revision `0025df0d03fb385344394f4e5afd73ce47da0680` and checked by SHA-256.
 
 The engine keeps expert tensors in the model's RAM-backed file cache and caches as many as fit in VRAM.
-The GGUF directory contains 10.01 GB of routed experts and 1.63 GB of other weight tensors.
-Setup budgets 4 GiB of VRAM beside the experts, including weights, recurrent state, KV rows and scratch.
-That budget and its roughly 16 GB RAM estimate beside an 8 GiB card are estimates, not measured peaks.
+Q4_K_M's directory contains 9.94 GB of routed experts and 2.54 GB of other weight tensors.
+Each size's VRAM estimate is its non-expert tensor bytes in GiB plus a 2.5 GiB budget for state, KV rows and scratch,
+rounded up to 0.1 GiB. This gives Q4_K_M 4.9 GiB beside its experts.
+That budget and its roughly 17 GB RAM estimate beside an 8 GiB card are estimates, not measured peaks.
 The budget uses the 32K context, including the draft block's KV rows (22,528 bytes per token over 11 attention layers).
 Windows, the display, other applications, image encoding and longer requests need headroom.
 The expert cache adapts to available VRAM; total model size is not a full-GPU fit claim.
+
+Existing configs from the earlier GrootTeam upload still start as before. Run setup again to switch a size to
+Bartowski's files. Model IDs and config names are unchanged; Bartowski's tokenizer/profile packs use a separate
+folder so an old extracted template is not silently reused. The old files are not deleted.
 
 ## Hardware and shared engine features
 

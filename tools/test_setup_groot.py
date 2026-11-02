@@ -14,24 +14,39 @@ from unittest import mock
 import setup
 from tools import test_setup_glm as glm_tests
 
-FILE = "Groot-19B-A3B-261023-Q4_K_M.gguf"
-PROJECTOR = "mmproj-Groot-19B-A3B-261023-BF16.gguf"
-REV = "2fa1ec958e3bbf7312cf0af97802ff26bfdc5260"
+FILE = "GrootTeam_Groot-19B-A3B-261023-Q4_K_M.gguf"
+PROJECTOR = "mmproj-GrootTeam_Groot-19B-A3B-261023-bf16.gguf"
+REV = "0025df0d03fb385344394f4e5afd73ce47da0680"
+QUANTS = ("Q4_K_M", "IQ2_S", "IQ2_M", "Q2_K", "IQ3_XXS", "Q3_K_S", "IQ3_XS", "Q3_K_M", "Q3_K_L",
+          "IQ3_M", "IQ4_XS", "Q4_K_S", "IQ4_NL", "Q4_K_L", "Q5_K_S", "Q5_K_M", "Q6_K_S", "Q6_K",
+          "Q6_K_L", "Q8_0")
 
 
 class Pins(unittest.TestCase):
     def test_pinned_files(self):
         fam = setup.FAMILIES["groot"]
-        self.assertEqual(fam["hf"], f"https://huggingface.co/GrootTeam/Groot-19B-A3B-261023-GGUF/resolve/{REV}/")
+        self.assertEqual(fam["hf"], f"https://huggingface.co/bartowski/GrootTeam_Groot-19B-A3B-261023-GGUF/resolve/{REV}/")
         self.assertEqual(fam["mmproj_hf"], fam["hf"])
         self.assertEqual(setup.model_file(fam, "Q4_K_M", 1), FILE)
         self.assertEqual(setup.model_shards(fam, "Q4_K_M"), 1)
         self.assertEqual(fam["mmproj"], PROJECTOR)
-        self.assertEqual(fam["sha256"], {
-            FILE: (11657618560, "0716cae1f19a39a786a463f7b8c068d50b3d7a74532fce73e5ea23ed98130796"),
-            PROJECTOR: (902822016, "05a5c8a279b2589306824864d76d663063ba69ff1f399e6a283fae988fdff360"),
-        })
-        self.assertEqual(list(setup.family_models("groot")), ["Q4_K_M"])
+        self.assertEqual(fam["sha256"][FILE],
+                         (12484339584, "c941e12a231b40b8fb9f6ad7f6601878d72db39c2c62aefb185fbe5c7d0c2e29"))
+        self.assertEqual(fam["sha256"][PROJECTOR],
+                         (902822208, "0140cef0473d63595a030c68b75b2c8d110bb623bb12ae5993c0cfdfb2d2b0a7"))
+        self.assertEqual(tuple(setup.family_models("groot")), QUANTS)
+        files = [setup.model_file(fam, quant, 1) for quant in QUANTS]
+        self.assertEqual(list(fam["sha256"]), [*files, PROJECTOR])
+        for quant, file in zip(QUANTS, files):
+            with self.subTest(quant=quant):
+                d = fam["models"][quant]
+                size, sha = fam["sha256"][file]
+                self.assertEqual(setup.model_shards(fam, quant), 1)
+                self.assertRegex(sha, r"^[0-9a-f]{64}$")
+                self.assertAlmostEqual(d["download_gb"], size / 1e9, delta=0.05)
+                self.assertEqual(d["draft"], "own")
+                self.assertTrue(d["memory_estimate"])
+                self.assertEqual(round(setup.poly_ram_need(d, 8.0)), d["ram_gb"])
         self.assertEqual(setup.POLY_GGUF_ARCHS.get("groot", ("qwen35moe",)), ("qwen35moe",))
         self.assertTrue(fam["unverified"])
         self.assertNotIn("ran_on_gb", fam)
@@ -44,12 +59,20 @@ class Pins(unittest.TestCase):
 
     def test_estimates_fit_the_target_but_are_not_measurements(self):
         d = setup.family_models("groot")["Q4_K_M"]
-        self.assertEqual(d["arena_gb"], 10012852224 / 1e9)
+        self.assertEqual(d["arena_gb"], 9937354752 / 1e9)
         self.assertTrue(d["memory_estimate"])
         self.assertEqual(round(setup.poly_ram_need(d, 8.0)), d["ram_gb"])
         self.assertTrue(setup.poly_fits(d, 32.0, 8.0, False))
         self.assertGreater(setup.poly_ram_need(d, 8.0 - 1.6), setup.poly_ram_need(d, 8.0))
         self.assertFalse(setup.poly_fits(d, 32.0, 4.0, False))
+
+    def test_default_and_low_ram_selection(self):
+        sizes = setup.family_models("groot")
+        self.assertEqual(setup.poly_default(sizes, 32.0, 8.0), "Q4_K_M")
+        self.assertEqual(setup.poly_default(sizes, 12.0, 8.0), "IQ2_S")
+        self.assertEqual(setup.poly_default(sizes, 4.0, 8.0), "IQ2_S")
+        self.assertLess(setup.poly_ram_need(sizes["IQ2_S"], 8.0),
+                        setup.poly_ram_need(sizes["Q8_0"], 8.0))
 
     def test_choices_round_trip(self):
         with tempfile.TemporaryDirectory() as t:
@@ -106,6 +129,34 @@ class Main(unittest.TestCase):
         self.assertEqual(self.encoder, "cpu")
         self.assertNotIn("--no-draft", cfg["args"])
 
+    def test_interactive_size_choice_controls_download_and_model_id(self):
+        sizes = list(setup.family_models("groot"))
+        choice = str(sizes.index("Q6_K") + 1)
+        code, out, cfg = self.main(family="groot", ram=32.0, vram=8.0, win=True,
+                                   answers={"Size?": choice})
+        self.assertEqual(code, 0, out)
+        self.assertTrue(any("Size?" in prompt for prompt in self.asked))
+        self.assertEqual(self.downloads, [setup.FAMILIES["groot"]["hf"] +
+                                         "GrootTeam_Groot-19B-A3B-261023-Q6_K.gguf"])
+        self.assertEqual(cfg["model_name"], "groot-19b-a3b-261023-q6_k")
+        self.assertNotIn("--no-draft", cfg["args"])
+
+    def test_each_offered_quantization_uses_its_own_download_and_pins(self):
+        fam = setup.FAMILIES["groot"]
+        for quant in QUANTS:
+            with self.subTest(quant=quant):
+                self.downloads, self.verified, self.runs = [], [], []
+                code, out, _ = self.main(family="groot", model=quant, ram=64.0, vram=24.0, win=True)
+                self.assertEqual(code, 0, out)
+                file = setup.model_file(fam, quant, 1)
+                self.assertEqual(self.downloads, [fam["hf"] + file])
+                self.assertEqual(self.verified, [(file, *fam["sha256"][file])])
+                cfg = json.loads((self.t / f"strata-groot-{quant.lower()}.json").read_text())
+                self.assertEqual(cfg["model_name"], f"groot-19b-a3b-261023-{quant.lower()}")
+                self.assertEqual(Path(cfg["args"][cfg["args"].index("--model") + 1]).name, file)
+                self.assertNotIn("--draft-model", cfg["args"])
+                self.assertNotIn("--no-draft", cfg["args"])
+
     def test_repeated_setup_reuses_downloads(self):
         argv = ["--vision", "yes"]
         code, out, cfg = self.main(argv, family="groot", ram=32.0, vram=8.0, win=True)
@@ -117,6 +168,17 @@ class Main(unittest.TestCase):
         self.assertEqual(self.downloads, [])
         self.assertEqual(again["args"], cfg["args"])
         self.assertEqual(again["vision"], cfg["vision"])
+
+    def test_source_change_does_not_reuse_the_original_tokenizer(self):
+        old = self.t / "data" / "packs" / "groot-q4_k_m" / "tokenizer"
+        old.mkdir(parents=True)
+        (old / "vocab.json").write_text("{}")
+        code, out, cfg = self.main(family="groot", ram=32.0, vram=8.0, win=True)
+        self.assertEqual(code, 0, out)
+        new_pack = self.t / "data" / "packs" / "groot-bartowski-q4_k_m"
+        self.assertEqual(Path(cfg["tokenizer"]), new_pack / "tokenizer")
+        self.assertEqual(self.runs[0][self.runs[0].index("--out") + 1], str(new_pack))
+        self.assertTrue((old / "vocab.json").exists())
 
     def test_hardware_range_keeps_shared_defaults(self):
         for ram, vram, win in ((24.0, 8.0, True), (32.0, 12.0, False), (64.0, 24.0, True),
@@ -163,7 +225,7 @@ class Main(unittest.TestCase):
         self.assertEqual(cfg["args"][cfg["args"].index("--max-context") + 1], "8192")
 
     def test_explicit_gpu_vision_is_preserved(self):
-        code, out, cfg = self.main(["--vision", "gpu"], family="groot", ram=32.0, vram=8.0, win=True)
+        code, out, cfg = self.main(["--vision", "gpu"], family="groot", ram=32.0, vram=12.0, win=True)
         self.assertEqual(code, 0, out)
         self.assertEqual(self.encoder, "gpu")
         self.assertTrue(cfg["vision"]["gpu"])
