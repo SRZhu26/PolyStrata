@@ -47,6 +47,7 @@ class Pins(unittest.TestCase):
                 self.assertEqual(round(setup.poly_ram_need(d, 8.0)), d["ram_gb"])
         self.assertEqual(setup.POLY_GGUF_ARCHS.get("groot", ("qwen35moe",)), ("qwen35moe",))
         self.assertTrue(fam["unverified"])
+        self.assertIn("Q4_K_M text", fam["validation"])
         self.assertNotIn("ran_on_gb", fam)
         self.assertNotIn("tail_skip", fam)
         self.assertNotIn("no_draft", fam)
@@ -83,7 +84,7 @@ class Pins(unittest.TestCase):
 class Main(unittest.TestCase):
     setUp, tearDown, main = glm_tests.Main.setUp, glm_tests.Main.tearDown, glm_tests.Main.main
 
-    def test_windows_text_setup_is_explicitly_unverified(self):
+    def test_windows_text_setup_names_what_is_untested(self):
         code, out, cfg = self.main(family="groot", ram=32.0, vram=8.0, win=True)
         self.assertEqual(code, 0, out)
         fam = setup.FAMILIES["groot"]
@@ -99,7 +100,7 @@ class Main(unittest.TestCase):
         self.assertNotIn("--draft-model", args)
         self.assertNotIn("--tail-skip", args)
         self.assertEqual([Path(r[1]).name for r in self.runs], ["strata_tokenizer.py"])
-        self.assertIn("not been validated on hardware", out)
+        self.assertIn("images, Q6_K, Q8_0 and other hardware are untested", out)
         self.assertNotIn("has been run on Linux only", out)
         self.assertNotIn("has run on no card", out)
         self.assertNotIn("tokens/s after a full prompt", out)

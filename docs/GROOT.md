@@ -3,8 +3,10 @@
 [Bartowski's Groot GGUFs](https://huggingface.co/bartowski/GrootTeam_Groot-19B-A3B-261023-GGUF) use `qwen35moe`,
 already implemented by `strata-poly`. Setup offers three quantizations (Q4_K_M, Q6_K and Q8_0) and their optional
 BF16 image projector.
-This integration has not yet been validated by real inference on Windows, Linux or an RTX 5060.
-Matching tensor headers are not an inference correctness or speed measurement.
+Q4_K_M text ran on Windows 11, an RTX 5060 Laptop 8 GB and 32 GB of RAM on 2026-11-02: it answered, streamed,
+kept its reasoning separate and called a tool; [the measured speeds](#measured-on-an-rtx-5060-laptop-8-gb) are below.
+Q6_K, Q8_0, images and other hardware have not been run. Matching tensor headers alone are not a correctness or
+speed measurement.
 
 ## Choose it during setup
 
@@ -21,6 +23,8 @@ asks which quantization to download and whether to include the image encoder, ve
 extracts the tokenizer and writes the run config and launcher.
 Q4_K_M is the default; Q6_K and Q8_0 are for a PC with more RAM.
 The default context is 32K, the same as the other `strata-poly` families; an explicit `--context` overrides it.
+Setup downloads from Hugging Face by default. `HF_ENDPOINT` selects a mirror (for example
+`https://hf-mirror.com`); `--source modelscope` is opt-in and checks the file against the same SHA-256.
 
 For an unattended install with a chosen context and images:
 
@@ -69,6 +73,27 @@ Existing configs from the earlier GrootTeam upload still start as before. Run se
 Bartowski's files. Model IDs and config names are unchanged; Bartowski's tokenizer/profile packs use a separate
 folder so an old extracted template is not silently reused. The old files are not deleted.
 
+## Measured on an RTX 5060 Laptop 8 GB
+
+`python polystrata.py benchmark --model groot-19b-a3b-261023-q4_k_m` on 2026-11-02, main at `c4e12110`, the
+ready-made `strata-poly` 0.1.45 (CUDA 13.0), Q4_K_M, 32,768-token context, Windows 11, Core Ultra 9 275HX
+(15 threads for the experts outside VRAM), 32 GB of RAM, driver 617.42. One run on one machine; the short prompt
+pays the first-request warm-up.
+
+| Prompt, tokens | Prefill, tokens/s | Decode, tokens/s | MTP kept | Peak VRAM | Peak RAM |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 21 | 74.6 | 96.9 | 80.7% | 6.84 GiB | 21.66 GiB |
+| 2,952 | 1,296.4 | 97.2 | 83.7% | 7.05 GiB | 21.80 GiB |
+| 10,640 | 1,904.8 | 95.4 | 84.4% | 7.05 GiB | 21.51 GiB |
+
+VRAM and RAM are the whole machine's use at its highest during the request, not the engine's alone. 1,994 of
+5,248 routed experts stayed in VRAM (3.5 GiB); the rest ran on the CPU. The file loaded in 7.4 s.
+The benchmark's 256-token answers reached the limit while still thinking, so the decode speeds are thinking
+tokens. A separate request with room to finish answered "hello from groot", a streamed request kept content and
+reasoning separate, and a tool request returned `get_weather({"city":"Paris"})` with `finish_reason: tool_calls`.
+The raw run is in
+[bench/results/2026-11-02-groot-q4_k_m-rtx5060-laptop](../bench/results/2026-11-02-groot-q4_k_m-rtx5060-laptop/README.md).
+
 ## Hardware and shared engine features
 
 Groot uses the same `strata-poly` path as Tiel Coder and Qwen3.6, not an RTX 5060-specific engine.
@@ -80,7 +105,7 @@ where offered, and this does not add a Qwen35 engine to Intel Arc/SYCL.
 Use the usual options, for example `--parallel 2`, `--gpus all`, `--vision cpu` and `--context 65536`.
 Setup's shared memory estimates decide how much of the experts the GPU can hold.
 Larger cards can cache more experts; smaller cards rely more on RAM and CPU work.
-No specific card's speed or maximum usable context has been measured for Groot yet.
+The table above is one card and one size; longer contexts than its 10,640-token prompt are still unmeasured.
 
 On Windows 11 with 32 GB RAM and an RTX 5060 8 GB, `--vision yes` automatically places image encoding on the CPU.
 Choose a shorter context such as `--context 8192` if needed; `--context 4096` is also available explicitly for
@@ -115,11 +140,11 @@ Groot does not set an approximate tail-skipping override.
 ## What remains to be measured
 
 - Compare text logits/output, tokenizer IDs and chunked prefill against a compatible reference runtime.
-- Exercise both API formats, streaming, thinking/non-thinking, multi-turn tools and model switching.
-- Test repeated image/text requests at the selected context lengths, including explicit errors when context is exceeded.
-- Record peak dedicated/shared VRAM, process working set/commit, available system RAM, prompt processing and
-  generation tokens/s, CPU, build and driver details. Compare ordinary decoding and MTP for correctness and memory use.
+- Exercise the Anthropic API, multi-turn tools, model switching and explicit context-limit errors; streaming, one
+  tool call and the OpenAI API were checked.
+- Test images; this run did not download the projector.
+- Measure Q6_K and Q8_0, other cards, longer contexts and repeated requests.
 
-No RTX 5060 throughput or real RAM/VRAM peak is published yet. The model's trained context is 262,144 tokens;
+The Q4_K_M table above is the first measured RTX 5060 throughput and RAM/VRAM peak. The model's trained context is 262,144 tokens;
 its card recommends at least 128K for complex reasoning. A 4K/8K smoke test does not establish that capability
 or reproduce the card's benchmark results.

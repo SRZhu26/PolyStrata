@@ -624,12 +624,15 @@ FAMILIES = {
                            "Kolibri-1-Q3_K_M.gguf":
                            (37523996640, "b797de9cebb5f8b6e12e32a57c76776c83c2c077e6804fa4835aa6ab5e9e79da")}},
     "groot": {"title": "Groot 19B-A3B 261023", "by": "GrootTeam; quantized by bartowski",
-              "about": "experimental qwen35moe on strata-poly; 3 sizes, 12.5 to 20.2 GB; hardware validation pending",
+              "about": "experimental qwen35moe on strata-poly; 3 sizes, 12.5 to 20.2 GB; "
+                       "Q4_K_M text measured on an 8 GB RTX 5060",
               "hf": hf("bartowski/GrootTeam_Groot-19B-A3B-261023-GGUF"),
               "file": "GrootTeam_Groot-19B-A3B-261023-{q}.gguf",
               "shards": 1, "tag": "groot-", "name": "groot-19b-a3b-261023", "engine": "poly",
               "pack_tag": "groot-bartowski-",
               "vision": True, "experimental": True, "unverified": True, "row_bytes": 22528,
+              "validation": "Q4_K_M text, streaming and tool calls ran on an 8 GB RTX 5060; images, Q6_K, "
+                            "Q8_0 and other hardware are untested.",
               "mmproj_hf": hf("bartowski/GrootTeam_Groot-19B-A3B-261023-GGUF"),
               "mmproj": "mmproj-GrootTeam_Groot-19B-A3B-261023-bf16.gguf", "vision_gb": 0.9, "vision_vram_gb": 1.6,
               # Expert bytes come from each pinned tensor directory. VRAM beside them is the other weights
@@ -6745,8 +6748,9 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         warn(f"{title}'s engine with CUDA 12 is compiled here (the ready-made one is CUDA 13)" +
              (": on Pascal / Volta it is untested" if int(gpu["arch"]) < CUDA13_MIN_ARCH else ""))
     if fam.get("unverified"):
-        warn(f"{title}: tensor headers match an existing engine, but text, tools, images and memory use have "
-             "not been validated on hardware. Estimates are not measurements; see docs/GROOT.md.")
+        warn(f"{title}: tensor headers match an existing engine. "
+             f"{fam.get('validation', 'Text, tools, images and memory use have not been validated on hardware.')} "
+             "Estimates are not measurements; see docs/GROOT.md.")
     elif WIN and not fam.get("windows"):
         confirm_risk(f"{title} has been run on Linux only: its engine compiles on Windows, the model was not tried "
                      "there", bool(a.family), a.yes, f"{title} has not been tried on Windows",
