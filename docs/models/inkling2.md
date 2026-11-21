@@ -7,6 +7,8 @@ uses the `inkling2_loop` architecture (`ggml-org/llama.cpp` PR `#32694` + `#3270
 > **Status:** Scaffolding only. `Inkling2::load_geometry()` and KV sizing (FP16 and Q8_0) are wired into
 > `src/poly/inkling2.cpp`, `src/poly/engine.cpp`, `CMakeLists.txt` and `setup.py`. Forward kernels are stubbed
 > until built and tested on a CUDA/HIP machine. No speeds or outputs have been measured on `strata-poly` yet.
+> For the complete tensor inventory, phased kernel implementation/fusion plan, and 4-stage verification plan, see
+> **[inkling2_plan.md](inkling2_plan.md)**.
 
 ## Architecture and KV cache math
 
