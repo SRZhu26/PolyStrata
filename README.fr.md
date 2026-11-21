@@ -1,9 +1,11 @@
 <h1 align="center">PolyStrata</h1>
 
-[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · **Français** · [Español](README.es.md) · [Português](README.pt-BR.md)
+[English](README.md) · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · **Français** · [Español](README.es.md) · [Português](README.pt-BR.md) · [Türkçe](README.tr.md)
 
 <p align="center"><b>Faites tourner de grands modèles d'IA sur votre propre PC</b><br>
 Qwen3.8-Flash-Next, GLM 5.3 Flash, DeepSeek V4 Flash, LFM2.5, Flint, Qwen3.6, Clover, Ornith 1.5, Gemma 4, Tiel Coder, MiniCPM-V et Kolibri 1 · gratuit et open source</p>
+
+<p align="center"><a href="https://github.com/simplexai-labs/linger"><img height="28" alt="Used by Linger" src="docs/media/used-by-linger.svg"></a></p>
 
 <p align="center"><img src="docs/media/speed.svg" width="820" alt="Tokens par seconde pendant l'écriture d'une réponse : 94 à 100 avec Qwen3.6-35B-A3B sur un portable à carte 8 Go, 394 à 395 sur une RTX 5090"></p>
 
@@ -53,6 +55,7 @@ de 32 Go, et les huit plus petits en plus sur un portable avec une carte de 8 Go
 Le serveur peut passer d'un modèle installé à un autre pendant qu'il tourne
 ([comment](docs/BACKENDS.md#changing-the-model), en anglais).
 
+PolyStrata a été créé par [VecSzn](https://github.com/VecSzn).
 PolyStrata est construit sur [Strata](https://github.com/Niko1221/Strata) de Niko1221.
 Pourquoi c'est un dépôt à part, les cartes AMD et plus petites, les fine-tunes et d'autres questions : [FAQ](docs/FAQ.md) (en anglais).
 
@@ -102,7 +105,8 @@ Pour en occuper moins, ajoutez `"--ram-experts-mib", "6144"` à la liste `"args"
 ([où](docs/INSTALL.md#where-things-are-stored)) et redémarrez. Le moteur garde alors ce nombre de MiB de RAM pour les
 experts qui restent hors de la VRAM, aussi pendant qu'il répond, et l'indique au démarrage. Les autres restent dans le
 cache de fichiers du système, où vos autres programmes peuvent prendre cette mémoire, et sont lus de là quand un token
-en a besoin. C'est désactivé par défaut parce que cela écrit moins vite, et nous continuons d'y travailler. Sur le
+en a besoin. Quand les experts tiennent dans la RAM libre, c'est désactivé par défaut parce que cela écrit moins vite,
+et nous continuons d'y travailler ; quand ils n'y tiennent pas, le moteur l'active de lui-même (plus bas). Sur le
 portable (RTX 4070 Laptop 8 Go, 32 Go de RAM, Windows 11), Qwen3.6-35B-A3B UD-Q3_K_M :
 
 | | par défaut | `--ram-experts-mib 6144` |
@@ -121,6 +125,26 @@ dans le chat suivant. Sous Linux (une RTX PRO 6000 limitée à environ 8 Go) il 
 14.3 et écrivait 7 à 14 % moins vite. Avec le cache d'experts figé, comme on vérifie une version, les réponses sont
 identiques token par token.
 
+Quand les experts hors de la VRAM ne tiennent pas dans la RAM libre, le moteur garde maintenant les plus utilisés dans
+un budget égal à cette RAM moins 4 GiB et lit les autres sur le SSD quand un token en a besoin ; il l'indique au
+démarrage. Avant, il les mappait tous et le système les relisait défaut de page après défaut de page. La limite de
+mémoire d'un conteneur compte aussi. Mesuré sous Linux sur une RTX PRO 6000 limitée à environ 8 Go, le moteur limité à
+12 Go puis à 10 Go de RAM, ce qu'il lui reste sur un PC de 16 Go, et le fichier du modèle hors du cache de fichiers à
+chaque démarrage : Qwen3.6-35B-A3B UD-Q3_K_M, tokens/s dans le premier chat court, après un prompt de 24,000 tokens et
+dans un chat court ensuite.
+
+| RAM pour le moteur | tous les experts mappés (avant) | le budget qu'il prend maintenant |
+| --- | ---: | ---: |
+| 12 Go | 51 / 75-78 / 94-98 | **57-60 / 77-85 / 131-139** |
+| 10 Go | 39 / 48 / 69 | **51 / 64 / 92** |
+
+Sans limite, la même machine écrit 63 / 169 / 203. Ce n'est pas mesuré sous Windows, où le même code tourne.
+`"--ram-experts-mib", "-1"` garde tous les experts mappés comme avant.
+
+À l'inverse, `"--lock-experts"` verrouille en RAM les experts hors de la VRAM : le système ne peut pas donner cette
+mémoire à d'autres programmes, et le moteur n'a pas à les relire depuis le SSD. Sous Linux il en verrouille au plus
+ce que permet `ulimit -l`, et le moteur indique au démarrage combien il en a verrouillé.
+
 Le moteur demande aussi 350 à 400 MiB de VRAM de moins pour lire les prompts : le cache d'experts les prend (Qwen3.6
 garde 2,712 experts en VRAM au lieu de 2,444), ou `--vram-reserve-mib` les laisse aux autres programmes.
 Comment c'est mesuré : [docs/BACKENDS.md](docs/BACKENDS.md#less-of-the-pcs-ram-and-vram).
@@ -132,9 +156,9 @@ Comment c'est mesuré : [docs/BACKENDS.md](docs/BACKENDS.md#less-of-the-pcs-ram-
 | [Qwen3.8-Flash-Next](docs/models/qwen38.fr.md) | NVIDIA RTX série 20 à 50, ou AMD RX 6800 / 6900, RX 7700 XT / 7800 XT / 7900 XT / XTX, RX 9060 XT / 9070 / 9070 XT, Radeon AI PRO R9700 ; 12 Go ou plus | 32 Go ou plus ; avec 64 Go, toutes les tailles | environ 80 Go | Windows, Linux |
 | [GLM 5.3 Flash](docs/models/glm.fr.md) | NVIDIA RTX série 20 ou plus récente ; seulement essayé sur une carte de 32 Go | 96 Go à côté d'une carte de 32 Go | 79 à 114 Go, sur un SSD | Linux |
 | [DeepSeek V4 Flash](docs/models/deepseek.fr.md) | comme au-dessus | 72 Go à côté d'une carte de 32 Go | 91 Go, sur un SSD | Linux |
-| [LFM2.5-24B-A2B](docs/models/lfm25.fr.md) | NVIDIA RTX série 20 ou plus récente, 8 Go ou plus | environ 20 Go à côté d'une carte de 8 Go | 11 à 25 Go | Windows, Linux |
+| [LFM2.5-24B-A2B](docs/models/lfm25.fr.md) | NVIDIA RTX série 20 ou plus récente, 8 Go ou plus | environ 20 Go à côté d'une carte de 8 Go | 11 à 25 Go | Windows, Linux, Mac (bêta) |
 | [Flint 40B-A2.5B](docs/models/flint.fr.md) | comme au-dessus | environ 22 Go à côté d'une carte de 8 Go | 18 à 42 Go | Windows, Linux |
-| [Qwen3.6-35B-A3B](docs/models/qwen36.fr.md) | comme au-dessus ; AMD en bêta | environ 21 Go à côté d'une carte de 8 Go | 13 à 23 Go | Windows, Linux |
+| [Qwen3.6-35B-A3B](docs/models/qwen36.fr.md) | comme au-dessus ; AMD en bêta | environ 21 Go à côté d'une carte de 8 Go | 13 à 23 Go | Windows, Linux, Mac (bêta) |
 | [Clover-35B-A3B-Preview](docs/models/clover.fr.md) | NVIDIA RTX série 20 ou plus récente, 8 Go ou plus | environ 20 Go à côté d'une carte de 8 Go | 13 à 21 Go | Windows, Linux |
 | [Ornith 1.5](docs/models/ornith.fr.md) | comme au-dessus ; AMD en bêta | environ 22 Go à côté d'une carte de 8 Go | 14 à 24 Go | Windows, Linux |
 | [Gemma 4 26B-A4B](docs/models/gemma4.fr.md) | comme au-dessus ; AMD en bêta | environ 18 Go à côté d'une carte de 8 Go | 11 à 17 Go | Windows, Linux |
@@ -142,7 +166,7 @@ Comment c'est mesuré : [docs/BACKENDS.md](docs/BACKENDS.md#less-of-the-pcs-ram-
 | [MiniCPM-V 4.7 35B-A3B](docs/models/minicpmv.fr.md) | comme au-dessus ; AMD en bêta | environ 25 Go à côté d'une carte de 8 Go | 16 à 29 Go | Windows, Linux |
 | [Kolibri 1](docs/models/kolibri.fr.md) | NVIDIA RTX série 20 ou plus récente, 8 Go ou plus | environ 33 Go à côté d'une carte de 8 Go | 29 à 48 Go | Windows, Linux |
 
-La RAM est l'estimation de l'installeur ; une carte plus grande en demande moins. L'installeur s'occupe de tout le reste : sous Windows, il télécharge le moteur déjà compilé et ne le compile sur votre PC que sur un processeur sans AVX2 ou si le moteur de votre copie est plus récent que la dernière version, en proposant d'installer les outils qui manquent. Deux ou trois cartes peuvent se partager un modèle ([multi-GPU](docs/MULTI_GPU.md)). Cartes graphiques plus anciennes, Intel Arc, Strix Halo et processeurs sans AVX2 : [la liste complète](docs/INSTALL.md#what-you-need). La carte, la RAM et les tailles de chaque modèle en détail sont sur sa page.
+La RAM est l'estimation de l'installeur ; une carte plus grande en demande moins. L'installeur s'occupe de tout le reste : sous Windows, il télécharge le moteur déjà compilé et ne le compile sur votre PC que sur un processeur sans AVX2 ou si le moteur de votre copie est plus récent que la dernière version, en proposant d'installer les outils qui manquent. Deux ou trois cartes peuvent se partager un modèle ([multi-GPU](docs/MULTI_GPU.md)). Cartes graphiques plus anciennes, Intel Arc, Mac Apple Silicon (Qwen3.8-Flash-Next, et Qwen3.6 et LFM2.5 en bêta), Strix Halo et processeurs sans AVX2 : [la liste complète](docs/INSTALL.md#what-you-need). La carte, la RAM et les tailles de chaque modèle en détail sont sur sa page.
 
 Ce qu'il faut à chacun des six (Qwen3.6, Clover, Ornith 1.5, Gemma 4, Tiel Coder et MiniCPM-V) et comment il a été vérifié : [docs/BACKENDS.md](docs/BACKENDS.md#install) (en anglais).
 
@@ -153,7 +177,7 @@ Ce qu'il faut à chacun des six (Qwen3.6, Clover, Ornith 1.5, Gemma 4, Tiel Code
 Vous utilisez un assistant de code IA (Claude Code, Cursor, Codex, GitHub Copilot, ...) ? Collez-lui ceci :
 
 ```text
-Set up PolyStrata on this PC for me: https://github.com/VecSzn/PolyStrata - follow docs/AI_SETUP.md in that repository.
+Set up PolyStrata on this PC for me: https://github.com/simplexai-labs/PolyStrata - follow docs/AI_SETUP.md in that repository.
 ```
 
 Il vérifie votre carte graphique, votre RAM et votre disque, et choisit le modèle qui convient. Ensuite il l'installe,
@@ -162,10 +186,10 @@ arrêter PolyStrata grâce à son [serveur MCP](docs/MCP_SERVER.md).
 
 ### Ou faites-le vous-même
 
-[Téléchargez PolyStrata](https://github.com/VecSzn/PolyStrata/archive/refs/heads/main.zip) et décompressez-le (ou faites un `git clone`).
+[Téléchargez PolyStrata](https://github.com/simplexai-labs/PolyStrata/archive/refs/heads/main.zip) et décompressez-le (ou faites un `git clone`).
 **Windows :** double-cliquez sur **`START-HERE.bat`**. **Linux :** lancez **`./setup.sh`** dans le dossier PolyStrata.
 
-**Mac (Apple Silicon, M1 à M5, macOS 15 ou plus récent) :** installez une fois les Command Line Tools d'Apple (`xcode-select --install` dans le Terminal ; Xcode lui-même n'est pas nécessaire). Ouvrez ensuite le Terminal dans le dossier PolyStrata et lancez **`./setup.sh`**. Il compile le moteur Mac sur votre Mac (environ 7 minutes), pose les mêmes questions, télécharge le modèle et le démarre. La fois suivante, `./setup.sh` démarre tout de suite. Quelle taille convient à votre Mac et sa vitesse : [docs/MAC.md](docs/MAC.md). Le moteur Mac ne fait tourner que Qwen3.8-Flash-Next ; les onze autres modèles ont besoin d'une carte NVIDIA ou AMD.
+**Mac (Apple Silicon, M1 à M5, macOS 15 ou plus récent) :** installez une fois les Command Line Tools d'Apple (`xcode-select --install` dans le Terminal ; Xcode lui-même n'est pas nécessaire). Ouvrez ensuite le Terminal dans le dossier PolyStrata et lancez **`./setup.sh`**. Il compile le moteur Mac sur votre Mac (environ 7 minutes), pose les mêmes questions, télécharge le modèle et le démarre. La fois suivante, `./setup.sh` démarre tout de suite. Quelle taille convient à votre Mac et sa vitesse : [docs/MAC.md](docs/MAC.md). Par défaut, il installe Qwen3.8-Flash-Next. `./setup.sh --family qwen36` ou `--family lfm25` installe à la place Qwen3.6 ou LFM2.5 sur le moteur Metal de strata-poly, en bêta : sur un M5 Ultra, Qwen3.6 UD-Q2_K_XL a écrit 134 tokens/s dans une courte conversation et lu un prompt de 3,768 tokens à 2,978 tokens/s. Le setup propose aussi GLM, DeepSeek, Ornith, Gemma 4, Tiel Coder et MiniCPM-V sur un Mac, mais ils n'y ont pas encore tourné avec leurs vrais poids. Kolibri, Flint et Clover ont besoin d'une carte NVIDIA ou AMD.
 
 Les étapes sont les mêmes pour NVIDIA et AMD. L'installateur détecte votre carte et installe le bon moteur pour elle.
 Il vous pose quelques questions :
@@ -222,6 +246,8 @@ Les douze modèles s'utilisent de la même façon : la même application, la mê
 
 - **Dans le navigateur :** ouvrez `http://127.0.0.1:8080`. Vous y trouvez **Chat**, un **Monitor** en direct du
   modèle et de votre GPU/CPU/RAM, et **About** avec les réglages et les adresses.
+- **Comme agent personnel :** téléchargez [Linger](https://github.com/simplexai-labs/linger) pour [Mac (Apple Silicon)](https://github.com/simplexai-labs/linger/releases/download/desktop-v0.1.2/Linger-0.1.2-macos-arm64.dmg) ·
+  [Windows](https://github.com/simplexai-labs/linger/releases/download/desktop-v0.1.2/Linger-0.1.2-windows-x64-setup.exe) · [Linux](https://github.com/simplexai-labs/linger/releases/download/desktop-v0.1.2/Linger-0.1.2-linux-x64.tar.gz).
 - **Vos applications et agents de code :** ajoutez un fournisseur « OpenAI-compatible » avec l'URL de base
   **`http://127.0.0.1:8080/v1`**. N'importe quelle clé API et n'importe quel nom de modèle fonctionnent.
   - Applications qui utilisent l'API d'Anthropic : `http://127.0.0.1:8080/v1/messages` (Claude Code :
@@ -272,7 +298,7 @@ Redémarrez PolyStrata (`START-HERE.bat` ou `./setup.sh`) après la modification
 - **Il dit que le port 8080 est déjà utilisé.** PolyStrata tourne déjà. Cherchez sa fenêtre.
 
 Autres problèmes et leurs solutions : [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Toujours bloqué ? Ouvrez une
-[issue](https://github.com/VecSzn/PolyStrata/issues) et joignez `strata-<model>.log` depuis le dossier PolyStrata. Vous
+[issue](https://github.com/simplexai-labs/PolyStrata/issues) et joignez `strata-<model>.log` depuis le dossier PolyStrata. Vous
 avez trouvé un problème de sécurité ? Signalez-le en privé : [SECURITY.md](SECURITY.md).
 
 ## Comment ça marche ?
@@ -283,6 +309,17 @@ PC**. Pensez à une cuisine : ce que vous utilisez tout le temps reste sur le pl
 le placard.
 
 Le schéma et l'explication de chaque modèle : [docs/HOW_IT_WORKS_MODELS.fr.md](docs/HOW_IT_WORKS_MODELS.fr.md).
+
+## Construit sur PolyStrata
+
+<p align="center"><a href="https://github.com/simplexai-labs/linger"><img src="https://raw.githubusercontent.com/simplexai-labs/linger/main/assets/linger-story.webp" width="820" alt="Linger en 28 secondes : il installe un modèle local, connecte vos applications, fait de vos e-mails et réunions une mémoire, et demande avant d'envoyer un e-mail."></a><br>
+<sub>Linger en 28 secondes : il installe un modèle local, connecte vos applications, fait de vos e-mails et réunions une mémoire, et demande avant d'envoyer un e-mail.</sub></p>
+
+**[Linger](https://github.com/simplexai-labs/linger)** est un agent personnel open source qui tourne entièrement sur votre PC, avec ses
+modèles locaux sur PolyStrata. Il trouve ce dont vous avez besoin dans vos applications, retient ce qui compte et
+avance pendant votre absence. [Documentation](https://docs.heylinger.com/) · [GitHub](https://github.com/simplexai-labs/linger)
+
+Vous avez construit quelque chose sur PolyStrata ? Ouvrez une [issue](https://github.com/simplexai-labs/PolyStrata/issues) et nous l'ajouterons ici.
 
 ## Crédits et licence
 

@@ -94,6 +94,26 @@ class Main(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertNotIn("Windows", out)
 
+    def test_kv_q8_0_goes_into_the_config_and_stays(self):
+        # issue 183: setup refused --kv q8_0, which strata-poly has for Flint
+        code, out, cfg = self.main(["--kv", "q8_0"], family="flint", model="Q8_0", ram=128.0, vram=24.0)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["args"][cfg["args"].index("--kv") + 1], "q8_0")
+        self.assertNotIn("not used with", out)
+        code, out, cfg = self.main(family="flint", model="Q8_0", ram=128.0, vram=24.0)   # setup again, without it
+        self.assertEqual(cfg["args"][cfg["args"].index("--kv") + 1], "q8_0")
+        code, out, cfg = self.main(["--kv", "fp16"], family="flint", model="Q8_0", ram=128.0, vram=24.0)
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("--kv", cfg["args"])
+
+    def test_a_kv_format_flint_has_not_is_named(self):
+        for kv in ("int8", "q4_0"):
+            with self.subTest(kv):
+                code, out, cfg = self.main(["--kv", kv], family="flint", model="Q8_0", ram=128.0, vram=24.0)
+                self.assertEqual(code, 0, out)
+                self.assertIn("--kv", next(ln for ln in out.splitlines() if "not used with Flint" in ln))
+                self.assertNotIn("--kv", cfg["args"])
+
     def test_vision_is_not_used(self):
         code, out, cfg = self.main(["--vision", "yes"], family="flint", ram=32.0, vram=8.0)
         self.assertEqual(code, 0, out)

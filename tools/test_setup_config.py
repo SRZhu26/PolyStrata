@@ -106,6 +106,26 @@ class CarryOver(unittest.TestCase):
             self.assertFalse((Path(d) / "strata-x.json.bak").exists())
             self.assertEqual(json.loads(p.read_text(encoding="utf-8")), got)
 
+    def test_warm_start(self):
+        """--warm-start [FILE]: written when given, an earlier config's kept when not."""
+        import types
+        with tempfile.TemporaryDirectory() as d:
+            p, seed = Path(d) / "strata-x.json", Path(d) / "agent.json"
+            seed.write_text("{}", encoding="utf-8")
+            for given, want in ((True, True), (str(seed), str(seed.resolve())), (None, str(seed.resolve()))):
+                cfg = {"exe": "e", "args": []}
+                _, out = quiet(setup.warm_start_into, cfg, types.SimpleNamespace(warm_start=given))
+                self.assertEqual("warm start" in out, given is not None)
+                quiet(setup.write_setup_config, p, cfg)
+                self.assertEqual(json.loads(p.read_text(encoding="utf-8"))["warm_start"], want)
+            cfg = {"exe": "e", "args": []}
+            setup.warm_start_into(cfg, types.SimpleNamespace())           # a caller without the option
+            self.assertNotIn("warm_start", cfg)
+            later = Path(d) / "later.json"                                # the agent writes it later
+            _, out = quiet(setup.warm_start_into, cfg, types.SimpleNamespace(warm_start=str(later)))
+            self.assertEqual(cfg["warm_start"], str(later.resolve()))
+            self.assertIn("once the agent has written it", out)
+
     def test_an_unreadable_earlier_config_is_replaced_with_a_copy(self):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "strata-x.json"

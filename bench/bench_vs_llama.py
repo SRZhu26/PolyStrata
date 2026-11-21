@@ -4,7 +4,7 @@
 Both engines are driven through their OpenAI-compatible HTTP servers (/v1/chat/completions), with the same prompt
 text, same sampler settings and the same GGUF.  Server-side timings (llama.cpp's names, which Strata's server also
 emits) give prompt tok/s and decode tok/s; time to first token is the server's prompt_ms (non-streaming request,
-so TTFT = prompt processing time).  Peak VRAM comes from nvidia-smi polling (minus the idle baseline), RAM from the
+so TTFT = prompt processing time).  Peak VRAM comes from nvidia-smi polling, or the amdgpu sysfs counter when there is none (minus the idle baseline), RAM from the
 engine process tree (psutil RSS, which counts mmap'd file pages) and the system's used-memory delta.
 
     python bench_vs_llama.py prompts  --out DIR --tokenizer DIR --corpus FILE...     # build 4K / 32K prompt files
@@ -17,7 +17,7 @@ Interleaving: engines cannot be loaded together (12 GB card, 64 GB RAM), so one 
 (start, warm-up, cells, stop), and rounds alternate the config order.  Medians are taken over rounds.
 The caller holds the machine's GPU lock.  Processes are stopped by PID only.
 """
-import argparse, json, os, statistics, subprocess, sys, threading, time, urllib.request
+import argparse, glob, json, os, statistics, subprocess, sys, threading, time, urllib.request
 from pathlib import Path
 
 import psutil
@@ -35,12 +35,31 @@ def http(url, body=None, timeout=3600):
         return json.loads(r.read())
 
 
+def _amd_vram_file():
+    """sysfs file with the used VRAM of the AMD GPU with the most memory (the discrete card, not an iGPU), or None."""
+    best, best_total = None, 0
+    for d in glob.glob("/sys/class/drm/card[0-9]*/device"):
+        try:
+            total = int(open(d + "/mem_info_vram_total").read())
+            if total > best_total:
+                best, best_total = d + "/mem_info_vram_used", total
+        except (OSError, ValueError):
+            pass
+    return best
+
+
 def vram_used_mib():
+    """Used VRAM in MiB: nvidia-smi if it works, else the AMD sysfs counter; -1 if neither is readable."""
     try:
         out = subprocess.run(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
                              capture_output=True, text=True, timeout=20).stdout.split()
         return int(out[0])
     except Exception:
+        pass
+    try:
+        f = _amd_vram_file()
+        return int(open(f).read()) // (1024 * 1024) if f else -1
+    except (OSError, ValueError):
         return -1
 
 
@@ -73,6 +92,9 @@ class Engine:
         scfg = json.load(open(self.m["strata_cfg"], encoding="utf-8-sig"))
         scfg["port"] = PORT
         scfg.pop("vision", None)
+        # The server binds 127.0.0.1 here and chat() sends no key: an install's "api_key" would answer every request
+        # with 401. Leaving it out also keeps the key out of strata-cfg-<name>.json in the results folder.
+        scfg.pop("api_key", None)
         args = [a for a in scfg["args"]]
         for k, v in c.get("override", {}).items():          # replace "--flag value" pairs
             if k in args:

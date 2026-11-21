@@ -995,6 +995,10 @@ def _gemma_value(s: str, i: int):
                 i += 1
             if i >= len(s) or s[i] == close:
                 return out, i + 1
+            if not mapping and s[i] == "}":
+                # a list the model closed with the mapping's bracket (issue 174): it ends here, and the bracket is
+                # the mapping's.  Read as a value it was an empty word that used no text, and this loop never ended.
+                return out, i
             if mapping:
                 colon = s.find(":", i)
                 if colon < 0:

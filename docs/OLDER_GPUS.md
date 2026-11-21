@@ -246,15 +246,18 @@ Two other existing tuning options did not justify a recommendation on this machi
 
 ## AMD: building gfx906 and gfx1012
 
-Setup does not build these; build by hand and run `serve/server.py` with a config, as on any other card.
+Setup does not build these (but see gfx1012 under Windows below); build by hand and run `serve/server.py` with a
+config, as on any other card.
 
 - **gfx906** (MI50 / MI60 / Radeon VII, wave64): a separate opt-in build, `-DSTRATA_HIP_GFX906=ON
   -DCMAKE_HIP_ARCHITECTURES=gfx906` (not `STRATA_ENABLE_HIP`). Current ROCm no longer ships gfx906 libraries; the
   reporter used a community ROCm 7.14 image. Recipe, kernels and measurements: [AMD_HIP.md](AMD_HIP.md#gfx906-instinct-mi50--mi60-radeon-vii-wave64-built-from-source).
 - **gfx1012** (RX 5500 XT): the wave32 backend, `-DSTRATA_ENABLE_HIP=ON -DCMAKE_HIP_ARCHITECTURES=gfx1012`. HIP 5.7
   (Ubuntu's packages) works: older hipBLAS (0.x) is used through rocBLAS, the legacy HIP names and the missing
-  `__syncwarp` are version-gated, and RDNA1's missing signed dot4 uses llama.cpp's SDWA sequence
-  (`-DSTRATA_GFX1012_PORTABLE_DOT=ON`: the portable one).
+  `__syncwarp` are version-gated. Where the compiler has `__builtin_amdgcn_sdot4` for it, gfx1012 takes its native
+  signed dot4 (`v_dot4_i32_i8`; `-DSTRATA_GFX1012_SDWA_DOT=ON`: llama.cpp's SDWA sequence as before,
+  `-DSTRATA_GFX1012_PORTABLE_DOT=ON`: the portable one). Under Windows, setup installs strata-poly for it with
+  `STRATA_EXPERIMENTAL_GFX1012=1` (opt-in, one card measured): [RADEON_PRO_5500M.md](RADEON_PRO_5500M.md).
 
 ## Reports welcome
 

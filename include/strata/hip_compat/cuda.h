@@ -11,6 +11,13 @@
 #define STRATA_VMM_RELEASE_WITH_ADDRESSES 1
 #endif
 
+// ROCm on Linux maps a piece with amdgpu's GEM_VA call, which queues the page-table update and returns: the kernel
+// that touches the piece next can find its pages not there yet (Engine::vmm_settle() has the measurement and the
+// wait).  Windows' HIP runtime is another implementation, and the same use of a piece has not faulted there.
+#if !defined(_WIN32)
+#define STRATA_VMM_MAP_SETTLES 1
+#endif
+
 typedef hipError_t CUresult;
 typedef int CUdevice;
 // HIP's own CUdeviceptr/handle equivalents are pointer-typed; CUDA's are integers, and strata-poly's Mapped

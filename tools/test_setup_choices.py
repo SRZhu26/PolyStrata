@@ -347,6 +347,10 @@ class HipVision(unittest.TestCase):
                 (bdir / "bin" / setup.VEXE).write_bytes(b"vision")
 
             with mock.patch.object(setup, "ROOT", root), mock.patch.object(setup, "cmake_build", cmake_build), \
+                    mock.patch.object(setup, "WIN", False), \
+                    mock.patch.object(setup, "cpu_floor", lambda avx2: ""), \
+                    mock.patch.object(setup, "rocm_root", lambda archs: (root / "rocm", [str(root / "rocm" / "lib")])), \
+                    mock.patch.object(setup, "cpu_info", lambda: ("Test CPU", True, False)), \
                     mock.patch.object(setup, "source_hash", lambda paths: vsrc if paths == setup.VISION_SOURCES else src):
                 quiet(setup.build_engine_hip, {"arch": "gfx1201"}, "llama", vision)
             return built, json.loads((eng / "BUILD.json").read_text()), (eng / setup.VEXE).exists()
@@ -540,8 +544,10 @@ class CudaVision(unittest.TestCase):
                     (bdir / "bin" / setup.VEXE).write_bytes(b"vision")
 
                 with mock.patch.object(setup, "ROOT", root), mock.patch.object(setup, "cmake_build", cmake_build), \
+                        mock.patch.object(setup, "get_llama_cpp", return_value=Path("llama")), \
                         mock.patch.object(setup, "source_hash", lambda p: "V" if p == setup.VISION_SOURCES else "S"), \
                         mock.patch.object(setup, "install_build_tools", lambda gpu, yes: (str(root / "nvcc"), None)), \
+                        mock.patch.object(setup, "cpu_info", lambda: ("Test CPU", True, False)), \
                         mock.patch.object(setup, "source_version", lambda: "test"):
                     quiet(setup.build_engine, {"arch": "86"}, vision, True, "llama")
                 self.assertEqual([t for t, _ in built], ["strata-vision"])
@@ -612,10 +618,6 @@ class HostCompilers(unittest.TestCase):
             self.assertIn("-DCMAKE_CUDA_HOST_COMPILER=g++-14", defs, target)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class CalibrateWithModel(unittest.TestCase):
     """#2036: --calibrate --model X tunes model X (it used to fall through to a plain re-setup); a model that is not
     installed is an error that says so; --calibrate with --setup or --check says it does nothing."""
@@ -630,6 +632,7 @@ class CalibrateWithModel(unittest.TestCase):
             cfgs.append(p)
         tuned = []
         with mock.patch.object(sys, "argv", ["setup.py", *argv]), \
+                mock.patch.object(setup.sys, "platform", "win32" if setup.WIN else "linux"), \
                 mock.patch.object(setup, "installed_configs", lambda: cfgs), \
                 mock.patch.object(setup, "update_installed_engine", lambda *a, **k: None), \
                 mock.patch.object(setup, "calibrate_config", lambda c: tuned.append(c.name) or True), \
@@ -661,3 +664,49 @@ class CalibrateWithModel(unittest.TestCase):
             self.assertEqual(setup.calibration_targets(ps, "Q2_0", None), [ps[1]])
             self.assertEqual(setup.calibration_targets(ps, "Q2_0", "qwen"), [ps[1]])
             self.assertEqual(setup.calibration_targets(ps, "Q4_K_M", None), [])
+
+
+class EnsureEnginePortable(unittest.TestCase):
+    """--max-compatibility: ensure_engine_for() keeps portable=True from BUILD.json when it rebuilds for a new card."""
+
+    def test_rebuild_for_new_card_preserves_portable_flag(self):
+        cases = [
+            ({"archs": [86], "portable": True}, True),
+            ({"archs": [86], "portable": False}, False),
+            ({"archs": [86]}, False),
+        ]
+        for meta_in, want_portable in cases:
+            with self.subTest(meta=meta_in), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                eng = root / "engine"
+                eng.mkdir()
+                (eng / "BUILD.json").write_text(json.dumps(meta_in))
+                cfg_path = root / "strata-test.json"
+                cfg = {"exe": str(eng / setup.EXE), "lib_dirs": ["<orig>"]}
+                cards = [
+                    {"index": 0, "name": "RTX 3090", "arch": "86"},
+                    {"index": 1, "name": "RTX 4090", "arch": "89"},
+                ]
+                built = []
+
+                def fake_build(gpu, vision, yes, llama, toolkit=None, portable=False):
+                    built.append({"gpu": gpu, "portable": portable, "toolkit": toolkit})
+                    (eng / "BUILD.json").write_text(json.dumps({**meta_in, "archs": gpu["archs"],
+                                                                "cuda_dirs": ["<new>"]}))
+                    return eng
+
+                with mock.patch.object(setup, "ROOT", root), \
+                        mock.patch.object(setup, "engine_runs_on", lambda g, tk=13: int(g["arch"]) == 86), \
+                        mock.patch.object(setup, "gpu_info", lambda i=0: {"index": i, "name": "RTX 3090", "arch": "86"}), \
+                        mock.patch.object(setup, "get_llama_cpp", lambda: root / "llama.cpp"), \
+                        mock.patch.object(setup, "write_config", lambda p, c: None), \
+                        mock.patch.object(setup, "build_engine", fake_build):
+                    quiet(setup.ensure_engine_for, cards, cfg_path, cfg, True)
+
+                self.assertEqual(len(built), 1)
+                self.assertEqual(built[0]["gpu"]["archs"], [86, 89])
+                self.assertEqual(built[0]["portable"], want_portable)
+
+
+if __name__ == "__main__":
+    unittest.main()

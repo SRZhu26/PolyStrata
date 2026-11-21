@@ -197,6 +197,9 @@ class KvWhole(unittest.TestCase):
     def test_once(self):
         self.assertEqual(self.upgraded("hip", ["--kv-whole"]).count("--kv-whole"), 1)
 
+    def test_a_vram_pool_config_is_left_alone(self):
+        self.assertNotIn("--kv-whole", self.upgraded("hip", ["--vram-pool"]))
+
     def test_no_build_stamp_is_left_alone(self):
         with tempfile.TemporaryDirectory() as d:
             cfg = {"exe": str(Path(d) / "engine-poly" / setup.POLY_EXE), "args": ["--model", "m.gguf"]}

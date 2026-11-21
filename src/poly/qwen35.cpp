@@ -2,6 +2,8 @@
 // llama.cpp's qwen35moe graph.
 #include "qwen35.hpp"
 
+#include "q35_scratch_arena.hpp"
+
 #include "fattn.hpp"
 
 #include "runtime.hpp"
@@ -197,26 +199,63 @@ void Qwen35::alloc_caches() {
 // Per-token buffers hold rows_ tokens, row after row.
 void Qwen35::assign_scratch() {
     const size_t n = (size_t) rows_, heads = n * n_head_ * head_dim_, kv = n * n_kv_ * head_dim_;
-    proj_ = fbuf(n * conv_dim_);
-    qkv_ = fbuf(n * conv_dim_);
-    z_ = fbuf(n * d_inner_);
-    alpha_ = fbuf(n * v_heads_);
-    beta_ = fbuf(n * v_heads_);
-    gated_ = fbuf(n * d_inner_);
+    // Recurrent and full-attention layers consume these temporary families in
+    // separate phases on the same compute stream. Keep members within a family
+    // disjoint, and keep score_/q8w_/persistent state outside this arena.
+    // Metal retains its existing balanced allocation policy.
+#if defined(STRATA_GPU_METAL)
+    constexpr bool scratch_alias = false;
+#else
+    constexpr bool scratch_alias = true;
+#endif
+    if (scratch_alias) {
+        const std::array<size_t, 6> recurrent = {
+            n * conv_dim_, n * conv_dim_, n * d_inner_, n * v_heads_, n * v_heads_, n * d_inner_};
+        const std::array<size_t, 7> attention = {
+            2 * heads, heads, kv, kv, kv, heads,
+            rows_ >= kStageRows ? heads + heads / 2 + 1 + 3 * n * n_head_ : 0};
+        const auto layout = poly_scratch::plan(recurrent, attention);
+        float* arena = fbuf(layout.total);
+        auto at = [&](size_t offset) { return arena != nullptr ? arena + offset : nullptr; };
+        proj_ = at(layout.a[0]);
+        qkv_ = at(layout.a[1]);
+        z_ = at(layout.a[2]);
+        alpha_ = at(layout.a[3]);
+        beta_ = at(layout.a[4]);
+        gated_ = at(layout.a[5]);
+        qg_ = at(layout.b[0]);
+        q_ = at(layout.b[1]);
+        kraw_ = at(layout.b[2]);
+        k_ = at(layout.b[3]);
+        v_ = at(layout.b[4]);
+        att_ = at(layout.b[5]);
+        if (rows_ >= kStageRows) awork_ = at(layout.b[6]);
+    } else {
+        proj_ = fbuf(n * conv_dim_);
+        qkv_ = fbuf(n * conv_dim_);
+        z_ = fbuf(n * d_inner_);
+        alpha_ = fbuf(n * v_heads_);
+        beta_ = fbuf(n * v_heads_);
+        gated_ = fbuf(n * d_inner_);
 
-    qg_ = fbuf(2 * heads);
-    q_ = fbuf(heads);
-    kraw_ = fbuf(kv);
-    k_ = fbuf(kv);
-    v_ = fbuf(kv);
-    att_ = fbuf(heads);
-    score_ = fbuf((size_t) chunk_ * n_head_ * opt_.max_context);
-    sg_ = fbuf(n);
-    if (rows_ >= kStageRows) awork_ = fbuf(heads + heads / 2 + 1 + 3 * n * n_head_);   // a prompt batch's attention
-    if (rows_ >= kStageRows && opt_.kv_format == KvFmt::kQ8_0) {
-        // the K and V blocks a q8 prompt batch dequantizes, side by side; work_halves_ halves each
-        work_halves_ = kQ8WorkRows * (size_t) n_kv_ * head_dim_;
-        q8w_ = fbuf((2 * work_halves_ + 1) / 2);
+        qg_ = fbuf(2 * heads);
+        q_ = fbuf(heads);
+        kraw_ = fbuf(kv);
+        k_ = fbuf(kv);
+        v_ = fbuf(kv);
+        att_ = fbuf(heads);
+    }
+#if defined(STRATA_GPU_METAL)
+    if (!opt_.metal_balanced)
+#endif
+    {
+        score_ = fbuf((size_t) chunk_ * n_head_ * opt_.max_context);
+        if (!scratch_alias && rows_ >= kStageRows) awork_ = fbuf(heads + heads / 2 + 1 + 3 * n * n_head_);   // a prompt batch's attention
+        if (rows_ >= kStageRows && opt_.kv_format == KvFmt::kQ8_0) {
+            // the K and V blocks a q8 prompt batch dequantizes, side by side; work_halves_ halves each
+            work_halves_ = kQ8WorkRows * (size_t) n_kv_ * head_dim_;
+            q8w_ = fbuf((2 * work_halves_ + 1) / 2);
+        }
     }
     if (gdn_mma_.initialize([&] {
 #ifdef STRATA_POLY_GDN_MMA
@@ -272,6 +311,7 @@ void Qwen35::assign_scratch() {
         hip_value_split_logged_ = true;
     }
 #endif
+    sg_ = fbuf(n);
 }
 
 // A recurrent layer's convolution and delta-rule state lie one behind the other in state_ (alloc_caches()).
@@ -370,13 +410,19 @@ void Qwen35::gdn(Block& B, int n) {
     lin(B.wz, xn_, z_, n, xq_);
     lin(B.alpha, xn_, alpha_, n, xq_);
     lin(B.beta, xn_, beta_, n, xq_);
-    if (rows_of_) {   // step(): each row with its own sequence's convolution and state
-        for (int i = 0; i < n; ++i) {
+    if (rows_of_) {   // step(): each sequence's rows with its own convolution and state
+        for (int i = 0, m; i < n; i += m) {
+            // a token and its guess (step() with guesses) go in one call, a window of two, leaving the state after
+            // the first at its snap for keep_step()
             const int s = rows_of_[i].seq;
+            m = i + 1 < n && rows_of_[i + 1].seq == s ? 2 : 1;
+            float* snap = rows_of_[i].snap;
             const size_t c = (size_t) i * conv_dim_, h = (size_t) i * v_heads_, d = (size_t) i * d_inner_;
-            conv4_silu(proj_ + c, seq_state(s, B.past), fp(B.conv), qkv_ + c, conv_dim_, 1, st_);
+            conv4_silu(proj_ + c, seq_state(s, B.past), fp(B.conv), qkv_ + c, conv_dim_, m, st_,
+                       snap ? snap + (B.past - state_) : nullptr, rec_n_, snap ? 1u : 0u);
             gdn_step(qkv_ + c, alpha_ + h, beta_ + h, fp(B.dt), fp(B.a), seq_state(s, B.s), z_ + d, fp(B.o_norm),
-                     gated_ + d, s_dim_, v_heads_, k_heads_, 1, rms_eps_, st_);
+                     gated_ + d, s_dim_, v_heads_, k_heads_, m, rms_eps_, st_, snap ? snap + (B.s - state_) : nullptr,
+                     rec_n_, snap ? 1u : 0u);
         }
     } else {
         conv4_silu(proj_, B.past, fp(B.conv), qkv_, conv_dim_, n, st_,
@@ -517,7 +563,8 @@ void Qwen35::attn(Block& B, int64_t pos, int n) {
                                          n_kv_, scale, score_, (size_t) chunk_ * n_head_ * opt_.max_context, st_))))
         attend(q_, q8 ? nullptr : B.keys, q8 ? nullptr : B.vals, pos, n, score_, chunk_, att_, head_dim_, n_head_,
                n_kv_, scale, st_, 0, 0, false, at, at ? room(n) : 0, /*score_floats*/ 0,
-               q8 ? Kvq8{B.k_codes, B.k_scales} : Kvq8{}, q8 ? Kvq8{B.v_codes, B.v_scales} : Kvq8{});
+               q8 ? Kvq8{B.k_codes, B.k_scales} : Kvq8{}, q8 ? Kvq8{B.v_codes, B.v_scales} : Kvq8{}, nullptr,
+               (size_t) chunk_ * n_head_ * opt_.max_context /*part_floats: STRATA_HIP_SPLIT_ATTEND's partial sums*/);
     mul_sigmoid(att_, qg_ + head_dim_, head_dim_, n * n_head_, 2 * head_dim_, false, st_);
     lin(B.wo, att_, ao_, n);
 }
@@ -550,38 +597,40 @@ void Qwen35::attn_rows(Block& B, int n) {
     const float scale = 1.f / std::sqrt((float) head_dim_);
     const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
     const size_t kv = (size_t) n_kv_ * head_dim_, hq = (size_t) n_head_ * head_dim_;
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0, m; i < n; i += m) {
         const Row& r = rows_of_[i];
         const long long* ai = at + 2 * i;
-        // a row at a time: the turn takes one position and counts on from it, which suits a window's rows only
+        // a sequence's rows at a time: one, or a token and its guess (step() with guesses), a window of two.  The
+        // turn takes one position and counts on from it, which suits a window's rows only.
+        m = i + 1 < n && rows_of_[i + 1].seq == r.seq ? 2 : 1;
         head_norm_rope(qg_ + 2 * i * hq, 2 * head_dim_, fp(B.q_norm), q_ + i * hq, head_dim_, n_head_, n_rot_,
-                       theta_scale_, 0, 1, rms_eps_, st_, nullptr, nullptr, sections_, ai + 1);
-        head_norm_rope(kraw_ + i * kv, head_dim_, fp(B.k_norm), k_ + i * kv, head_dim_, n_kv_, n_rot_, theta_scale_, 0, 1,
+                       theta_scale_, 0, m, rms_eps_, st_, nullptr, nullptr, sections_, ai + 1);
+        head_norm_rope(kraw_ + i * kv, head_dim_, fp(B.k_norm), k_ + i * kv, head_dim_, n_kv_, n_rot_, theta_scale_, 0, m,
                        rms_eps_, st_, nullptr, nullptr, sections_, ai + 1);
         Kvq8 kq{}, vq{};
         uint16_t *kc = nullptr, *vc = nullptr;
         if (q8) {
             kq = {(int8_t*) seq_buf(r.seq, B.k_codes), (uint16_t*) seq_buf(r.seq, B.k_scales)};
             vq = {(int8_t*) seq_buf(r.seq, B.v_codes), (uint16_t*) seq_buf(r.seq, B.v_scales)};
-            store_q8_at(k_ + i * kv, (int8_t*) kq.codes, (uint16_t*) kq.scales, (int) kv, ai, 1, 0, st_);
-            store_q8_at(v_ + i * kv, (int8_t*) vq.codes, (uint16_t*) vq.scales, (int) kv, ai, 1, 0, st_);
+            store_q8_at(k_ + i * kv, (int8_t*) kq.codes, (uint16_t*) kq.scales, (int) kv, ai, m, 0, st_);
+            store_q8_at(v_ + i * kv, (int8_t*) vq.codes, (uint16_t*) vq.scales, (int) kv, ai, m, 0, st_);
         } else {
             kc = (uint16_t*) seq_buf(r.seq, B.keys);
             vc = (uint16_t*) seq_buf(r.seq, B.vals);
-            store_f16_at(k_ + i * kv, kc, (int) kv, ai, 1, 0, st_);
-            store_f16_at(v_ + i * kv, vc, (int) kv, ai, 1, 0, st_);
+            store_f16_at(k_ + i * kv, kc, (int) kv, ai, m, 0, st_);
+            store_f16_at(v_ + i * kv, vc, (int) kv, ai, m, 0, st_);
         }
         const int64_t keep = pos_;
         pos_ = r.pos;
-        const int sized = room(1);
+        const int sized = room(m);
         pos_ = keep;
         const size_t sf = (size_t) chunk_ * n_head_ * opt_.max_context;
         if (!(fdec_ && r.pos >= fdec_from_ &&
-              (q8 ? fdec_q8(q_ + i * hq, kq, vq, r.pos, 1, ai, sized, att_ + i * hq, head_dim_, n_head_, n_kv_,
+              (q8 ? fdec_q8(q_ + i * hq, kq, vq, r.pos, m, ai, sized, att_ + i * hq, head_dim_, n_head_, n_kv_,
                                      scale, score_, sf, st_)
-                           : fdec_f16(q_ + i * hq, kc, vc, r.pos, 1, ai, sized, att_ + i * hq, head_dim_, n_head_,
+                           : fdec_f16(q_ + i * hq, kc, vc, r.pos, m, ai, sized, att_ + i * hq, head_dim_, n_head_,
                                       n_kv_, scale, score_, sf, st_))))
-            attend(q_ + i * hq, kc, vc, r.pos, 1, score_, chunk_, att_ + i * hq, head_dim_, n_head_, n_kv_, scale, st_,
+            attend(q_ + i * hq, kc, vc, r.pos, m, score_, chunk_, att_ + i * hq, head_dim_, n_head_, n_kv_, scale, st_,
                    0, 0, false, ai, sized, 0, kq, vq);
     }
     mul_sigmoid(att_, qg_ + head_dim_, head_dim_, n * n_head_, 2 * head_dim_, false, st_);

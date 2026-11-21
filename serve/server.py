@@ -14,7 +14,8 @@ Images (optional, when the config has a "vision" entry): OpenAI image_url parts 
 data, http(s) URLs or local file paths) go through `strata-vision` (the model's mmproj file) and reach the engine as
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
 converted to PNG first with Pillow.
-Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated.
+Requests whose prompt plus max tokens exceed the engine's context are rejected with 400 by default. The opt-in
+`truncate_middle` setting can trim an oversized text prompt while keeping its beginning and ending.
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
 
 The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
@@ -803,6 +804,10 @@ class StrataEngine:
     last_err = None                      # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
     turn_ids = frozenset()               # Service: the tokens that open a chat turn (turn_key()); survives restart()
+    # Service: the tokens the engine itself ends a reply on (its default --eos-ids); survives restart().  A slot request
+    # whose last token is one of them has its BDONE right behind it.  EOS_IDS is ChatML's: a Gemma reply ending at
+    # <turn|> was taken for a consumer that left early, and the slot went down the BSTOP path (#1994, #1603).
+    eos_ids = frozenset(EOS_IDS)
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
     # own thread, so each one reads its own request's figures (Service.run records them); one at a time, the one dict.
@@ -824,8 +829,11 @@ class StrataEngine:
 
     @property
     def disk_sessions(self) -> bool:
-        """SAVE / RESTORE: the Strata project's engine has them, strata-poly does not (issue 114)."""
-        return Path(str(self.spawn[0])).stem.lower() not in ("strata-poly", "strata-glm")
+        """SAVE / RESTORE: the Strata project's engine has them.  strata-poly says so in its INFO line (sessions=1);
+        one from before that, and strata-glm, answer them with a refusal (issue 114)."""
+        if Path(str(self.spawn[0])).stem.lower() not in ("strata-poly", "strata-glm"):
+            return True
+        return bool((self.info or {}).get("sessions"))
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
@@ -1423,6 +1431,8 @@ class StrataEngine:
         says BDONE (in the background).  `stream`: the prompt and every token of it so far - with the tokens still to
         come before BDONE, all but the last are what the slot holds then (the next turn of its conversation)."""
         if slot >= len(self.slot_q):                    # the engine restarted with fewer slots: this one is gone
+            with self.slot_cv:
+                self.slot_claims.discard(slot)
             return
         try:
             self._send(f"BSTOP {slot}")
@@ -1430,7 +1440,14 @@ class StrataEngine:
             pass
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
         releasing = self.slot_releasing
-        releasing.add(slot)
+        # The BDONE wait owns it from here, and the request's claim goes in the same step, before the wait starts.
+        # Dropped after it (the caller did), a BDONE already queued let the wait free the slot and the next request
+        # claim it first: the drop then took THAT request's claim, the reaper freed the slot under it as ownerless,
+        # and the engine refused the BGEN that followed (#1994, #1603).
+        with self.slot_cv:
+            releasing.add(slot)
+            self.slot_claims.discard(slot)
+            self._orphan_seen.pop(slot, None)
 
         def wait():
             end = time.monotonic() + 600.0
@@ -1459,6 +1476,14 @@ class StrataEngine:
                 self.slot_cv.notify_all()
         threading.Thread(target=wait, daemon=True).start()
 
+    def _claim_slot(self, slot: int) -> None:
+        """A request takes `slot` (the caller holds slot_cv).  Its earlier sighting as ownerless is dropped: kept, the
+        next moment it looked ownerless (a hand-over) counted from that old sighting, and the reaper freed a slot in use
+        at once instead of after ORPHAN_SLOT_S."""
+        self.slot_busy[slot] = True
+        self.slot_claims.add(slot)
+        self._orphan_seen.pop(slot, None)
+
     BGEN_REFUSALS_MAX = 6    # #1994: how often one request tries another slot after the engine refused a BGEN
     SLOT_PARK_S = 2.0        # ... and how long a refused slot stays out of the picks
 
@@ -1468,6 +1493,7 @@ class StrataEngine:
         with self.slot_cv:
             self.slot_claims.discard(slot)
             self.slot_busy[slot] = True
+            self._orphan_seen.pop(slot, None)
         busy = self.slot_busy
 
         def free():
@@ -1643,8 +1669,7 @@ class StrataEngine:
                             with self.slot_cv:          # the slot the part read will wait in
                                 reserved = self.pick_slot(prompt)
                                 if reserved is not None:
-                                    self.slot_busy[reserved] = True
-                                    self.slot_claims.add(reserved)
+                                    self._claim_slot(reserved)
                             if reserved is not None:
                                 self._send(f"BYIELD {reserved}")
                     for x in self._control(cancel, pending.append, stop_when=others, on_quiet=give_way):
@@ -1673,7 +1698,7 @@ class StrataEngine:
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
+                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in self.eos_ids):
                             return
                         if reused0 is None:
                             reused0 = (self.last or {}).get("reused")
@@ -1691,8 +1716,7 @@ class StrataEngine:
                             with self.slot_cv:
                                 slot = self.pick_slot(prompt)
                                 if slot is not None:
-                                    self.slot_busy[slot] = True
-                                    self.slot_claims.add(slot)
+                                    self._claim_slot(slot)
                                     if admit_wait:
                                         admit_wait = False
                                         self.admitting = max(0, self.admitting - 1)
@@ -1838,7 +1862,7 @@ class StrataEngine:
                             self.slot_held[slot] = []
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
-                                and not (out and out[-1] in EOS_IDS)):
+                                and not (out and out[-1] in self.eos_ids)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
                             # last token are in them) and decodes with MTP drafts again
                             carry_leg(carry, self.last)         # #1869: the solo path's DONE replaces these figures
@@ -1874,7 +1898,7 @@ class StrataEngine:
             except EngineDied:
                 pass
             bdone_in = False
-            if phase == "slot" and slot is not None and out and out[-1] in EOS_IDS and self.gen == born:
+            if phase == "slot" and slot is not None and out and out[-1] in self.eos_ids and self.gen == born:
                 bd = self._bdone_after_eos(slot)            # (#1869) the slot's figures, not the admission's
                 if bd is not None:
                     self._apply_bdone(bd.split())
@@ -1906,8 +1930,7 @@ class StrataEngine:
                 elif phase == "slot":
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
-                    self._release_slot_when_done(slot, stream)    # freed at its BDONE
-                    self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
+                    self._release_slot_when_done(slot, stream)    # freed at its BDONE (the wait owns it now)
                 else:
                     with self.slot_cv:
                         self.slot_busy[slot] = False
@@ -2153,7 +2176,9 @@ class StrataEngine:
         return EngineSilent(f"{what}; the server ended the engine")
 
     def session_file(self, action: str, path: str) -> dict:
-        """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
+        """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO), and
+        strata-poly's `PIN <path>` (action "pin": the file's conversation is kept beside the conversation cache, and a
+        prompt that starts with it goes on from there; Service.pin_start).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
         malformed one, a bare ERR, an answer with negative counts or a non-finite time - means the two sides lost
@@ -2164,16 +2189,17 @@ class StrataEngine:
         a step that blocks in one call (a flush, the device transfer): until the next line the wait is that step's
         explicit allowance (at most SESSION_WAIT_MAX_S) when it is longer than engine_silence_s - no more, so a step
         that never ends is still ended."""
-        if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
+        send, want = {"save": ("SAVE", "SAVED"), "restore": ("RESTORE", "RESTORED"),
+                      "pin": ("PIN", "PINNED")}.get(action, ("", ""))
+        if not send or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+            self.proc.stdin.write(f"{send} {path}\n")
             self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         silence = float(self.silence_s or 0)
         heard = time.monotonic()
-        want = "SAVED" if action == "save" else "RESTORED"
 
         def out_of_step(line: str) -> EngineDied:
             self.ended = True                               # not alive from now: the next request restarts it
@@ -2324,6 +2350,11 @@ def vision_start_error(line: str, log=None) -> str:
                 "may use the card, and the engine already holds it. Check with: nvidia-smi --query-gpu=compute_mode "
                 "--format=csv; set it back with: sudo nvidia-smi -c DEFAULT (or run the encoder on another card). "
                 "First line from the encoder: " + (text or "(none)"))
+    if not text:   # it ended without a line (issue 162): the reason is in its stderr, the log's last lines
+        last = [ln.strip() for ln in tail.splitlines() if ln.strip()][-6:]
+        where = getattr(log, "name", None) or "the model's .log file"
+        return ("the vision encoder ended before it was ready; the last lines of " + where + ":\n" + "\n".join(last)
+                if last else "the vision encoder ended before it was ready and wrote nothing to " + where)
     return "the vision encoder did not start: " + text
 
 
@@ -2372,6 +2403,7 @@ class Vision:
             args += ["--max-tokens", str(cfg["max_tokens"])]
         if cfg.get("min_tokens"):                       # #767: mtmd's image_min_tokens (a hand-edited key)
             args += ["--min-tokens", str(cfg["min_tokens"])]
+        self.max_size = self.max_size_of(cfg.get("max_size"))   # opt-in: pictures larger than this box are scaled down
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
         self.proc = None
@@ -2502,12 +2534,54 @@ class Vision:
             return False
 
     @staticmethod
-    def normalize(data: bytes) -> bytes:
+    def max_size_of(value) -> tuple[int, int] | None:
+        """The vision section's "max_size": [W, H] or "WxH" (e.g. [2560, 1440]), or None when it is not set."""
+        if value in (None, "", 0, False):
+            return None
+        try:
+            w, h = (value.lower().split("x") if isinstance(value, str) else value)
+            w, h = int(w), int(h)
+        except (TypeError, ValueError):
+            raise ValueError(f'the vision section\'s "max_size" {value!r}: give [width, height], e.g. [2560, 1440]') \
+                from None
+        if w < 1 or h < 1:
+            raise ValueError(f'the vision section\'s "max_size" {value!r}: both sides must be at least 1')
+        return w, h
+
+    @staticmethod
+    def fit(size: tuple[int, int], box: tuple[int, int] | None) -> tuple[int, int] | None:
+        """The size a `size` picture is scaled down to so it fits `box` either way round (its long side within the
+        box's long side, its short side within the short one, the aspect ratio kept), or None when it fits as it
+        is.  [2560, 1440] takes 3840x2160 to 2560x1440 and a 1440x3200 phone screenshot to 1152x2560."""
+        w, h = size
+        if not box or w < 1 or h < 1:
+            return None
+        s = min(max(box) / max(w, h), min(box) / min(w, h))
+        return None if s >= 1 else (max(1, round(w * s)), max(1, round(h * s)))
+
+    @staticmethod
+    def _too_big(data: bytes, box: tuple[int, int] | None) -> bool:
+        """Whether a picture is larger than `box` (read from its header).  False without Pillow or for a file
+        Pillow cannot read: the image then goes through as it was, and the encoder's max_tokens still caps it."""
+        if not box:
+            return False
+        try:
+            import io
+            from PIL import Image
+            with Image.open(io.BytesIO(data)) as im:
+                return Vision.fit(im.size, box) is not None
+        except Exception:  # noqa: BLE001 - any failure leaves the image as it was sent
+            return False
+
+    @staticmethod
+    def normalize(data: bytes, max_size: tuple[int, int] | None = None) -> bytes:
         """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG.
-        A JPEG with an EXIF Orientation other than 1 is turned upright first (needs Pillow)."""
+        A JPEG with an EXIF Orientation other than 1 is turned upright first (needs Pillow).  `max_size` (the
+        vision section's "max_size", opt-in): a picture larger than that box either way round is scaled down to
+        fit it (Lanczos, aspect ratio kept) and passed on as a PNG; one that fits is untouched."""
         jpeg = data[:3] == b"\xff\xd8\xff"
-        if (jpeg and not Vision._exif_rotated(data)) or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or \
-                data[:6] in (b"GIF87a", b"GIF89a"):
+        if ((jpeg and not Vision._exif_rotated(data)) or data[:8] == b"\x89PNG\r\n\x1a\n" or data[:2] == b"BM" or
+                data[:6] in (b"GIF87a", b"GIF89a")) and not Vision._too_big(data, max_size):
             return data
         try:
             import io
@@ -2529,6 +2603,9 @@ class Vision:
             im = bg
         elif im.mode != "RGB":
             im = im.convert("RGB")
+        smaller = Vision.fit(im.size, max_size)
+        if smaller is not None:
+            im = im.resize(smaller, Image.LANCZOS)
         out = io.BytesIO()
         im.save(out, format="PNG")
         return out.getvalue()
@@ -2547,7 +2624,9 @@ class Vision:
     def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
         """-> (embeddings file, number of image tokens).  `source`: what load() reads, or the image's bytes.
         `keep`: files the caller still needs (never evicted by this call)."""
-        data = self.normalize(source if isinstance(source, bytes) else self.load(source))
+        raw = source if isinstance(source, bytes) else self.load(source)
+        box = getattr(self, "max_size", None)
+        data = self.normalize(raw, box) if box else self.normalize(raw)
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             if key in self.cache:
@@ -2728,8 +2807,10 @@ def engine_args(cfg: dict) -> list[str]:
     if layer_split_of(cfg) and cfg.get("split_skip_if_fits") and "--split-skip-if-fits" not in args:
         args.append("--split-skip-if-fits")
     # #533 (opt-in): "vram_elastic": true - the expert cache in segments, so POST /v1/vram can give VRAM back to other
-    # programs and take it back; "vram_segment_mib" sets the segment size (the engine's default: 512)
-    if cfg.get("vram_elastic") is True and "--vram-elastic" not in args:
+    # programs and take it back; "vram_segment_mib" sets the segment size (the engine's default: 512).  strata-poly
+    # has neither option and ends at one it does not know: its cache is resized by VRAM as it is (vram_elastic=1 in
+    # its INFO line)
+    if cfg.get("vram_elastic") is True and "--vram-elastic" not in args and not poly:
         args.append("--vram-elastic")
         seg = cfg.get("vram_segment_mib")
         if isinstance(seg, int) and not isinstance(seg, bool) and seg > 0 and "--vram-segment-mib" not in args:
@@ -3202,6 +3283,7 @@ class Service:
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.drop_oldest = False                      # #17 (opt-in): a conversation too long loses its oldest turns
+        self.truncate_middle = False                  # opt-in: keep a prompt's beginning and ending when it will not fit
         self.preserve_thinking = False                # #25 (opt-in): earlier turns keep their thinking in the prompt
         self.reasoning_memory: collections.OrderedDict[str, str] = collections.OrderedDict()   # remember_reasoning()
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
@@ -3312,6 +3394,10 @@ class Service:
             special = getattr(tokenizer, "special_ids", None) or {}
             self.stop_ids = {special[k] for k in ("tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id",
                                                   "tokenizer.ggml.eom_token_id") if k in special}
+        # these are exactly the engine's default --eos-ids (a ChatML model's <|im_end|> and <|endoftext|>, else the
+        # GGUF's eos, eot and eom): what it ends a slot's reply on.  The model-specific stops added below are not.
+        if self.stop_ids:
+            self.engine.eos_ids = frozenset(self.stop_ids)
         # the tokenizer's own tokens under the names a template knows them by (Gemma's starts with bos_token)
         special = getattr(tokenizer, "special_ids", None) or {}
         self.template_tokens = {name: tokenizer.decode([special[key]]) for name, key in (
@@ -3370,15 +3456,26 @@ class Service:
         config = Path(self.config_path)
         return config.with_name(config.stem + ".warm-start")
 
-    def keep_start(self, ids) -> None:
+    def keep_start(self, ids, seed: bool = False) -> None:
         """"warm_start": keep the prompt's first turn (the system prompt with the tools) for start_warm(), when it is
-        long and not the one kept already."""
+        long and not the one kept already.  A first turn that leaves the kept one after a long common start (a date
+        or a folder written near its end) keeps that common start: it is what the next chat begins with as well, and
+        the session file made of it (pin_start()) ends where a chat can go on from.  `seed`: the first turn is the
+        config's own ("warm_start": "FILE"); it replaces a kept start that is not a part of it."""
         opens = (i for i, t in enumerate(ids) if t in self.turn_ids)
         next(opens, None)
         end = next(opens, None)                         # the second turn's opener: the first turn ends there
-        if end is None or end < WARM_MIN_TOKENS or ids[:end] == self.warm_ids:
+        if end is None:
             return
-        self.warm_ids = ids[:end]
+        first, kept = ids[:end], self.warm_ids or []
+        same = len(os.path.commonprefix([kept, first]))
+        if seed and WARM_MIN_TOKENS <= same == len(kept):
+            return
+        if not seed and WARM_MIN_TOKENS <= same < end:
+            first = first[:same]
+        if len(first) < WARM_MIN_TOKENS or first == kept:
+            return
+        self.warm_ids = first
         path = self.warm_path()
         tmp = path.with_name(f"{path.name}.{threading.get_ident()}.tmp")
         try:
@@ -3387,41 +3484,96 @@ class Service:
         except OSError as e:
             print(f"[strata] warm start: {path} could not be written ({e})", flush=True)
 
+    def pin_path(self) -> Path:
+        """The kept start as the engine saved it (a session file), next to warm_path().  The name says which start it
+        is: another start gets another file."""
+        path = self.warm_path()
+        return path.with_name(f"{path.name}-{hashlib.sha256(json.dumps(self.warm_ids).encode()).hexdigest()[:16]}.bin")
+
+    def pin_start(self, make: bool = False) -> bool:
+        """"warm_start" with an engine that pins (strata-poly's INFO pinned_tokens, one conversation at a time): the
+        kept start is pinned from its session file, and a chat that begins with it goes on from there whatever the
+        engine read in between.  `make`: the engine has just read the kept start (start_warm(): there was no file, or
+        the engine refused it - another engine version's, another model file's), and the file is written from that
+        first.  The caller holds self.fifo.  False: nothing is pinned, and requests read the start as before."""
+        info = getattr(self.engine, "info", None) or {}
+        if not self.warm_ids or "pinned_tokens" not in info or getattr(self.engine, "batch", False):
+            return False
+        path = self.pin_path()
+        try:
+            if make:
+                self.engine.session_file("save", str(path))
+                for old in path.parent.glob(f"{self.warm_path().name}-*.bin"):
+                    if old != path:                     # an earlier start's
+                        with contextlib.suppress(OSError):
+                            old.unlink()
+            elif not path.is_file():
+                return False
+            r = self.engine.session_file("pin", str(path))
+        except (SessionRefused, EngineDied, ValueError, OSError) as e:
+            print(f"[strata] warm start: the kept prompt start is not pinned from {path.name} ({e})", flush=True)
+            return False
+        print(f"[strata] warm start: the {r['tokens']}-token prompt start is pinned from {path.name} "
+              f"({r['bytes'] >> 20} MiB, {r['ms'] / 1000:.1f} s)", flush=True)
+        return True
+
     def start_warm(self) -> None:
         """"warm_start": read the prompt start keep_start() kept when the server ran last, so that the first request
         that starts with it again reads only what follows.  A request stops the read (run() sets warm_stop); the part
-        read stays cached."""
+        read stays cached.  An engine that pins takes the start from its session file instead (pin_start()), and
+        reads it only to write that file.  "warm_start": "FILE" names a chat request (messages and tools, as
+        /v1/chat/completions takes them) whose first turn is the start, for an installation that knows its agent's
+        system prompt before the first request."""
         if not self.warm_start or not self.loaded():
             return
         path = self.warm_path()
         try:
             ids = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return
+            ids = None
         except (OSError, ValueError) as e:
             print(f"[strata] warm start: {path} cannot be read ({e})", flush=True)
-            return
-        if not (isinstance(ids, list) and WARM_MIN_TOKENS <= len(ids) < self.engine.max_context and
+            ids = None
+        if ids is not None and not (
+                isinstance(ids, list) and WARM_MIN_TOKENS <= len(ids) < self.engine.max_context and
                 all(isinstance(t, int) and not isinstance(t, bool) and t >= 0 for t in ids)):
             print(f"[strata] warm start: {path} is not a kept prompt start; ignored", flush=True)
-            return
+            ids = None
         self.warm_ids = ids
+        if isinstance(self.warm_start, str):
+            seed = Path(self.config_path).parent / self.warm_start
+            try:
+                messages, tools, kwargs = openai_to_messages(json.loads(seed.read_text(encoding="utf-8-sig")))
+                self.keep_start(self.encode_prompt(messages, tools, kwargs, store=False), seed=True)
+            except FileNotFoundError:                   # the agent writes it later: a start without it, as before
+                print(f"[strata] warm start: {seed} is not there yet", flush=True)
+            except Exception as e:                      # whatever is wrong with the file, the server starts
+                print(f"[strata] warm start: {seed} is not a chat request this server can read ({e}); ignored",
+                      flush=True)
+        ids = self.warm_ids
+        if ids is None or len(ids) >= self.engine.max_context:
+            return
         stop = self.warm_stop = threading.Event()
 
         def warm():
             t0, read = time.perf_counter(), 0
             try:
                 with self.fifo:
-                    if not stop.is_set():               # read to the end: the one token comes after the prompt
+                    if self.pin_start():                # no read: also after a request that came first
+                        return
+                    if not stop.is_set():
+                        print(f"[strata] warm start: reading the {len(ids)}-token prompt start kept last time",
+                              flush=True)
+                        # read to the end: the one token comes after the prompt
                         read = sum(t is not None for t in self.engine.generate(ids, 1, {}, stop))
+                    took = time.perf_counter() - t0
+                    print(f"[strata] warm start: read {len(ids)} tokens in {took:.1f} s" if read else
+                          f"[strata] warm start: stopped for a request after {took:.1f} s", flush=True)
+                    if read:
+                        self.pin_start(make=True)
             except Exception as e:                      # the next request starts a dead engine again (run())
                 print(f"[strata] warm start failed: {e}", flush=True)
-                return
-            took = time.perf_counter() - t0
-            print(f"[strata] warm start: read {len(ids)} tokens in {took:.1f} s" if read else
-                  f"[strata] warm start: stopped for a request after {took:.1f} s", flush=True)
 
-        print(f"[strata] warm start: reading the {len(ids)}-token prompt start kept last time", flush=True)
         threading.Thread(target=warm, name="warm-start", daemon=True).start()
 
     def models(self) -> list[dict]:
@@ -3627,7 +3779,7 @@ class Service:
             for e in self.models():
                 if e["current"] or e["status"] == "unavailable":
                     continue
-                other = {"id": e["id"], "object": "model",
+                other = {"id": e["id"], "object": "model", "source": "preset",   # llama-server's router: loads on use
                          "status": {"value": "loading" if e["status"] == "loading" else "unloaded"},
                          **({"meta": {"n_ctx": e["context"]}} if e["context"] else {}),
                          "architecture": {"input_modalities": ["text", "image"] if e["multimodal"] else ["text"],
@@ -3680,7 +3832,9 @@ class Service:
                 # under the FIFO: a model switch replaces the engine there (issue 114: strata-poly got the command and
                 # its reply made the server end it)
                 if not getattr(self.engine, "disk_sessions", True):
-                    return error(501, "slot save/restore is not available with strata-poly, this model's engine")
+                    return error(501, "slot save/restore is not available with this model's engine "
+                                      f"({Path(str(self.engine.spawn[0])).stem}); strata-poly has it after "
+                                      "0.1.45-poly.9")
                 with self.status_lock:
                     self.status.update(busy=True, phase="saving the session" if action == "save"
                                        else "restoring a session", started=time.time(), first_token=None,
@@ -3934,6 +4088,8 @@ class Service:
                 self.vision.unload()
             raise
         print("[strata] the engine is running again", flush=True)
+        if self.warm_start:                              # the kept prompt start, when its session file is there
+            self.pin_start()
         if self.restore_after_load:                      # an image job unloaded it: its conversation comes back
             images_api.restore_session(self)
         if self.vram_reserve is not None and hasattr(self.engine, "vram"):   # #533: the reserve asked for last
@@ -4445,6 +4601,26 @@ class Service:
                   f"were left out (drop_oldest)", flush=True)
         return messages, ids
 
+    def truncate_prompt_middle(self, ids, max_new):
+        """With "truncate_middle": true, keep the prompt's beginning and ending when text alone exceeds context.
+
+        Leave room for an explicitly requested answer, or one eighth of the context when no answer limit was given.
+        Image prompts are excluded by the caller because cutting encoded image embeddings would corrupt their layout.
+        """
+        ctx = self.engine.max_context or getattr(self.engine, "known_ctx", 0)
+        if ctx <= 0:
+            return ids
+        answer_room = max_new if max_new is not None and max_new > 0 else ctx // 8
+        prompt_room = ctx - CTX_SLACK - answer_room
+        if prompt_room < 1 or len(ids) <= prompt_room:
+            return ids
+        keep_start = (prompt_room + 1) // 2
+        keep_end = prompt_room - keep_start
+        removed = len(ids) - prompt_room
+        print(f"[strata] the prompt did not fit the context ({ctx} tokens): its {removed} middle tokens were "
+              f"left out (truncate_middle)", flush=True)
+        return ids[:keep_start] + (ids[-keep_end:] if keep_end else [])
+
     def forget_prompt(self, ids):
         if self.prompts is not None:
             self.prompts.forget(ids)
@@ -4465,9 +4641,11 @@ class Service:
             encoded_ids = ids
         if force and kwargs.get("enable_thinking", True) is False:
             ids = ids + self.tok.encode(force, parse_special=True)
+        images = images_of(messages)
+        if self.truncate_middle and not images:
+            ids = self.truncate_prompt_middle(ids, max_new)
         self.embeddings.path = None
         self.embeddings.keys = None
-        images = images_of(messages)
         if images:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
@@ -6027,7 +6205,7 @@ def make_handler(svc: Service):
             elif path in ("/health", "/api/health"):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
-                                 "image_generation": svc.images is not None,
+                                 "image_generation": svc.images is not None, "api_monitor": svc.api_monitor,
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
@@ -7357,6 +7535,9 @@ def model_settings(cfg: dict, overrides: dict | None = None) -> dict:
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise ValueError(f"anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
+    warm = cfg.get("warm_start", False)                # true, or the chat request whose first turn is the start
+    if not isinstance(warm, (bool, str)) or warm == "":
+        raise ValueError(f"\"warm_start\" must be true, false or the path of a chat request (a JSON file), not {warm!r}")
     rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # #606: opt-out with 0
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
         raise ValueError(f"\"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
@@ -7377,6 +7558,7 @@ def model_settings(cfg: dict, overrides: dict | None = None) -> dict:
         "fit_max_tokens": bool(over.get("fit_max_tokens")) or cfg.get("fit_max_tokens") is True,
         "reasoning_close_retry": cfg.get("reasoning_close_retry") is True,   # #1053: opt-in, off by default
         "drop_oldest": cfg.get("drop_oldest") is True,                       # #17: opt-in, off by default
+        "truncate_middle": cfg.get("truncate_middle") is True,               # opt-in, off by default
         "preserve_thinking": cfg.get("preserve_thinking") is True,           # #25: opt-in, off by default
         "config_effort": effort,
         "codex_thread_titles": cfg.get("codex_thread_titles") is True,       # #923: opt-in, off by default
@@ -7384,7 +7566,7 @@ def model_settings(cfg: dict, overrides: dict | None = None) -> dict:
         "aliases": alias_list(cfg.get("aliases")),                           # #297: other names the model answers to
         "anthropic_think_unasked": mode == "model",
         "tool_call_recovery": flag("tool_call_recovery"),                    # opt-in: see OutputParser's recover
-        "warm_start": flag("warm_start"),                                    # opt-in: see Service.start_warm
+        "warm_start": warm,                                                  # opt-in: see Service.start_warm
         "repeat_stop_tokens": rs,
         "reasoning_budget_tokens": budget if budget is not None else 0,
         "reasoning_loop_recovery": loops,
@@ -7435,7 +7617,13 @@ def start_model(cfg: dict, tok, lazy: bool = False):
         vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                     if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                 for k, v in cfg["vision"].items()}
-        if vcfg.get("elastic") is True and vcfg.get("gpu") and cfg.get("vram_elastic") is not True:
+        if vcfg.get("elastic") is True and vcfg.get("gpu") and poly_engine(cfg):
+            # the turns around the encoder ask for a reserve of 0: the whole cache for the Strata project's engine,
+            # strata-poly's smallest reserve (256 MiB, under the one it started with)
+            print('[strata] the vision section\'s "elastic" does not start a GPU encoder on demand with strata-poly: '
+                  "the encoder starts with the model (an encoder on the CPU starts with the first picture)", flush=True)
+            vcfg["elastic"] = False
+        elif vcfg.get("elastic") is True and vcfg.get("gpu") and cfg.get("vram_elastic") is not True:
             print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
                   "encoder its VRAM): the encoder starts with the model instead", flush=True)
             vcfg["elastic"] = False

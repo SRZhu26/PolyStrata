@@ -255,8 +255,149 @@ void limits() {
     check(e.kept.parked() == 0, "nothing is parked when the host has no memory to spare");
 }
 
+using Restored = Conversations<Fake>::Restored;
+
+std::vector<uint8_t> saved(Chat& c) {
+    std::vector<uint8_t> f;
+    check(c.kept.save(1000, [&](const void* p, size_t n) {
+              f.insert(f.end(), (const uint8_t*) p, (const uint8_t*) p + n);
+              return true;
+          }),
+          "a conversation is saved");
+    check(f.size() == c.kept.save_bytes(), "in the bytes it said it takes");
+    return f;
+}
+
+// Restores f, of which only the first `have` bytes can be read.
+Restored restored(Chat& c, const std::vector<uint8_t>& f, size_t have = SIZE_MAX, int64_t most = Fake::ctx) {
+    size_t at = 0;
+    return c.kept.restore(f.size(), most, 1000, [&](void* p, size_t n) {
+        if (n > std::min(have, f.size()) - at) return false;
+        std::memcpy(p, f.data() + at, n);
+        at += n;
+        return true;
+    });
+}
+
+// A session file: a conversation leaves one engine as bytes and takes another, with its checkpoints.
+void session_files() {
+    Chat a(options(0));
+    std::vector<int32_t> ids = text(1, 5000);
+    a.ask(ids);
+    const std::vector<uint8_t> f = saved(a);
+    check(a.e.holds(ids) && a.kept.seq() == ids, "saving leaves the conversation as it was");
+
+    Chat b(options(0));
+    check(restored(b, f) == Restored::ok && b.e.holds(ids) && b.kept.seq() == ids, "another engine takes it whole");
+    std::vector<int32_t> next = ids + text(2, 300);
+    const int64_t before = b.e.read;
+    check(b.ask(next) == (int64_t) ids.size(), "and the next turn goes on from its end");
+    check(b.e.read - before == 300 + 3, "reading the new turn and the reply only");
+
+    Chat c(options(0));
+    restored(c, f);
+    std::vector<int32_t> edit(ids.begin(), ids.begin() + 4500);
+    edit = edit + text(3, 100);
+    check(c.ask(edit) == 4096, "an edit goes back to a checkpoint that came with it");
+    Chat c2(options(0));
+    restored(c2, f);
+    std::vector<int32_t> early(ids.begin(), ids.begin() + 3000);
+    early = early + text(11, 100);
+    check(c2.ask(early) == 0, "and one before the two checkpoints a file has is read from the start");
+
+    Chat d(options(64));
+    std::vector<int32_t> mine = text(4, 3000);
+    d.ask(mine);
+    check(restored(d, f) == Restored::ok && d.e.holds(ids) && d.kept.parked() == 1, "the one in the engine is parked");
+    mine = mine + text(5, 10);
+    check(d.ask(mine) == 2999, "and comes back");
+    next = ids + text(6, 20);
+    check(d.ask(next) == (int64_t) ids.size(), "and so does the restored one, parked in its turn");
+
+    Chat e(options(64));
+    std::vector<int32_t> held = text(7, 2000);
+    e.ask(held);
+    std::vector<uint8_t> g = f;
+    g.pop_back();
+    check(restored(e, g) == Restored::other, "bytes that do not add up are refused");
+    check(restored(e, f, SIZE_MAX, 5000) == Restored::other, "and a conversation longer than the context");
+    e.e.state = 16;
+    check(restored(e, f) == Restored::other, "and a file of an engine with another state");
+    check(e.e.holds(held) && e.kept.seq() == held && e.kept.parked() == 0, "a refused file changes nothing");
+
+    Chat h(options(64));
+    std::vector<int32_t> was = text(8, 3000);
+    h.ask(was);
+    check(restored(h, f, f.size() - 100) == Restored::cut && h.kept.seq().empty() && h.e.at == 0,
+          "a file that ends inside its rows leaves the engine empty");
+    was = was + text(9, 10);
+    check(h.ask(was) == 2999, "and the conversation it held parked");
+
+    CacheOptions tight = options(64);
+    tight.admit = [](size_t) { return false; };
+    Chat t(tight);
+    std::vector<int32_t> gone = text(10, 3000);
+    t.ask(gone);
+    check(restored(t, f) == Restored::ok && t.e.holds(ids) && t.kept.parked() == 0,
+          "a host with no memory to spare for parking still takes the file");
+}
+
+// Pins f, of which only the first `have` bytes can be read.
+Restored pinned(Chat& c, const std::vector<uint8_t>& f, size_t have = SIZE_MAX) {
+    size_t at = 0;
+    return c.kept.pin(f.size(), Fake::ctx, 1000, [&](void* p, size_t n) {
+        if (n > std::min(have, f.size()) - at) return false;
+        std::memcpy(p, f.data() + at, n);
+        at += n;
+        return true;
+    });
+}
+
+// A pinned conversation: a system prompt that every chat starts with, read once and saved.  A new chat goes on
+// from its end whatever took the engine since, and neither the slots nor the budget nor a long chat push it out.
+void pinned_prompt() {
+    const std::vector<int32_t> sys = text(1, 3000);
+    Chat maker(options(0));
+    std::vector<int32_t> ids = sys;
+    maker.ask(ids, 0);
+    const std::vector<uint8_t> f = saved(maker);
+
+    for (const int64_t budget : {0, 64}) {
+        Chat c(options(budget, 2));
+        check(pinned(c, f) == Restored::ok && c.kept.pinned_tokens() == 3000 && c.e.at == 0 && c.e.read == 0,
+              "a file is pinned without touching the engine");
+        std::vector<int32_t> q = sys + text(2, 50);
+        check(c.ask(q) == 3000 && c.e.read == 50 + 3, "a chat that starts with it reads its own tokens only");
+        q = sys + text(3, 60);
+        check(c.ask(q) == 3000, "and so does the next new chat");
+        for (int k = 0; k < 4; ++k) {
+            std::vector<int32_t> other = text(10 + k, 9000);
+            c.ask(other);
+        }
+        q = sys + text(4, 70);
+        check(c.ask(q) == 3000, "after other conversations took the engine and every slot, a new chat still does");
+        check(c.kept.parked() <= 2 && c.kept.parked_bytes() <= ((size_t) budget << 20),
+              "it is outside the slots and the budget");
+        std::vector<int32_t> big = sys + text(5, 30000);
+        c.ask(big);
+        q = sys + text(6, 10);
+        check(c.ask(q) == 3000, "after a long chat that began from it, the next one starts there again");
+        std::vector<int32_t> part(sys.begin(), sys.begin() + 2500);
+        part = part + text(7, 10);
+        check(c.ask(part) == 2048, "a prompt that leaves it inside takes its checkpoint before that place");
+        q = sys + text(8, 5);
+        check(c.ask(q) == 3000, "and it is whole for the chat after that");
+    }
+
+    Chat d(options(64));
+    check(pinned(d, f, f.size() - 100) == Restored::cut && d.kept.pinned_tokens() == 0, "a file cut short pins nothing");
+    std::vector<int32_t> q = sys + text(9, 5);
+    check(d.ask(q) == 0, "and the prompt is read from its start");
+}
+
 // Any order of prompts over conversations that share starts, under any options: the engine always ends up
-// holding the prompt.
+// holding the prompt.  Now and then the conversation is saved as a session file, and one saved earlier comes back.
+// Half the rounds have a pinned conversation, which some prompts start with.
 void any_order() {
     std::mt19937 rng(11);
     const int64_t every[] = {0, 64, 256, 1000}, budget[] = {0, 1, 64};
@@ -271,7 +412,23 @@ void any_order() {
         c.e.state = rng() % 2 ? 100 << 10 : 8;
         c.rng.seed((unsigned) round);
         std::vector<std::vector<int32_t>> chats;
+        std::vector<std::vector<uint8_t>> files;
+        std::vector<int32_t> sys;
+        if (rng() % 2) {
+            Chat maker(o);
+            maker.e.state = c.e.state;
+            sys = text((int) rng(), 300 + (int) (rng() % 3000));
+            std::vector<int32_t> read = sys;
+            maker.ask(read, 0);
+            check(pinned(c, saved(maker)) == Restored::ok, "a conversation is pinned");
+            chats.push_back(sys);
+        }
         for (int step = 0; step < 40; ++step) {
+            if (!c.kept.seq().empty() && rng() % 6 == 0) {
+                files.push_back(saved(c));
+                check(restored(c, files[rng() % files.size()]) == Restored::ok && c.e.holds(c.kept.seq()),
+                      "a session file comes back whole");
+            }
             std::vector<int32_t> ids;
             const unsigned what = rng() % 10;
             if (chats.empty() || what == 0) {
@@ -350,6 +507,9 @@ int main() {
         limits();
         any_order();
     }
+    far = 0;
+    session_files();
+    pinned_prompt();
     quits = 3;   // with reads given up, the places a prompt is taken up from are others: any order, any options
     for (const int64_t f : {6000, 700}) {
         far = f;

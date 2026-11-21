@@ -101,6 +101,20 @@ family's architecture (`qwen35moe` for Qwen3.6, Ornith 1.5 and Tiel Coder, `gemm
 not the file it offers, and uses it as it is; it never deletes a file in that folder. Its RAM and VRAM estimates
 are those of the size whose name the file took.
 
+### How do I remove a model?
+
+There is no command for it. A model's files are these, where `<model>` is the name in its run config's file name
+(`qwen36-ud-q3_k_m` for `strata-qwen36-ud-q3_k_m.json`):
+
+- its folder in `models/` (the same name, in capitals where the file has them): the GGUF, and `mmproj` for pictures
+- `packs/<model>/`: its tokenizer and expert profile
+- `strata-<model>.json` and `strata-<model>.json.bak`: its run config
+- `strata-<model>.log`
+- `run-<model>.bat` or `run-<model>.sh`
+
+`models/` and `packs/` are in the PolyStrata folder unless setup was given another data folder. The engines
+(`engine-poly/`, `engine/`) are shared by every model: keep them.
+
 ### Can I use any GLM 5.3 Flash GGUF?
 
 The installer offers three files, and those are the ones that were run: neuralll's 3.0bit (114 GB), Unsloth's
@@ -121,8 +135,15 @@ model, Q3 and Q4 run at about the same speed, so take Q4 if you have the memory.
 
 ### What about NVFP4?
 
-PolyStrata reads GGUF weight types only, so no NVFP4 for now. For GLM, NVFP4 would make the model around 204 GB,
-which doesn't fit in RAM on a normal PC; the 2- and 3-bit GGUFs (79 to 114 GB) are what lets the experts stay in RAM.
+The strata-poly engine reads NVFP4 GGUFs, llama.cpp's NVFP4 type, including files converted from NVIDIA's
+checkpoints that keep a global scale beside each matrix. Setup doesn't offer one yet. On an RTX PRO 6000, Qwen3.6's
+NVFP4 file ran about as fast as UD-Q4_K_M with the whole model in VRAM, and nobody has measured its quality next to
+the Unsloth files. To try one, give strata-poly its path with `--model`. On an RTX 50 card,
+`STRATA_PREFILL_NVFP4=w4a4` reads the prompt on the FP4 tensor cores: 10% faster on LFM2.5, no faster on Qwen3.6, and
+further from the exact result, so it is off by default. The numbers are in [NVFP4.md](NVFP4.md).
+
+For GLM, NVFP4 would make the model around 204 GB, which doesn't fit in RAM on a normal PC; the 2- and 3-bit GGUFs
+(79 to 114 GB) are what lets the experts stay in RAM.
 
 ### Does it work on Windows?
 
@@ -156,6 +177,10 @@ room for the answer, as LM Studio's rolling window does. The system prompt and t
 window says how many messages it left out. Each request is cut again from the full conversation the app sends, so
 the model has forgotten what was dropped. Claude Code, Codex and OpenCode compact the conversation themselves and do
 not need it. A larger context (`--max-context` in the same file) keeps more of the chat.
+
+If one very long message still does not fit, `"truncate_middle": true` trims the middle of the rendered text prompt,
+keeping its beginning (including the system prompt in a normal-sized prompt) and its newest ending. The setting is off
+by default. It does not truncate prompts containing images.
 
 ### Can the model see what it thought in earlier turns?
 

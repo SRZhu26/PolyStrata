@@ -952,14 +952,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # synthetic, no model; --bench adds timings).  NVIDIA only: cp.async and the CUDA occupancy API (not on gfx906)
   if(STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
     # Independent pinned expert uploads: byte parity and stream/event ordering.
-    add_executable(dma_batch_parity tests/core/dma_batch_parity.cu)
-    target_include_directories(dma_batch_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-    target_link_libraries(dma_batch_parity PRIVATE ${_strata_gpu_runtime_target})
-    add_test(NAME dma_batch_parity COMMAND dma_batch_parity)
-    set_tests_properties(dma_batch_parity PROPERTIES TIMEOUT 120)
-    if(WIN32)
-      add_test(NAME dma_batch_registered_parity COMMAND dma_batch_parity --registered)
-      set_tests_properties(dma_batch_registered_parity PROPERTIES TIMEOUT 120)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/dma_batch_parity.cu")
+      add_executable(dma_batch_parity tests/core/dma_batch_parity.cu)
+      target_include_directories(dma_batch_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      target_link_libraries(dma_batch_parity PRIVATE ${_strata_gpu_runtime_target})
+      add_test(NAME dma_batch_parity COMMAND dma_batch_parity)
+      set_tests_properties(dma_batch_parity PROPERTIES TIMEOUT 120)
+      if(WIN32)
+        add_test(NAME dma_batch_registered_parity COMMAND dma_batch_parity --registered)
+        set_tests_properties(dma_batch_registered_parity PROPERTIES TIMEOUT 120)
+      endif()
     endif()
     add_executable(gdn_rec_parity src/prefill/gdn_rec_parity.cu)
     target_link_libraries(gdn_rec_parity PRIVATE ${_strata_gpu_runtime_target})
@@ -1466,6 +1468,29 @@ if(STRATA_NATIVE_EXPERTS)
       FetchContent_Populate(strata_llamacpp)
     endif()
     add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
+  endif()
+  # Clang turns ggml-cpu's i-quant grid lookups (_mm256_set_epi32 of eight table loads, IQ2_*/IQ3_*) into
+  # vpgatherdd, which Intel's Gather Data Sampling microcode mitigation (2023) made slow on Skylake to Tiger Lake.
+  # -mno-gather keeps them scalar loads: the same values, so the same products.  On an i9-9980HK (Windows, ROCm's
+  # clang, one thread) a 2048-value IQ2_S row went from 500 to 183 ns and an IQ3_XXS row from 978 to 269 ns;
+  # IQ4_XS, Q3_K and Q8_0 rows did not move.  On by default only where a GNU-style clang compiles ggml-cpu for
+  # x86-64 on an Intel CPU (the Windows HIP build on one: the engine is compiled on the PC it runs on); it was not
+  # measured on an AMD CPU or on an Intel one newer than Tiger Lake.  -DSTRATA_CPU_NO_GATHER=ON / OFF sets it.
+  set(_strata_no_gather_default OFF)
+  if(CMAKE_C_COMPILER_ID STREQUAL "Clang" AND NOT CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" AND
+     CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|x86_64|amd64)$" AND NOT STRATA_ISA_FLOOR)
+    cmake_host_system_information(RESULT _strata_host_cpu QUERY PROCESSOR_DESCRIPTION)
+    include(CheckCCompilerFlag)
+    check_c_compiler_flag(-mno-gather STRATA_HAVE_MNO_GATHER)
+    if(STRATA_HAVE_MNO_GATHER AND _strata_host_cpu MATCHES "GenuineIntel")
+      set(_strata_no_gather_default ON)
+    endif()
+  endif()
+  option(STRATA_CPU_NO_GATHER "Compile ggml-cpu with -mno-gather (scalar table loads in place of gathers)"
+         ${_strata_no_gather_default})
+  if(STRATA_CPU_NO_GATHER AND TARGET ggml-cpu)
+    message(STATUS "ggml-cpu: -mno-gather (STRATA_CPU_NO_GATHER)")
+    target_compile_options(ggml-cpu PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-mno-gather>)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
@@ -1991,6 +2016,8 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME poly_hip_value_split_policy_test COMMAND poly_hip_value_split_policy_test)
   add_executable(poly_gdn_mma_control_test src/poly/gdn_mma_control_test.cpp)
   add_test(NAME poly_gdn_mma_control_test COMMAND poly_gdn_mma_control_test)
+  add_executable(poly_q35_scratch_arena_test src/poly/q35_scratch_arena_test.cpp)
+  add_test(NAME poly_q35_scratch_arena_test COMMAND poly_q35_scratch_arena_test)
   add_executable(poly_stream_stage_test src/poly/stage_copy_test.cpp)
   add_test(NAME poly_stream_stage_test COMMAND poly_stream_stage_test)
 endif()
@@ -2036,18 +2063,39 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     endif()
     set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
   endif()
+  # Navi 12 / Navi 14 (gfx1011, gfx1012) have the signed dot4 that llama.cpp's ggml_cuda_dp4a leaves to RDNA1's SDWA
+  # sequence (its vendors/hip.h counts gfx1012 as RDNA1); include/strata/hip_compat/intrinsics.hpp has the
+  # measurement.  A HIP build for either has the checkout's common.cuh take __builtin_amdgcn_sdot4 there as well: the
+  # same products.  The checkout is downloaded, not part of this tree, so it is patched here, once, by its exact line;
+  # STRATA_GFX1012_SDWA_DOT=ON (cmake/hip_backend.cmake) leaves it as it is.
+  if(STRATA_ENABLE_HIP AND CMAKE_HIP_ARCHITECTURES MATCHES "gfx101[12]" AND NOT STRATA_GFX1012_SDWA_DOT)
+    set(_strata_cc ${_strata_mmq}/common.cuh)
+    file(READ ${_strata_cc} _strata_cc_text)
+    set(_strata_cc_old "#if defined(CDNA) || defined(RDNA2) || defined(__gfx906__)\n    c = __builtin_amdgcn_sdot4")
+    set(_strata_cc_new "#if defined(CDNA) || defined(RDNA2) || defined(__gfx906__) || defined(__gfx1011__) || defined(__gfx1012__)\n    c = __builtin_amdgcn_sdot4")
+    string(FIND "${_strata_cc_text}" "${_strata_cc_old}" _strata_cc_at)
+    if(_strata_cc_at GREATER -1)
+      string(REPLACE "${_strata_cc_old}" "${_strata_cc_new}" _strata_cc_text "${_strata_cc_text}")
+      file(WRITE ${_strata_cc} "${_strata_cc_text}")
+      message(STATUS "gfx1011/gfx1012: ${_strata_cc}'s ggml_cuda_dp4a takes the signed dot4")
+    endif()
+  endif()
   set(_strata_poly_mmq_instances "")
   foreach(_t q4_0 q4_1 q5_0 q5_1 q8_0 q2_k q3_k q4_k q5_k q6_k iq1_s iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl
              iq4_xs)
     list(APPEND _strata_poly_mmq_instances ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
   endforeach()
-  # MXFP4: on RTX 50 llama.cpp's tiles use the FP4 MMA with block scales, which exists only in the arch-specific
-  # target, so on CUDA its instance alone is built with 12x -> 12xa, as Strata's W4A4 unit is.  A Blackwell other
-  # than 12.0 has no image of it, and Mmq::fits() leaves MXFP4 out there.
+  # MXFP4 and NVFP4: on RTX 50 llama.cpp's tiles use the FP4 MMA with block scales, which exists only in the
+  # arch-specific target, so on CUDA their instances alone are built with 12x -> 12xa, as Strata's W4A4 unit is.  A
+  # Blackwell other than 12.0 has no image of them, and Mmq::fits() leaves MXFP4 out there.  NVFP4 takes this
+  # instance only on a 12.0 card with STRATA_PREFILL_NVFP4=w4a4; otherwise its tiles are mmq_nvfp4.cu's int8 ones,
+  # built for the architectures as given.  On HIP there is no NVFP4 prompt product.
   set(_strata_poly_mxfp4 ${_strata_mmq}/template-instances/mmq-instance-mxfp4.cu)
   if(STRATA_ENABLE_HIP)
     list(APPEND _strata_poly_mmq_instances ${_strata_poly_mxfp4})
   else()
+    list(APPEND _strata_poly_mxfp4 ${_strata_mmq}/template-instances/mmq-instance-nvfp4.cu)
+    list(APPEND _strata_poly_mmq_instances src/poly/mmq_nvfp4.cu)
     set(_strata_poly_fp4_archs ${CMAKE_CUDA_ARCHITECTURES})
     list(TRANSFORM _strata_poly_fp4_archs REPLACE "^(12[0-9])$" "\\1a")
     list(TRANSFORM _strata_poly_fp4_archs REPLACE "^(12[0-9])-(real|virtual)$" "\\1a-\\2")
@@ -2078,6 +2126,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     target_compile_definitions(strata_poly_mmq PRIVATE GGML_USE_HIP=1)
     target_link_libraries(strata_poly_mmq PUBLIC ggml-base hip::host)
   else()
+    target_compile_definitions(strata_poly_mmq PRIVATE STRATA_POLY_NVFP4=1)
     target_link_libraries(strata_poly_mmq PUBLIC ggml-base ${_strata_gpu_runtime_target})
   endif()
 
@@ -2103,7 +2152,7 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   add_executable(strata-poly src/poly/main.cpp src/poly/engine.cpp src/poly/glm5next.cpp src/poly/qwen35.cpp
                             src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/flint.cpp
                             src/poly/kolibri1.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
-                            src/poly/spill.cpp src/core/conversation_memory.cpp)
+                            src/poly/spill.cpp src/core/conversation_memory.cpp src/core/conversation_file.cpp)
   target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   # the driver's virtual memory calls: the attention caches grow with the conversation; on HIP they are HIP's
   # memory management calls, which the HIP runtime itself provides (hip_compat/cuda.h)
@@ -2162,17 +2211,41 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
   target_link_libraries(poly_hip_value_split_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   add_test(NAME poly_hip_value_split_test COMMAND poly_hip_value_split_test)
   set_tests_properties(poly_hip_value_split_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 240)
+  # STRATA_HIP_SPLIT_ATTEND (heads of 256 over a q8_0 cache): against an FP64 reference and the old kernels, the position on the card, the
+  # fallback and a graph replay; needs a card with 32-lane waves (77 = skipped)
+  add_executable(poly_hip_split_attend_test src/poly/hip_split_attend_test.cu src/poly/kernels.cu)
+  target_include_directories(poly_hip_split_attend_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                            ${_strata_gpu_include_directories})
+  target_link_libraries(poly_hip_split_attend_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  add_test(NAME poly_hip_split_attend_test COMMAND poly_hip_split_attend_test)
+  set_tests_properties(poly_hip_split_attend_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   # attend_batch() against attend() with Flint's heads, sinks and window ring; needs a card
   add_executable(poly_sink_attend_test src/poly/sink_attend_test.cu src/poly/kernels.cu)
   target_include_directories(poly_sink_attend_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                           ${_strata_gpu_include_directories})
   target_link_libraries(poly_sink_attend_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  # STRATA_HIP_PREFILL_FP32 (attend_batch() on FP32 inputs over a q8_0 cache): against an FP64 reference and the default path, and the
+  # fallbacks; needs a card (77 = skipped)
+  add_executable(poly_hip_prefill_fp32_test src/poly/hip_prefill_fp32_test.cu src/poly/kernels.cu)
+  target_include_directories(poly_hip_prefill_fp32_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                            ${_strata_gpu_include_directories})
+  target_link_libraries(poly_hip_prefill_fp32_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  add_test(NAME poly_hip_prefill_fp32_test COMMAND poly_hip_prefill_fp32_test)
+  set_tests_properties(poly_hip_prefill_fp32_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
   # fattn_q8() and fattn_f16() (llama.cpp's flash-attention kernel) against attend_batch(), and with `dec` fdec_q8()
   # against attend(); needs a card, run by hand
   add_executable(poly_fattn_test src/poly/fattn_test.cu src/poly/kernels.cu)
   target_include_directories(poly_fattn_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/poly
                                                     ${_strata_gpu_include_directories})
   target_link_libraries(poly_fattn_test PRIVATE strata_poly_mmq ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  # STRATA_POLY_STAGED_TILES: the staged experts in size classes, each a launch of its own tile width, against one
+  # launch, bit for bit; needs a card
+  add_executable(poly_mmq_tiles_test src/poly/mmq_tiles_test.cu)
+  target_include_directories(poly_mmq_tiles_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/poly
+                                                        ${_strata_gpu_include_directories})
+  target_link_libraries(poly_mmq_tiles_test PRIVATE strata_poly_mmq ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+  add_test(NAME poly_mmq_tiles_test COMMAND poly_mmq_tiles_test)
+  set_tests_properties(poly_mmq_tiles_test PROPERTIES SKIP_RETURN_CODE 77)
   # LFM2's short convolution against the same arithmetic on the host; needs a card, so it is run by hand
   add_executable(poly_shortconv_test src/poly/shortconv_test.cu src/poly/kernels.cu)
   target_include_directories(poly_shortconv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include

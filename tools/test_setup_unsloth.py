@@ -216,6 +216,11 @@ class Base(unittest.TestCase):
 class Main(Base):
     """UD-Q4_K_XL."""
 
+    def test_a_kv_format_of_strata_poly_is_refused(self):
+        code, out, cfg = self.main(["--kv", "q8_0"])   # issue 183 made it an option; this engine has no such format
+        self.assertNotEqual(code, 0)
+        self.assertIn("has no --kv q8_0", out)
+
     def test_install(self):
         code, out, cfg = self.main(["--context", "8192"])
         self.assertEqual(code, 0, out)

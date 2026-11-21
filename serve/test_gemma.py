@@ -133,6 +133,14 @@ class ToolCalls(unittest.TestCase):
         self.assertEqual((parse_gemma_tool_call("call:now").name, parse_gemma_tool_call("call:now").arguments),
                          ("now", {}))
 
+    def test_a_list_closed_by_the_wrong_bracket_ends(self):
+        # issue 174: each of these never returned, and the request's thread held the server
+        for body, args in (("call:x{a:[b}", {"a": ["b"]}), ("call:x{a:[}", {"a": []}),
+                           ("call:x{a:[[1}}", {"a": [[1]]}), ("call:x{a:[1,}],b:2}", {"a": [1]}),
+                           ("call:x{a:[b:{c:[}}", {"a": ["b:{c:["]})):
+            with self.subTest(body=body):
+                self.assertEqual(parse_gemma_tool_call(body).arguments, args)
+
     def test_a_string_parameter_written_bare_stays_a_string(self):
         call = parse_gemma_tool_call("call:write{path:7,n:7}", self.SCHEMA[0])
         self.assertEqual(call.arguments, {"path": "7", "n": 7})

@@ -23,7 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
-                          PP_DONE_TAIL, Service,
+                          PP_DONE_TAIL, Service, SessionRefused, model_settings,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
                           prompt_tokens_seen,
                           request_stats, request_timings, serve, start_failure_hint)
@@ -1836,6 +1836,120 @@ class WarmStart(unittest.TestCase):
                 self.svc.start_warm()
         join_warm_read()
         self.assertEqual(self.engine.calls, [])
+
+    def test_the_setting(self):
+        self.assertIs(model_settings({})["warm_start"], False)
+        self.assertEqual(model_settings({"warm_start": "agent.json"})["warm_start"], "agent.json")
+        for bad in (1, "", ["agent.json"]):
+            with self.assertRaisesRegex(ValueError, '"warm_start" must be true, false or the path'):
+                model_settings({"warm_start": bad})
+
+    def test_what_two_first_turns_share_is_kept(self):
+        a, b = self.prompt("S" * 3000 + " Monday"), self.prompt("S" * 3000 + " Friday")
+        self.ask(a)
+        self.ask(b)
+        kept = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(kept, os.path.commonprefix([a, b]))
+        self.assertTrue(self.tok.decode(kept).endswith("S" * 3000 + " "))
+        self.path.unlink()
+        self.ask(a)                                             # it begins with the kept start: nothing new to keep
+        self.assertFalse(self.path.exists())
+
+    def request_file(self, system):
+        seed = self.dir / "agent.json"
+        seed.write_text(json.dumps({"messages": [{"role": "system", "content": system},
+                                                 {"role": "user", "content": "hi"}], "tools": self.TOOLS}),
+                        encoding="utf-8")
+        return seed
+
+    def started(self, svc=None):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            (svc or self.svc).start_warm()
+            join_warm_read()
+        return out.getvalue()
+
+    def test_a_chat_request_names_the_start(self):
+        self.svc.warm_start = "agent.json"                      # not written yet (the agent writes it): no start
+        self.assertIn("agent.json is not there yet", self.started())
+        self.assertEqual((self.engine.calls, self.path.exists()), ([], False))
+        self.svc.warm_start = self.request_file("S" * 3000).name   # relative: next to the config
+        self.started()
+        kept = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(self.prompt("S" * 3000)[:len(kept)], kept)
+        self.assertTrue(self.tok.decode(kept).endswith("<|im_end|>\n"))
+        self.assertEqual([(ids, n) for ids, n, _ in self.engine.calls], [(kept, 1)])
+        self.ask(self.prompt("S" * 3000))                       # the agent's own request: the same start
+        self.assertEqual(json.loads(self.path.read_text(encoding="utf-8")), kept)
+        self.path.write_text(json.dumps(kept[:2500]), encoding="utf-8")
+        self.started()                                          # the part of it the requests shared stays
+        self.assertEqual(len(json.loads(self.path.read_text(encoding="utf-8"))), 2500)
+        self.request_file("T" * 3000)
+        self.started()                                          # another system prompt replaces it
+        self.assertIn("T" * 3000, self.tok.decode(json.loads(self.path.read_text(encoding="utf-8"))))
+        self.path.unlink()
+        for bad in ("{", "[]", json.dumps({"messages": "hi"})):
+            (self.dir / "agent.json").write_text(bad, encoding="utf-8")
+            self.assertIn("is not a chat request this server can read", self.started())
+        self.assertFalse(self.path.exists())
+
+    def test_an_engine_that_pins_takes_it_from_a_file(self):
+        self.ask(self.prompt("S" * 3000))
+        kept = json.loads(self.path.read_text(encoding="utf-8"))
+        engine = PinningEngine(self.tok, "ok", max_context=1 << 20)
+        old = self.dir / "strata-m.warm-start-0123456789abcdef.bin"
+        old.write_bytes(b"an earlier start's")
+        out = self.started(self.service(engine))                # no file yet: read, saved, pinned
+        files = sorted(self.dir.glob("strata-m.warm-start-*.bin"))
+        self.assertEqual(len(files), 1)
+        self.assertNotEqual(files[0], old)
+        self.assertEqual([(ids, n) for ids, n, _ in engine.calls], [(kept, 1)])
+        self.assertEqual(engine.sessions, [("save", str(files[0])), ("pin", str(files[0]))])
+        self.assertIn(f"the {len(kept)}-token prompt start is pinned", out)
+        engine.calls.clear(), engine.sessions.clear()
+        svc = self.service(engine)
+        self.started(svc)                                       # the file is there: pinned, nothing read
+        self.assertEqual((engine.calls, engine.sessions), ([], [("pin", str(files[0]))]))
+        engine.sessions.clear()
+        self.assertTrue(svc.pin_start())                        # an engine that was started again
+        files[0].write_bytes(b"another engine's")
+        self.assertFalse(svc.pin_start())                       # ... refuses it: not written in a request
+        self.assertEqual(files[0].read_bytes(), b"another engine's")
+        engine.sessions.clear()
+        out = self.started(self.service(engine))                # the next start reads the prompt and writes it again
+        self.assertIn("is not pinned from", out)
+        self.assertEqual([n for _, n, _ in engine.calls], [1])
+        self.assertEqual([a for a, _ in engine.sessions], ["pin", "save", "pin"])
+        engine.calls.clear(), engine.sessions.clear()
+        svc = self.service(engine)
+        with contextlib.redirect_stdout(io.StringIO()):         # a request that came before the warm start's turn:
+            with svc.fifo:                                      # the file is pinned all the same
+                svc.start_warm()
+                svc.warm_stop.set()
+            join_warm_read()
+        self.assertEqual(([n for _, n, _ in engine.calls], [a for a, _ in engine.sessions]), ([], ["pin"]))
+        engine.calls.clear(), engine.sessions.clear()
+        engine.batch = True                                     # batch slots have no session files
+        self.started(self.service(engine))
+        self.assertEqual(([n for _, n, _ in engine.calls], engine.sessions), ([1], []))
+
+
+class PinningEngine(SamplingEngine):
+    """strata-poly's session files, as Service.pin_start uses them: SAVE writes the file, PIN takes one it wrote."""
+
+    batch = False
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.info = {"sessions": 1, "pinned_tokens": 0}
+        self.sessions = []
+
+    def session_file(self, action, path):
+        self.sessions.append((action, path))
+        if action == "save":
+            Path(path).write_bytes(json.dumps(self.calls[-1][0]).encode())
+        elif not Path(path).read_bytes().startswith(b"["):
+            raise SessionRefused("invalid", "the file was saved by another engine version")
+        return {"tokens": len(json.loads(Path(path).read_bytes())), "bytes": Path(path).stat().st_size, "ms": 1.0}
 
 
 class GpuChoice(unittest.TestCase):

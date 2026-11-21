@@ -96,9 +96,14 @@ add_library(strata_hip_runtime INTERFACE)
 target_include_directories(strata_hip_runtime BEFORE INTERFACE
   "${STRATA_HIP_COMPAT_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1 "STRATA_HIP_ARCHS=\"${STRATA_HIP_ARCHS}\"")
-option(STRATA_GFX1012_PORTABLE_DOT "Use the portable signed-byte dot control on gfx1012" OFF)
+option(STRATA_GFX1012_PORTABLE_DOT "Use the portable signed-byte dot control on gfx1010 and gfx1012" OFF)
 if(STRATA_GFX1012_PORTABLE_DOT)
   target_compile_definitions(strata_hip_runtime INTERFACE STRATA_GFX1012_PORTABLE_DOT=1)
+endif()
+# gfx1011 / gfx1012 take v_dot4_i32_i8 for dp4a (include/strata/hip_compat/intrinsics.hpp); ON keeps the SDWA sequence
+option(STRATA_GFX1012_SDWA_DOT "gfx1011/gfx1012: the SDWA dot4 sequence in place of v_dot4_i32_i8" OFF)
+if(STRATA_GFX1012_SDWA_DOT)
+  target_compile_definitions(strata_hip_runtime INTERFACE STRATA_GFX1012_SDWA_DOT=1)
 endif()
 # #313: the RDNA3 WMMA GEMM's intrinsics only compile for gfx11 targets and the host pass does not define
 # __gfx11xx__, so the build supplies the macro for gfx11 configs (the kernels also gate on the device at runtime)

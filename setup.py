@@ -35,7 +35,8 @@ answers, no questions), --setup (install another model / change settings instead
 --host 0.0.0.0 --api-key KEY (reach it from other devices on your network), --experimental-speed-projection on|off
 (EXPERIMENTAL, off by default),
 --models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --build (compile instead of the ready-made
-engine), --check (only check this PC), --resident-budget-gib N (UD-Q4_K_XL's or UD-IQ4_XS's experts in RAM),
+engine), --max-compatibility (with --build on Windows: an engine that also runs on other PCs), --check (only check
+this PC), --resident-budget-gib N (UD-Q4_K_XL's or UD-IQ4_XS's experts in RAM),
 --kv-streaming on|off|auto.
 
 Setup recommends, it never forces: the recommended answers are the defaults (--yes, or Enter), and a bigger choice
@@ -84,7 +85,7 @@ HF_REVISIONS = {
     "peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP": "bbe9e566f39e4fc9652ac66b71968289a03c520a",        # 2026-09-10
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",                  # 2026-10-12
     "unsloth/DeepSeek-V4-Flash-0731-GGUF": "fbbb5b93fb787c21338159b0af3318bb3f4d9768",               # 2026-10-15
-    "unsloth/LFM2.5-24B-A2B-GGUF": "faa77113e93335b63423e9e8d33395f86eaf8946",                        # 2026-10-15
+    "unsloth/LFM2.5-24B-A2B-GGUF": "aacc77834f6aa568c93b4dbd6d295059736be98c",                        # 2026-10-20
     "LiquidAI/LFM2.5-24B-A2B-GGUF": "0912d33141f77e10705345a6732bfd83f0252fdc",                       # 2026-10-15
     "unsloth/flint-GGUF": "20468edfc38ab43d6914cc88b08cbecb05d0fc62",                                 # 2026-10-21
     "openbmb/MiniCPM-V-4.7-35B-A3B-gguf": "77f6d8cb08b2b115ce27d2e2ac1359e126921689",                   # 2026-10-12
@@ -984,6 +985,25 @@ def say(msg=""):
     print(msg, flush=True)
 
 
+def colours() -> bool:
+    """Whether the menus may print ANSI colours: stdout is a terminal that takes them and NO_COLOR is not set.  A
+    Windows console prints the escape codes as text ("<-[36m") until virtual terminal processing is turned on for
+    it, which this does; a console that refuses (before Windows 10 1511) gets none."""
+    if not sys.stdout.isatty() or os.environ.get("NO_COLOR"):
+        return False
+    if not WIN:
+        return os.environ.get("TERM") != "dumb"
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        out = k32.GetStdHandle(-11)                    # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        return bool(k32.GetConsoleMode(out, ctypes.byref(mode))
+                    and k32.SetConsoleMode(out, mode.value | 0x0004))   # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
 def step(n, title):
     say()
     say(f"=== Step {n}: {title} ===")
@@ -1302,6 +1322,23 @@ def linux_hybrid_pmu(root: str = "/sys/devices"):
     except OSError:
         return None
     return (p, e) if p and e else None
+
+
+def rdna1_poly_args() -> list[str]:
+    """strata-poly's settings for a gfx1012 card (STRATA_EXPERIMENTAL_GFX1012), measured on a Radeon Pro 5500M beside an
+    i9-9980HK (8 cores, 16 threads; Tiel Coder UD-IQ3_XXS through the server, six coding prompts): with 16 threads (the
+    engine's default, every logical CPU) it wrote 26.4 tokens/s at 81% CPU, with one a physical core 34.8-38.3 at 45-48%;
+    --kv q8_0 holds 64K of context in the VRAM 32K takes in fp16.  docs/RADEON_PRO_5500M.md."""
+    args = ["--kv", "q8_0"]
+    physical = None
+    try:
+        import psutil                                  # installed into .venv by step 3
+        physical = psutil.cpu_count(logical=False)
+    except Exception:
+        pass
+    if physical and physical < (os.cpu_count() or 0):
+        args += ["--threads", str(physical)]
+    return args
 
 
 def hybrid_pool_workers(cores) -> int | None:
@@ -2754,6 +2791,7 @@ ROCM_INDEXES = {"gfx1100": "https://rocm.nightlies.amd.com/v2/gfx110X-dgpu/",   
                 "gfx1031": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
                 "gfx1032": "https://rocm.nightlies.amd.com/v2/gfx103X-all/",
                 "gfx1010": "https://rocm.nightlies.amd.com/v2/gfx101X-dgpu/",  # RDNA1: run on Windows only so far
+                "gfx1012": "https://rocm.nightlies.amd.com/v2/gfx101X-dgpu/",  # RX 5500 XT / Pro 5500M: only with STRATA_EXPERIMENTAL_GFX1012=1
                 "gfx1151": "https://rocm.nightlies.amd.com/v2/gfx1151/",       # Strix Halo (docs/STRIX_HALO.md)
                 "gfx1150": "https://rocm.nightlies.amd.com/v2/gfx1150/",       # Strix Point: only with STRATA_EXPERIMENTAL_GFX1150=1
                 "gfx1103": "https://rocm.nightlies.amd.com/v2/gfx110X-all/"}   # Radeon 780M: only with STRATA_EXPERIMENTAL_GFX1103=1
@@ -2790,9 +2828,14 @@ GFX1103_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1103") == "1"
 # build one with `STRATA_HIP_ARCHS=gfx1150 tools\hip\build_windows.bat` and start setup with `--prebuilt dist\`.
 # Unset: unchanged.
 GFX1150_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1150") == "1"
+# STRATA_EXPERIMENTAL_GFX1012=1 (opt-in, unvalidated beyond one card): Navi 14 (RDNA1, gfx1012: RX 5500 XT, Radeon Pro
+# 5500M), with its native v_dot4_i32_i8 (include/strata/hip_compat/intrinsics.hpp).  On Windows strata-poly is compiled
+# here as for gfx1010 (the whl-next index has a gfx1012 device wheel).  docs/RADEON_PRO_5500M.md.  Unset: unchanged.
+GFX1012_OPT_IN = os.environ.get("STRATA_EXPERIMENTAL_GFX1012") == "1"
 AMD_ARCHS = ("gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx1032", "gfx1010",
              "gfx1151") \
-            + (("gfx1103",) if GFX1103_OPT_IN else ()) + (("gfx1150",) if GFX1150_OPT_IN else ())
+            + (("gfx1103",) if GFX1103_OPT_IN else ()) + (("gfx1150",) if GFX1150_OPT_IN else ()) \
+            + (("gfx1012",) if GFX1012_OPT_IN else ())
 # The exact (bit-identical) speed switches the engine turns on by default on gfx1151 (src/core/arch_defaults.cpp), less
 # STRATA_HCD_EXACT: that one copies the gfx1151 hipBLASLt table's solutions 1176 / 1177, and the gfx1103 table
 # (tools/hip/gfx1103-hipblaslt-100401.txt) picks others, so it would only report that it cannot run.  A gfx1103 install
@@ -2823,6 +2866,7 @@ AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs ha
              "gfx1031": "AMD Radeon RX 6700 XT series (gfx1031)",
              "gfx1032": "AMD Radeon RX 6600 / 6600 XT / 6650 XT (gfx1032)",
              "gfx1010": "AMD Radeon RX 5600 XT / 5700 / 5700 XT (gfx1010)",
+             "gfx1012": "AMD Radeon RX 5500 XT / Pro 5500M (gfx1012)",
              "gfx1151": "AMD Radeon 8060S / 8050S / 8040S (Ryzen AI Max, Strix Halo, gfx1151)",
              # integrated Radeons of other Ryzen families: named so they are not taken for Strix Halo (not supported)
              "gfx1150": "AMD Radeon 890M / 880M (Ryzen AI 300, Strix Point, gfx1150)",
@@ -3303,6 +3347,9 @@ _WIN_AMD_DID = {0x744C: "gfx1100", 0x7448: "gfx1100", 0x745E: "gfx1100",        
                 0x7550: "gfx1201", 0x7551: "gfx1201",                               # RX 9070 / 9070 XT, AI PRO R9700
                 0x73BF: "gfx1030", 0x73AF: "gfx1030", 0x73A5: "gfx1030",            # RX 6800 / 6800 XT / 6900 XT / 6950 XT
                 0x73DF: "gfx1031",                                                  # RX 6700 XT / 6750 XT / 6800M (#881)
+                0x73FF: "gfx1032", 0x73EF: "gfx1032",                               # RX 6600 / 6600 XT, RX 6650 XT (issue 121)
+                0x731F: "gfx1010",                                                  # RX 5600 XT / 5700 / 5700 XT (Navi 10)
+                **({0x7340: "gfx1012"} if GFX1012_OPT_IN else {}),                  # Navi 14: RX 5500 XT / 5500M, Radeon Pro 5500M / 5300M
                 **AMD_IGPU_PCI}                                                     # Ryzen APUs: 0x1586 = Strix Halo (gfx1151)
 _WIN_AMD_NAME = ((re.compile(r"\b80[456]0S\b", re.I), "gfx1151"),                   # Radeon 8060S / 8050S / 8040S
                  (re.compile(r"\b8[89]0M\b", re.I), "gfx1150"),                     # Radeon 890M / 880M
@@ -3313,7 +3360,10 @@ _WIN_AMD_NAME = ((re.compile(r"\b80[456]0S\b", re.I), "gfx1151"),               
                  (re.compile(r"RX\s*7900|W7900|W7800", re.I), "gfx1100"),
                  (re.compile(r"RX\s*7800|RX\s*7700(?!\s*S)|W7700", re.I), "gfx1101"),
                  (re.compile(r"RX\s*7600|W7600|W7500", re.I), "gfx1102"),
-                 (re.compile(r"RX\s*6800(?!\s*[MS])|RX\s*6900|RX\s*6950|W6800", re.I), "gfx1030"))
+                 (re.compile(r"RX\s*6800(?!\s*[MS])|RX\s*6900|RX\s*6950|W6800", re.I), "gfx1030"),
+                 (re.compile(r"RX\s*66[05]0", re.I), "gfx1032"),
+                 (re.compile(r"RX\s*5[67]00|W5700", re.I), "gfx1010")) + \
+    (((re.compile(r"RX\s*5500|Pro\s*5[35]00M|W5500", re.I), "gfx1012"),) if GFX1012_OPT_IN else ())   # Navi 14, opt-in
 _DISPLAY_CLASS = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
 
 
@@ -3790,10 +3840,14 @@ def hipblaslt_table(arch, lib_dirs, ver=None):
     return None
 
 
-def build_engine_hip(gpu, llama, vision="none") -> Path:
+def build_engine_hip(gpu, llama, vision="none", portable=False) -> Path:
     """Compile the HIP engine for this AMD GPU into engine/ (again only when its source changed: a `git pull`).
     gpu["archs"]: every architecture it needs code for (the cards of a layer split), else gpu["arch"].  vision "cpu"
-    (#304): the image encoder too, for the CPU (there is no HIP encoder build yet)."""
+    (#304): the image encoder too, for the CPU (there is no HIP encoder build yet).  Windows: AMD's TheRock wheels in
+    .rocm-win and MSVC's build tools, as the strata-poly Windows build (build_engine_hip_win; portable: see that
+    function)."""
+    if WIN:
+        return build_engine_hip_win(gpu, llama, portable)
     eng = ROOT / "engine"
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
@@ -3802,14 +3856,20 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
     archs = sorted(set(gpu.get("archs") or [gpu["arch"]]))
     has_archs = set(archs) <= set(meta.get("archs", []))
     floor = cpu_floor(cpu_info()[1])                     # "" on an AVX2 CPU: the normal engine
+    if portable and floor:                               # CMake refuses both: the portable build wins (it says why)
+        warn(f"--max-compatibility: the portable build (AVX2 baseline) takes the place of the older-CPU build "
+             f"(STRATA_ISA_FLOOR={floor})")
+        floor = ""
     engine_ok = meta.get("backend") == "hip" and (eng / EXE).exists() and meta.get("src") == src and has_archs and \
-        (meta.get("isa_floor") or "") == floor and not stale_binary(eng / EXE)
-    vision_ok = vision == "none" or ((eng / VEXE).exists() and meta.get("vision_src") == vsrc)
+        (meta.get("isa_floor") or "") == floor and bool(meta.get("portable")) == bool(portable) and \
+        not stale_binary(eng / EXE)
+    vision_ok = vision == "none" or ((eng / VEXE).exists() and meta.get("vision_src") == vsrc and
+                                     bool(meta.get("portable")) == bool(portable))
     if engine_ok and vision_ok:
         ok("engine already built for this PC")
         return eng
     if engine_ok:
-        return build_vision_cpu(eng, stamp, meta, llama, vsrc)
+        return build_vision_cpu(eng, stamp, meta, llama, vsrc, portable)
     if not (shutil.which("c++") or shutil.which("g++")) or not shutil.which("git"):
         fail("a C++ compiler and git are needed to compile the AMD engine",
              "Ubuntu/Debian: sudo apt install build-essential git   Fedora: sudo dnf install gcc-c++ git")
@@ -3831,6 +3891,7 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
                  f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
                  "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
                  f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
+                 f"-DSTRATA_PORTABLE={'ON' if portable else 'OFF'}",
                  f"-DSTRATA_GGML_DIR={llama}", *isa_floor_defs(floor, ROOT / "build-hip", meta)], None, "")
     if stale_binary(ROOT / "build-hip" / EXE):            # #2054: no stamp for a binary of another version
         fail(f"the engine build finished without a new engine ({EXE} is version "
@@ -3838,10 +3899,72 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
              "the installed engine is left as it was", "delete the folder build-hip and run this again")
     shutil.copy2(ROOT / "build-hip" / EXE, eng / EXE)
     meta = {"source": "local-hip", "backend": "hip", "version": source_version(), "archs": archs, "vision": "none",
-            "lib_dirs": dirs, "src": src, **({"isa_floor": floor} if floor else {})}
+            "lib_dirs": dirs, "src": src, **({"isa_floor": floor} if floor else {}),
+            **({"portable": True} if portable else {})}
     if vision != "none":
-        return build_vision_cpu(eng, stamp, meta, llama, vsrc)
+        return build_vision_cpu(eng, stamp, meta, llama, vsrc, portable)
     stamp.write_text(json.dumps(meta, indent=1))
+    ok(f"engine compiled: {eng / EXE}")
+    return eng
+
+
+def build_engine_hip_win(gpu, llama, portable=False) -> Path:
+    """Compile the HIP engine for this AMD GPU on Windows into engine/ (again only when its source changed: a
+    `git pull`).  ROCm comes from AMD's TheRock Windows wheels in .rocm-win (rocm_win_root), MSVC's headers, linker
+    and runtime from the Visual Studio C++ build tools, and ROCm's clang compiles the host code too (CMake refuses to
+    mix it with cl.exe: tools/hip/build_windows.bat).  The DLLs and kernels it loads are .rocm-win's own, which the
+    config's lib_dirs points at (the ready-made zip keeps a copy of the DLLs it needs instead).  portable
+    (--max-compatibility): STRATA_PORTABLE, the release build (AVX2 baseline, static MSVC runtime), for other PCs.
+    There is no HIP image encoder: images stay off."""
+    eng = ROOT / "engine"
+    eng.mkdir(exist_ok=True)
+    stamp = eng / "BUILD.json"
+    meta = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
+    src = source_hash(ENGINE_SOURCES)
+    archs = sorted(set(gpu.get("archs") or [gpu["arch"]]))
+    engine_ok = meta.get("backend") == "hip" and meta.get("source") == "local-hip" and (eng / EXE).exists() and \
+        meta.get("src") == src and set(archs) <= set(meta.get("archs", [])) and \
+        bool(meta.get("portable")) == bool(portable) and not stale_binary(eng / EXE)
+    if engine_ok:
+        ok("engine already built for this PC")
+        return eng
+    vcvars = find_vcvars()
+    if vcvars is None:
+        fail("the Visual Studio C++ build tools were not found",
+             "install them (Visual Studio 2019 or 2022, workload 'Desktop development with C++') and run setup again")
+    root, _ = rocm_win_root(archs)
+    rocm = str(root).replace("\\", "/")
+    bitcode = f"{rocm}/lib/llvm/amdgcn/bitcode"
+    os.environ.update({"HIP_PLATFORM": "amd", "HIP_PATH": str(root), "ROCM_PATH": str(root)})
+    os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "lib" / "llvm" / "bin"),
+                                          os.environ.get("PATH", "")])
+    say("  The engine's source changed: compiling it again (only what changed, a few minutes) ..."
+        if meta.get("backend") == "hip" and (eng / EXE).exists()
+        else f"  Compiling the PolyStrata engine for your AMD GPU ({', '.join(archs)}; 10-20 minutes, once) ...")
+    bdir = ROOT / "build-hip-win"
+    cmake_build(ROOT, bdir, ["strata", "strata-device"],
+                ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_BUILD_TESTS=OFF",
+                 "-DSTRATA_PREFILL_MMQ=ON", "-DSTRATA_NATIVE_EXPERTS=ON",
+                 f"-DSTRATA_PORTABLE={'ON' if portable else 'OFF'}",
+                 "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
+                 f"-DCMAKE_C_COMPILER={rocm}/lib/llvm/bin/clang.exe",
+                 f"-DCMAKE_CXX_COMPILER={rocm}/lib/llvm/bin/clang++.exe",
+                 f"-DCMAKE_HIP_COMPILER={rocm}/lib/llvm/bin/clang++.exe",
+                 f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={rocm}", f"-DCMAKE_PREFIX_PATH={rocm}",
+                 f"-DCMAKE_HIP_FLAGS=--rocm-path={rocm} --rocm-device-lib-path={bitcode}",
+                 f"-DSTRATA_GGML_DIR={llama}"], vcvars, "build-strata-hip-win.bat")
+    if stale_binary(bdir / EXE):                       # #2054: no stamp for a binary of another source
+        fail(f"the engine build finished without a new engine ({EXE} is version "
+             f"{binary_engine_version(bdir / EXE)}, this source is {source_version()}): "
+             "the installed engine is left as it was", "delete the folder build-hip-win and run this again")
+    for name in (EXE, "strata-device.exe"):
+        shutil.copy2(bdir / name, eng / name)
+    meta = {"source": "local-hip", "backend": "hip", "platform": "windows-x64", "version": source_version(),
+            "archs": archs, "rocm": ROCM_WIN_VERSION, "hipblaslt_version": hipblaslt_version([str(root / "bin")]),
+            "vision": "none", "lib_dirs": [str(root / "bin")], "src": src,
+            **({"portable": True} if portable else {})}
+    stamp.write_text(json.dumps(meta, indent=1))
+    hip_runtime_beside_exe(eng)                        # #468 #461: before System32's amdhip64_7.dll
     ok(f"engine compiled: {eng / EXE}")
     return eng
 
@@ -3853,18 +3976,19 @@ def hip_vision(asked) -> str:
         warn("the AMD backend has no GPU image encoder yet: images off"
              + ("" if WIN else " (--vision cpu reads them on the CPU)"))
     if asked == "cpu" and WIN:
-        warn("images on the CPU with an AMD card are Linux-only for now (the ready-made Windows AMD engine has no "
-             "image encoder): images off")
+        warn("images on the CPU with an AMD card are Linux-only for now (the Windows AMD engine has no image "
+             "encoder): images off")
         return "none"
     return "cpu" if asked == "cpu" else "none"
 
 
-def build_vision_cpu(eng: Path, stamp: Path, meta: dict, llama, vsrc) -> Path:
+def build_vision_cpu(eng: Path, stamp: Path, meta: dict, llama, vsrc, portable=False) -> Path:
     """#304: the CPU image encoder beside the HIP engine (tools/vision without CUDA), recorded in its BUILD.json."""
     if not ((eng / VEXE).exists() and meta.get("vision_src") == vsrc):
         say("  Compiling the image encoder (for the CPU) ...")
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision",
-                    [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=OFF", "-DSTRATA_PORTABLE=OFF"],
+                    [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=OFF",
+                     f"-DSTRATA_PORTABLE={'ON' if portable else 'OFF'}"],
                     find_vcvars() if WIN else None,
                     "build-vision-cpu.bat" if WIN else "")   # #881: MSVC's environment on Windows, as the CUDA path has
         shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
@@ -4440,21 +4564,23 @@ def update_installed_engine(url_base, toolkit=None) -> None:
         return
     meta_text = info.read_text(encoding="utf-8")
     meta = json.loads(meta_text)
-    if meta.get("backend") == "hip" and WIN:           # AMD on Windows: the ready-made HIP engine, when older
-        ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
-        if meta.get("source") == "prebuilt" and ver < WIN_HIP_MIN_ENGINE:
-            try:
-                g = next((x for x in amd_gpus() if amd_problem(x) is None), None)
-                if g is None:
-                    raise RuntimeError("no supported AMD GPU found")
-                say(f"  Updating the ready-made AMD engine ({meta.get('version')} -> "
-                    f"{'.'.join(map(str, WIN_HIP_MIN_ENGINE))} or newer) ...")
-                if get_prebuilt_hip(url_base, g, updating=True) is None:
-                    raise RuntimeError("not published yet")
-            except (Exception, SystemExit) as e:
-                warn(f"could not update the AMD engine{'' if isinstance(e, SystemExit) else f' ({e})'}: "
-                     "starting the installed one")
-        return
+    if meta.get("backend") == "hip" and WIN:
+        if meta.get("source") != "local-hip":          # AMD on Windows: the ready-made HIP engine, when older
+            ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
+            if meta.get("source") == "prebuilt" and ver < WIN_HIP_MIN_ENGINE:
+                try:
+                    g = next((x for x in amd_gpus() if amd_problem(x) is None), None)
+                    if g is None:
+                        raise RuntimeError("no supported AMD GPU found")
+                    say(f"  Updating the ready-made AMD engine ({meta.get('version')} -> "
+                        f"{'.'.join(map(str, WIN_HIP_MIN_ENGINE))} or newer) ...")
+                    if get_prebuilt_hip(url_base, g, updating=True) is None:
+                        raise RuntimeError("not published yet")
+                except (Exception, SystemExit) as e:
+                    warn(f"could not update the AMD engine{'' if isinstance(e, SystemExit) else f' ({e})'}: "
+                         "starting the installed one")
+            return
+        # one compiled here (--build): compiled again when its source changed, as on Linux below
     if meta.get("backend") == "hip":                   # AMD: compiled here, again when its source changed
         if meta.get("src") != source_hash(ENGINE_SOURCES) or stale_binary(eng / EXE):
             try:
@@ -4464,7 +4590,8 @@ def update_installed_engine(url_base, toolkit=None) -> None:
                     raise RuntimeError("no supported AMD GPU found")
                 # every architecture it was built for (a layer split across two families keeps both)
                 build_engine_hip({**g, "archs": [x for x in meta.get("archs", []) if x in AMD_ARCHS] or [g["arch"]]},
-                                 get_llama_cpp(vision=True), meta.get("vision") or "none")
+                                 get_llama_cpp(vision=not WIN), meta.get("vision") or "none",  # no Windows HIP image encoder
+                                 portable=bool(meta.get("portable")))
             except (Exception, SystemExit) as e:
                 warn(f"could not compile the updated engine{'' if isinstance(e, SystemExit) else f' ({e})'}: "
                      "starting the installed one")
@@ -4494,7 +4621,8 @@ def update_installed_engine(url_base, toolkit=None) -> None:
             gpu = {**gpu, "archs": sorted({int(gpu["arch"]), *(int(x) for x in meta.get("archs", []))})}
             if int(toolkit) == 12:                     # the cards it was compiled for (the main GPU may be newer)
                 gpu["archs"] = sorted({int(x) for x in meta.get("archs", [])}) or gpu["archs"]
-            build_engine(gpu, vision, False, get_llama_cpp(), toolkit=toolkit)
+            build_engine(gpu, vision, False, get_llama_cpp(), toolkit=toolkit,
+                         portable=bool(meta.get("portable")))
         except (Exception, SystemExit) as e:
             warn(f"could not compile the updated engine{'' if isinstance(e, SystemExit) else f' ({e})'}: starting the installed one")
         return
@@ -4674,12 +4802,16 @@ def cached_compiler(bdir, defs):
 
 
 def cmake_build(src, bdir, target, defs, vcvars, bat_name):
+    """`target`: one CMake target, or a list of them (one `--target` each: the Windows HIP engine builds `strata` and
+    `strata-device` together, as tools/hip/build_windows.bat does)."""
     cmake, ninja = find_tool("cmake"), find_tool("ninja")
     if cmake is None or ninja is None:
         fail("cmake / ninja not found after installing them", "run: .venv python -m pip install cmake ninja")
+    targets = [target] if isinstance(target, str) else list(target)
     conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
             "-DCMAKE_BUILD_TYPE=Release", *cached_compiler(bdir, defs)]
-    build = [cmake, "--build", str(bdir), "--target", target, "-j", str(max(2, (os.cpu_count() or 4) // 2))]
+    build = [cmake, "--build", str(bdir), *[x for t in targets for x in ("--target", t)],
+             "-j", str(max(2, (os.cpu_count() or 4) // 2))]
     # A failed build is tried once more: CUDA 13.0's ptxas now and then fails to parse a PTX file it just wrote, and
     # the same command then gets past it (issue #45); a second attempt only compiles what is still missing.
     if WIN:
@@ -4766,11 +4898,13 @@ def prebuilt_vision(meta: dict, gpu: dict, vision: str) -> str:
     return vision
 
 
-def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
+def build_engine(gpu, vision, yes, llama, toolkit=None, portable=False) -> Path:
     """Compile the engine (and, for images, the encoder) for this GPU; the results go to engine/.  A compiled
     engine whose source files changed since (a `git pull`) is compiled again: only the changed files, a few minutes.
     toolkit 12 (default: 12 for a card older than CUDA 13 supports): the experimental CUDA 12 engine, in
-    engine-cuda12/ with its own build folders."""
+    engine-cuda12/ with its own build folders.  portable (Windows, --max-compatibility): the engine and its encoder
+    with STRATA_PORTABLE - the release zip's build (AVX2 baseline, static MSVC runtime) - so they also run on other
+    PCs; off, this PC's own instructions are used."""
     if toolkit is None:
         toolkit = 12 if min(int(x) for x in gpu.get("archs", [gpu["arch"]])) < CUDA13_MIN_ARCH else 13
     t12 = int(toolkit) == 12
@@ -4787,9 +4921,16 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     # same; the compile keeps the generations it was built for
     new_arch = local and not set(archs) <= built
     floor = cpu_floor(cpu_info()[1])                     # "" on an AVX2 CPU: the normal engine
+    if portable and floor:                               # CMake refuses both: the portable build wins (it says why)
+        warn(f"--max-compatibility: the portable build (AVX2 baseline) takes the place of the older-CPU build "
+             f"(STRATA_ISA_FLOOR={floor})")
+        floor = ""
     engine_ok = local and (eng / EXE).exists() and meta.get("src") == src and not new_arch and \
-        (meta.get("isa_floor") or "") == floor and not stale_binary(eng / EXE)
-    vision_ok = not want_vision or ((eng / VEXE).exists() and (not local or meta.get("vision_src") == vsrc))
+        (meta.get("isa_floor") or "") == floor and bool(meta.get("portable")) == bool(portable) and \
+        not stale_binary(eng / EXE)
+    vision_ok = not want_vision or ((eng / VEXE).exists() and
+                                    (not local or (meta.get("vision_src") == vsrc and
+                                                   bool(meta.get("portable")) == bool(portable))))
     if engine_ok and vision_ok:
         ok("engine already built for this PC")
         return eng
@@ -4808,6 +4949,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
                      f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
                      f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DSTRATA_GGML_DIR={llama}",
                      *host_compiler_defs(True), *engine_defs(archs, toolkit),
+                     f"-DSTRATA_PORTABLE={'ON' if portable else 'OFF'}",
                      *isa_floor_defs(floor, bdir, meta)],
                     vcvars, "build-strata-cuda12.bat" if t12 else "build-strata.bat")
         if stale_binary(bdir / EXE):                      # #2054: the stamp below is written only for a binary of this source
@@ -4822,7 +4964,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
         defs = [f"-DLLAMA_DIR={get_llama_cpp(vision=True)}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}",
-                "-DSTRATA_PORTABLE=OFF", *host_compiler_defs(vision == "gpu")]   # native, like the engine
+                f"-DSTRATA_PORTABLE={'ON' if portable else 'OFF'}", *host_compiler_defs(vision == "gpu")]
         if vision == "gpu":
             defs += [f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
                      *toolkit_root_defs(nvcc)]
@@ -4834,7 +4976,8 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
     stamp.write_text(json.dumps({"source": "local", "version": source_version(), "archs": archs,
                                  "vision": vision, **({"toolkit": 12} if t12 else {}),
                                  "cuda_dirs": dirs, "src": src, "vision_src": vsrc if want_vision else None,
-                                 **({"isa_floor": floor} if floor else {})}, indent=1))
+                                 **({"isa_floor": floor} if floor else {}),
+                                 **({"portable": True} if portable else {})}, indent=1))
     ok(f"engine compiled: {eng / EXE}")
     return eng
 
@@ -5306,6 +5449,18 @@ def carry_over(old: dict, cfg: dict) -> list[str]:
     return kept
 
 
+def warm_start_into(cfg: dict, a) -> None:
+    """--warm-start [FILE]: the run config's "warm_start" (serve/server.py's Service.start_warm).  Written only when
+    given: an earlier config's is carried over (write_setup_config)."""
+    w = getattr(a, "warm_start", None)
+    if w is None:
+        return
+    cfg["warm_start"] = w if w is True else str(Path(w).expanduser().resolve())
+    ok("warm start: the server keeps an agent's system prompt with its tools and has it ready when it starts"
+       + ("" if w is True else f" (the one in {cfg['warm_start']}"
+          + ("" if Path(cfg["warm_start"]).is_file() else ", once the agent has written it") + ")"))
+
+
 def flag_value(args: list, flag: str):
     """The value after `flag` in an argument list, or None."""
     for i, a in enumerate(args[:-1]):
@@ -5435,6 +5590,9 @@ def choices_from_config(cfg_path: Path) -> dict:
     family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
     model = (tag[len(FAMILIES[family]["tag"]):] if tag.startswith(FAMILIES[family]["tag"]) else tag).upper()
     sizes = FAMILIES[family].get("models", MODELS)     # a family's own sizes, where it has them
+    # Some published quant names are lowercase (MiniCPM-V's mix_q3gud_im).
+    # Match the filename case-insensitively, then return the catalog's canonical key.
+    model = next((m for m in sizes if m.casefold() == model.casefold()), model)
     if model not in sizes:                             # (sizes have no dash except UD-Q4_K_XL: the old rule)
         model = tag.split("-")[-1].upper()
     a = cfg.get("args", [])
@@ -6217,7 +6375,8 @@ def ensure_engine_for(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
     main = gpu_info(cards[0]["index"])
     archs = sorted({int(x) for x in meta.get("archs", [])} | {int(g["arch"]) for g in cards})
     vision = meta.get("vision") or ("gpu" if (eng / VEXE).exists() else "none")
-    build_engine({**main, "archs": archs}, vision, yes, get_llama_cpp(), toolkit=tk)
+    build_engine({**main, "archs": archs}, vision, yes, get_llama_cpp(), toolkit=tk,
+                 portable=bool(meta.get("portable")))
     dirs = json.loads(info.read_text(encoding="utf-8")).get("cuda_dirs") or []
     cfg["lib_dirs"] = dirs + [d for d in cfg.get("lib_dirs") or [] if d not in dirs]
     write_config(cfg_path, cfg)
@@ -6232,7 +6391,10 @@ def get_cuda12_engine(url_base, gpu, vision, yes, build=False) -> Path:
         pip_cuda_libs(12)
         if vision != "none" and not (eng / VEXE).exists():
             eng = None
-    return eng if eng is not None else build_engine(gpu, vision, yes, get_llama_cpp(), toolkit=12)
+    stamp = engine_dir(12) / "BUILD.json"
+    prev = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
+    return eng if eng is not None else build_engine(gpu, vision, yes, get_llama_cpp(), toolkit=12,
+                                                    portable=bool(prev.get("portable")))
 
 
 def engine_lib_dirs(eng: Path, toolkit=13) -> list:
@@ -6400,6 +6562,26 @@ def poly_verdict(d, ram, vram_gb, hip, windows=False) -> str:
         f"wants ~{need:.0f} GB of RAM on this card: with {ram:.0f} its experts are read from the SSD")
 
 
+# --kv for a model of strata-poly (docs/Q8_KV.md): the formats its architecture's attention caches have beside
+# fp16, the default.  The other engine's own are STRATA_KV.
+POLY_KV = {"q8_0": ("qwen36", "ornith", "ornith122", "tiel", "groot", "minicpmv", "kolibri", "flint", "lfm25"),
+           "int8": ("gemma4",), "int8k": ("gemma4",)}
+STRATA_KV = ("int8", "q4_0", "k8v4")
+
+
+def poly_saved_kv(paths) -> str | None:
+    """--kv of an earlier run config of this model (the first of `paths` there is), or None."""
+    for p in paths:
+        if p is None or not p.is_file():
+            continue
+        try:
+            args = json.loads(p.read_text(encoding="utf-8-sig")).get("args")
+        except (OSError, ValueError, AttributeError):
+            continue
+        return flag_value(args, "--kv") if isinstance(args, list) else None
+    return None
+
+
 def poly_saved_conv(paths) -> int | str | None:
     """--conversation-cache-mib of an earlier run config of this model (the first of `paths` there is): MiB, or "auto";
     0 when that config has none; None without an earlier config: setup then asks."""
@@ -6480,12 +6662,13 @@ def get_poly_prebuilt(gpu) -> bool:
     return True
 
 
-def build_engine_poly(gpu, yes, llama, vision="none", toolkit=13) -> Path:
+def build_engine_poly(gpu, yes, llama, vision="none", toolkit=13, portable=False) -> Path:
     """Compile strata-poly for this GPU and, for images, the encoder beside it ("gpu": with CUDA, "cpu": without);
     the results go to engine-poly/.  Each is compiled again when its source changed (a `git pull`); the engine also
     when the card is one it has no code for, and the encoder when it is wanted on the GPU and was built without.
     toolkit 12 (--cuda 12): with a CUDA 12.x toolkit, for a driver older than CUDA 13's or a Pascal / Volta card;
-    both are compiled again when the ones there were built with the other toolkit."""
+    both are compiled again when the ones there were built with the other toolkit.  portable (Windows,
+    --max-compatibility): STRATA_PORTABLE, the release build (AVX2 baseline, static MSVC runtime), for other PCs."""
     eng = ROOT / ENGINE_POLY_DIR
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
@@ -6498,11 +6681,14 @@ def build_engine_poly(gpu, yes, llama, vision="none", toolkit=13) -> Path:
     release = meta.get("source") == "release"
     archs = sorted(cards if release or not same else built | cards)
     have = (eng / POLY_EXE).exists()
-    engine_ok = have and same and meta.get("src") == src and (cards <= built if release else set(archs) == built)
+    portable_same = release or bool(meta.get("portable")) == bool(portable)
+    engine_ok = have and same and meta.get("src") == src and (cards <= built if release else set(archs) == built) and \
+        portable_same
     # an encoder built with CUDA also runs on the CPU, so the one there is kept unless the GPU is asked of a CPU one
     was = meta.get("vision") or "none"
     vision_ok = vision == "none" or ((eng / VEXE).exists() and meta.get("vision_src") == vsrc and
-                                     (was == "gpu" and same or was == "cpu" and vision == "cpu"))
+                                     (was == "gpu" and same or was == "cpu" and vision == "cpu") and
+                                     portable_same)
     if engine_ok and vision_ok:
         ok(f"strata-poly already {'downloaded' if release else 'built'} for this PC")
         return eng
@@ -6518,14 +6704,16 @@ def build_engine_poly(gpu, yes, llama, vision="none", toolkit=13) -> Path:
         # a folder per toolkit: CMake does not take another compiler into a folder configured with one
         bdir = ROOT / ("build-poly" if toolkit == 13 else "build-poly-cuda12")
         defs = ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
-                f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"]
+                f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}",
+                f"-DSTRATA_PORTABLE={'ON' if portable else 'OFF'}"]
         if min(archs) < CUDA13_MIN_ARCH:
             defs.append("-DSTRATA_EXPERIMENTAL_SM60=ON")
         cmake_build(ROOT, bdir, "strata-poly", defs, vcvars, "build-strata-poly.bat")
         shutil.copy2(bdir / POLY_EXE, eng / POLY_EXE)
     if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
-        defs = [f"-DLLAMA_DIR={get_llama_cpp(vision=True)}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}"]
+        defs = [f"-DLLAMA_DIR={get_llama_cpp(vision=True)}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}",
+                f"-DSTRATA_PORTABLE={'ON' if portable else 'OFF'}"]
         if vision == "gpu":
             defs += [f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}"]
         # its own build folder: the Qwen engine's encoder may be built for another toolkit in build-vision/
@@ -6533,24 +6721,27 @@ def build_engine_poly(gpu, yes, llama, vision="none", toolkit=13) -> Path:
         cmake_build(ROOT / "tools" / "vision", vdir, "strata-vision", defs, vcvars, "build-vision-poly.bat")
         shutil.copy2(vdir / "bin" / VEXE, eng / VEXE)
         was, meta = vision, {**meta, "vision_src": vsrc}
+    elif vision == "none" and not portable_same:       # the encoder there is of another portability setting: not ours
+        was, meta = "none", {**meta, "vision_src": None}
     bindir = Path(nvcc).parent                            # the toolkit's own libraries (bin, bin/x64, lib64)
     dirs = [str(x) for x in (bindir, bindir / "x64", bindir.parent / "lib64") if x.is_dir()]
     if toolkit == 13:                                     # pip's, for a ready-made encoder kept beside it
         dirs += [d for d in cuda_lib_dirs(13) if d not in dirs]
     stamp.write_text(json.dumps({"source": "local", "version": source_version(), "archs": archs, "cuda_dirs": dirs,
-                                 "toolkit": toolkit, "src": src, "vision": was, "vision_src": meta.get("vision_src")},
+                                 "toolkit": toolkit, "src": src, "vision": was, "vision_src": meta.get("vision_src"),
+                                 **({"portable": True} if portable else {})},
                                 indent=1))
     ok(f"strata-poly compiled: {eng / POLY_EXE}" + (f", image encoder: {eng / VEXE}" if vision != "none" else ""))
     return eng
 
 
-def build_engine_poly_hip(gpu, llama) -> Path:
+def build_engine_poly_hip(gpu, llama, portable=False) -> Path:
     """Compile strata-poly for this AMD GPU into engine-poly/ (again only when its source changed: a `git pull`).
-    Windows: AMD's TheRock Windows wheels in .rocm-win (build_engine_poly_hip_win).  Linux: ROCm from rocm_root: a
-    system ROCm 7 or AMD's TheRock wheels in .venv, as for the main engine's HIP build.  There is no ready-made AMD
-    engine and no HIP image encoder: images stay off."""
+    Windows: AMD's TheRock Windows wheels in .rocm-win (build_engine_poly_hip_win; portable: see that function).
+    Linux: ROCm from rocm_root: a system ROCm 7 or AMD's TheRock wheels in .venv, as for the main engine's HIP
+    build.  There is no ready-made AMD engine and no HIP image encoder: images stay off."""
     if WIN:
-        return build_engine_poly_hip_win(gpu, llama)
+        return build_engine_poly_hip_win(gpu, llama, portable)
     eng = ROOT / ENGINE_POLY_DIR
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
@@ -6558,7 +6749,7 @@ def build_engine_poly_hip(gpu, llama) -> Path:
     src = source_hash(ENGINE_SOURCES)
     archs = sorted(set(gpu.get("archs") or [gpu["arch"]]))
     engine_ok = meta.get("backend") == "hip" and (eng / POLY_EXE).exists() and meta.get("src") == src and \
-        set(archs) <= set(meta.get("archs", []))
+        set(archs) <= set(meta.get("archs", [])) and bool(meta.get("portable")) == bool(portable)
     if engine_ok:
         ok("strata-poly already built for this PC")
         return eng
@@ -6578,6 +6769,7 @@ def build_engine_poly_hip(gpu, llama) -> Path:
         else f"  Compiling the strata-poly engine for your AMD GPU ({', '.join(archs)}; some minutes, once) ...")
     cmake_build(ROOT, ROOT / "build-poly-hip", "strata-poly",
                 ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_BUILD_TESTS=OFF",
+                 f"-DSTRATA_PORTABLE={'ON' if portable else 'OFF'}",
                  "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
                  f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
                  "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
@@ -6585,18 +6777,20 @@ def build_engine_poly_hip(gpu, llama) -> Path:
                  f"-DSTRATA_GGML_DIR={llama}"], None, "")
     shutil.copy2(ROOT / "build-poly-hip" / POLY_EXE, eng / POLY_EXE)
     stamp.write_text(json.dumps({"source": "local-hip", "backend": "hip", "version": source_version(),
-                                 "archs": archs, "vision": "none", "lib_dirs": dirs, "src": src}, indent=1))
+                                 "archs": archs, "vision": "none", "lib_dirs": dirs, "src": src,
+                                 **({"portable": True} if portable else {})}, indent=1))
     ok(f"strata-poly compiled: {eng / POLY_EXE}")
     return eng
 
 
-def build_engine_poly_hip_win(gpu, llama) -> Path:
+def build_engine_poly_hip_win(gpu, llama, portable=False) -> Path:
     """Compile strata-poly for this AMD GPU on Windows into engine-poly/ (again only when its source changed: a
     `git pull`).  ROCm comes from AMD's TheRock Windows wheels in .rocm-win (rocm_win_root), MSVC's headers, linker
     and runtime from the Visual Studio C++ build tools, and ROCm's clang compiles the host code too (CMake refuses to
     mix it with cl.exe: tools/hip/build_windows.bat).  The DLLs and kernels it loads are the ready-made main engine's
     bundled ROCm, or .rocm-win's own: the config's lib_dirs points there, so the libraries are not on the disk twice.
-    There is no HIP image encoder: images stay off."""
+    portable (--max-compatibility): STRATA_PORTABLE, the release build (AVX2 baseline, static MSVC runtime), for other
+    PCs.  There is no HIP image encoder: images stay off."""
     eng = ROOT / ENGINE_POLY_DIR
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
@@ -6604,7 +6798,7 @@ def build_engine_poly_hip_win(gpu, llama) -> Path:
     src = source_hash(ENGINE_SOURCES)
     archs = sorted(set(gpu.get("archs") or [gpu["arch"]]))
     engine_ok = meta.get("backend") == "hip" and (eng / POLY_EXE).exists() and meta.get("src") == src and \
-        set(archs) <= set(meta.get("archs", []))
+        set(archs) <= set(meta.get("archs", [])) and bool(meta.get("portable")) == bool(portable)
     if engine_ok:
         ok("strata-poly already built for this PC")
         return eng
@@ -6624,7 +6818,7 @@ def build_engine_poly_hip_win(gpu, llama) -> Path:
     bdir = ROOT / "build-poly-hip-win"
     cmake_build(ROOT, bdir, "strata-poly",
                 ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_BUILD_TESTS=OFF",
-                 "-DSTRATA_PREFILL_MMQ=ON", "-DSTRATA_PORTABLE=OFF",
+                 "-DSTRATA_PREFILL_MMQ=ON", f"-DSTRATA_PORTABLE={'ON' if portable else 'OFF'}",
                  "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
                  f"-DCMAKE_C_COMPILER={rocm}/lib/llvm/bin/clang.exe",
                  f"-DCMAKE_CXX_COMPILER={rocm}/lib/llvm/bin/clang++.exe",
@@ -6641,7 +6835,8 @@ def build_engine_poly_hip_win(gpu, llama) -> Path:
     stamp.write_text(json.dumps({"source": "local-hip", "backend": "hip", "platform": "windows-x64",
                                  "version": source_version(), "archs": archs, "rocm": ROCM_WIN_VERSION,
                                  "hipblaslt_version": hipblaslt_version([str(root / "bin")]), "vision": "none",
-                                 "lib_dirs": dirs, "src": src}, indent=1))
+                                 "lib_dirs": dirs, "src": src,
+                                 **({"portable": True} if portable else {})}, indent=1))
     hip_runtime_beside_exe(eng)                        # #468 #461: before System32's amdhip64_7.dll
     ok(f"strata-poly compiled: {eng / POLY_EXE}")
     return eng
@@ -6666,7 +6861,7 @@ def update_poly_engine(cfg: dict, yes=False, cfg_path: Path | None = None) -> No
         if meta.get("backend") == "hip":   # the AMD engine compiled here: the same way again when the source moved
             if not (meta.get("src") == source_hash(ENGINE_SOURCES) and (eng / POLY_EXE).exists()):
                 build_engine_poly_hip({"arch": (meta.get("archs") or [""])[0], "archs": meta.get("archs")},
-                                      get_llama_cpp())
+                                      get_llama_cpp(), bool(meta.get("portable")))
                 cfg["lib_dirs"] = engine_lib_dirs(eng)
             if renamed:
                 cfg["exe"] = str(eng / POLY_EXE)
@@ -6690,7 +6885,8 @@ def update_poly_engine(cfg: dict, yes=False, cfg_path: Path | None = None) -> No
                 warn("the latest release has no ready-made strata-poly of this source: the one installed starts "
                      "(START-HERE.bat --setup --build compiles this source)")
                 return
-            build_engine_poly(gpu, yes, get_llama_cpp(), vision, int(meta.get("toolkit", 13)))
+            build_engine_poly(gpu, yes, get_llama_cpp(), vision, int(meta.get("toolkit", 13)),
+                              bool(meta.get("portable")))
             # a ready-made engine loads CUDA from pip, one compiled here from the toolkit it was compiled with
             cfg["lib_dirs"], changed = engine_lib_dirs(eng), True
         if changed:
@@ -6721,13 +6917,15 @@ def poly_tail_skip(cfg: dict, cfg_path: Path | None = None) -> None:
 def poly_kv_whole(cfg: dict, cfg_path: Path | None = None) -> None:
     """A config of strata-poly on an AMD card gets --kv-whole: ROCm keeps the VRAM that cuMemUnmap() and
     cuMemRelease() gave back (issue #13), so the attention caches take theirs at load instead of as the
-    conversation grows, where the expert cache's VRAM would be lost to them.  A config that has it keeps it."""
+    conversation grows, where the expert cache's VRAM would be lost to them.  A config that has it keeps it.  A config
+    with --vram-pool is left as it is: the pool keeps the card's VRAM for the whole run and moves it between the caches,
+    so nothing is given back to ROCm, and --kv-whole would take the whole context's VRAM from the experts at load."""
     a = cfg["args"]
     try:
         meta = json.loads((Path(cfg["exe"]).parent / "BUILD.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
-    if meta.get("backend") != "hip" or "--kv-whole" in a:
+    if meta.get("backend") != "hip" or "--kv-whole" in a or "--vram-pool" in a:
         return
     a.append("--kv-whole")
     ok("AMD card: --kv-whole, the attention caches take their VRAM at load (ROCm keeps what the expert cache gives "
@@ -6763,7 +6961,8 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     unused = [flag for flag, given in (
         ("--vision", not sees and a.vision not in (None, "no", "none")),
         ("--vision-tokens", not sees and a.vision_tokens is not None),
-        ("--kv", a.kv), ("--kv-streaming", a.kv_streaming != "auto"), ("--rope-scaling", a.rope_scaling),
+        ("--kv", a.kv and a.kv != "fp16" and family not in POLY_KV.get(a.kv, ())),
+        ("--kv-streaming", a.kv_streaming != "auto"), ("--rope-scaling", a.rope_scaling),
         ("--rope-scale", a.rope_scale is not None), ("--low-ram", a.low_ram != "auto"),
         ("--resident-budget-gib", a.resident_budget_gib is not None),
         ("--draft-vocab", a.draft_vocab), ("--layer-split", a.layer_split and not multi), ("--calibrate", a.calibrate),
@@ -6778,7 +6977,8 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         fail(f"{title} has no {a.model} model file", "choose one of: " + ", ".join(names))
     vram = gpu["vram_gb"]
     if multi:   # each card has its layers' dense weights; its own scratch and staging buffer cost ~2 GB a card more
-        vram = sum(gpu_info(i)["vram_gb"] for i in multi) - 2.0 * (len(multi) - 1)
+        cards = {g["index"]: g for g in (amd_gpus() if hip else gpus())}
+        vram = sum(cards[i]["vram_gb"] for i in multi) - 2.0 * (len(multi) - 1)
     model = a.model or poly_default(sizes, ram, vram)
     if not a.model and len(names) > 1:
         say()
@@ -6840,10 +7040,17 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     ok(f"size: {model}")
     tag = fam["tag"] + custom_gguf_tag(_sg, model)
 
+    # STRATA_EXPERIMENTAL_GFX1012 (the RX 5500 XT / Radeon Pro 5500M): the q8_0 attention caches take half the VRAM,
+    # so 64K costs the expert cache what 32K in fp16 does, and the experts outside VRAM run on one thread a physical
+    # core (rdna1_poly_args()).  Measured on a Radeon Pro 5500M (8 GB) beside an i9-9980HK: docs/RADEON_PRO_5500M.md.
+    rdna1 = bool(hip) and gpu.get("arch") == "gfx1012"
     if a.context is not None:
         ctx = a.context
         if not 16 <= ctx <= 1048576:
             fail(f"--context {ctx}: {title} takes 16 to 1048576 tokens")
+    elif rdna1:
+        ctx = 65536
+        say("  Context: 64K tokens (the attention caches in q8_0 take the VRAM 32K takes in fp16; --context sets it)")
     else:
         say()
         say("  Context length = how much text the model can see at once (your chat, files, tool output).")
@@ -6863,6 +7070,11 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
 
     # the conversation cache: asked once, then kept as the model's run config has it
     cfg_path = ROOT / f"strata-{tag.lower()}.json"
+    # the attention caches' format (issue 183): --kv when this model has that one, else what its run config had;
+    # --kv fp16 goes back to the default
+    kv = a.kv or poly_saved_kv([cfg_path, adopted if adopted is not None and adopted.name == cfg_path.name else None])
+    if family not in POLY_KV.get(kv, ()):
+        kv = None
     conv = poly_saved_conv([cfg_path, adopted if adopted is not None and adopted.name == cfg_path.name else None])
     if conv is None:
         say()
@@ -6935,7 +7147,13 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml)")
     if not a.build and not hip and cuda_tk != 12:
         get_poly_prebuilt(gpu)
-    eng = build_engine_poly_hip(gpu, llama) if hip else build_engine_poly(gpu, a.yes, llama, vision, cuda_tk)
+    # --max-compatibility: the release build; a run without --build keeps the choice the installed engine records
+    prev = ROOT / ENGINE_POLY_DIR / "BUILD.json"
+    prev_meta = json.loads(prev.read_text(encoding="utf-8")) if prev.exists() else {}
+    portable = bool(WIN and (getattr(a, "max_compatibility", False) or
+                             (not a.build and prev_meta.get("portable"))))
+    eng = build_engine_poly_hip(gpu, llama, portable) if hip else \
+        build_engine_poly(gpu, a.yes, llama, vision, cuda_tk, portable)
     lib_dirs = engine_lib_dirs(eng)
     ok(f"engine: {eng / POLY_EXE}")
 
@@ -7027,10 +7245,13 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
            "that much less)")
     if fam.get("tail_skip"):
         args += ["--tail-skip", str(fam["tail_skip"])]
+    if kv:
+        args += ["--kv", kv]
+        ok(f"attention caches stored as {kv} (--kv in the config, docs/Q8_KV.md; --kv fp16 at setup takes it out)")
     if not multi and poly_batch(fam, d, vram, ctx):
         args += ["--prompt-batch", "2048"]
         ok("prompts are read 2,048 tokens at a time (--prompt-batch in the config)")
-    # The engine's own count is every logical CPU.  On a hybrid CPU that is the slowest: an efficiency core runs
+    # The engine's own count is 70% of the logical CPUs.  A hybrid CPU gets one of setup's: an efficiency core runs
     # an expert at half the speed, and a layer waits for its slowest part (hybrid_pool_workers()).
     cores = cpu_cores()
     threads = hybrid_pool_workers(cores)
@@ -7038,6 +7259,11 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         args += ["--threads", str(threads)]
         ok(f"hybrid CPU ({cores[0]} performance + {cores[1]} efficiency cores): {threads} CPU threads for the experts "
            "outside VRAM (--threads in the config)")
+    elif rdna1:
+        extra = rdna1_poly_args()
+        args += extra
+        ok("Radeon RX 5500 XT / Pro 5500M: " + " ".join(extra) + " (the attention caches in q8_0, one CPU thread a "
+           "physical core)")
     base = custom_gguf_tag(_sg, model) if _sg else None
     cfg = {"exe": str(eng / POLY_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": base.lower() if base else f"{fam['name']}-{model.lower()}",
@@ -7083,6 +7309,7 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
     for line in poly_parallel_note(a.parallel, d, vram):
         (ok if a.parallel is not None else say)(line if a.parallel is not None else "  " + line)
     poly_kv_whole(cfg)
+    warm_start_into(cfg, a)
     write_setup_config(cfg_path, cfg, earlier)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     ok(f"start script: {script.name}")
@@ -7136,19 +7363,37 @@ def sycl_setup(argv) -> int:
     return subprocess.call([sys.executable, str(script), *rest])
 
 
+def hip_build_here(gpu) -> bool:
+    """Windows: whether engine/ holds the HIP engine compiled here (--build) for this card.  Then setup keeps that
+    build - compiling it again when its source changed - instead of downloading the ready-made one over it."""
+    try:
+        meta = json.loads((ROOT / "engine" / "BUILD.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return meta.get("backend") == "hip" and meta.get("source") == "local-hip" and \
+        gpu.get("arch") in meta.get("archs", [])
+
+
 def engine_step(a, gpu, hip, amd, cuda_tk, vision):
     """Step 4: llama.cpp's sources and the engine (ready-made, or compiled here).  Returns (llama, engine folder, its
     BUILD.json, its library folders, the GPU (AMD on Windows: as the engine sees it), the image-encoder choice)."""
     llama = get_llama_cpp()
     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
-    if hip and WIN:                                    # AMD on Windows: the ready-made HIP engine (no compiler)
-        eng = None if a.build else get_prebuilt_hip(a.prebuilt, gpu)
-        if eng is None:
-            fail("no ready-made AMD engine for this PolyStrata version" + (" (--build)" if a.build else ""),
-                 "compiling it on Windows: tools\\hip\\build_windows.bat makes strata-windows-x64-hip.zip, then run "
-                 "START-HERE.bat --backend hip --prebuilt <its dist folder> (docs/AMD_HIP.md)")
-        gpu = hip_card(eng, gpu, amd)
-        a.gpu = gpu["index"] if gpu["count"] > 1 else a.gpu
+    # --max-compatibility: the release build; a run without --build keeps the choice the installed engine records
+    prev = engine_dir(cuda_tk) / "BUILD.json"
+    prev_meta = json.loads(prev.read_text(encoding="utf-8")) if prev.exists() else {}
+    portable = bool(WIN and (getattr(a, "max_compatibility", False) or
+                             (not a.build and prev_meta.get("portable"))))
+    if hip and WIN:                                    # AMD on Windows: the ready-made HIP engine, or one built here
+        if a.build or hip_build_here(gpu):
+            eng = None                                 # compiled below (build_engine_hip_win; again when stale)
+        else:
+            eng = get_prebuilt_hip(a.prebuilt, gpu)
+            if eng is None:
+                fail("no ready-made AMD engine for this PolyStrata version",
+                     "compile it on this PC: START-HERE.bat --backend hip --build (Visual Studio 2022 Build Tools "
+                     "with the C++ workload, git; docs/AMD_HIP.md), or run tools\\hip\\build_windows.bat and start "
+                     "setup with --prebuilt <its dist folder>")
     else:
         eng = None if a.build or hip else get_prebuilt(a.prebuilt, gpu, vision, **({"toolkit": 12} if cuda_tk == 12
                                                                                     else {}))
@@ -7160,7 +7405,11 @@ def engine_step(a, gpu, hip, amd, cuda_tk, vision):
         else:
             vision = prebuilt_vision(json.loads((eng / "BUILD.json").read_text(encoding="utf-8")), gpu, vision)
     if eng is None:
-        eng = build_engine_hip(gpu, llama, vision) if hip else build_engine(gpu, vision, a.yes, llama, toolkit=cuda_tk)
+        eng = build_engine_hip(gpu, llama, vision, portable) if hip else \
+            build_engine(gpu, vision, a.yes, llama, toolkit=cuda_tk, portable=portable)
+    if hip and WIN:                                    # the card as the installed engine numbers it (#325)
+        gpu = hip_card(eng, gpu, amd)
+        a.gpu = gpu["index"] if gpu["count"] > 1 else a.gpu
     meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
     if hip and WIN:                                    # the ready-made engine's rocm/bin, first on the engine's PATH
         lib_dirs = [str(d) for d in hip_lib_dirs(eng)]
@@ -7219,8 +7468,8 @@ def own_path_vision(a, fam: dict, gpu: dict, hip: bool) -> str:
         if asked == "gpu":
             say("  The AMD backend has no GPU image encoder yet: the encoder runs on the CPU.")
         if WIN:
-            warn("images on the CPU with an AMD card are Linux-only for now (the ready-made Windows AMD engine has no "
-                 "image encoder): images off")
+            warn("images on the CPU with an AMD card are Linux-only for now (the Windows AMD engine has no image "
+                 "encoder): images off")
             return "none"
         return "cpu"
     if asked == "yes":
@@ -7476,6 +7725,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         else:
             cfg["parallel"] = 1
             ok("parallel requests: one at a time (--parallel 1)")
+    warm_start_into(cfg, a)
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     ok(f"start script: {script.name}")
@@ -7655,9 +7905,11 @@ def main() -> int:
     ap.add_argument("--rope-scale", type=float,
                     help="the extension factor (default: the final context over the trained 262144, at least 1 - "
                          "1.5 for 384K, 2 for 512K, 1 inside the trained range)")
-    ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4"],
+    ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4", "fp16", "q8_0", "int8k"],
                     help="KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less "
-                         "precise) or k8v4 (hybrid: INT8 K + 4-bit V, 816 B/cell)")
+                         "precise) or k8v4 (hybrid: INT8 K + 4-bit V, 816 B/cell). For a model of strata-poly "
+                         "(docs/Q8_KV.md): q8_0 (half the KV cache's VRAM: Qwen3.6, Ornith, Tiel Coder, MiniCPM-V, "
+                         "Kolibri, Flint, LFM2.5), int8 or int8k (Gemma 4), fp16 (the default)")
     ap.add_argument("--vision", choices=["yes", "no", "none", "gpu", "cpu"],
                     help="let the model read images (yes = the encoder on the GPU)")
     ap.add_argument("--vision-tokens", type=int, metavar="N",
@@ -7711,6 +7963,10 @@ def main() -> int:
     ap.add_argument("--rollback-engine", action="store_true",
                     help="put back the engine an update replaced (kept in engine/.previous), and keep the current one there")
     ap.add_argument("--build", action="store_true", help="compile the engine instead of using the ready-made one")
+    ap.add_argument("--max-compatibility", action="store_true",
+                    help="with --build on Windows: compile the engine for other PCs too (STRATA_PORTABLE: AVX2 "
+                         "baseline, static MSVC runtime - the release build); the default build uses this PC's own "
+                         "CPU instructions")
     ap.add_argument("--source", choices=SOURCES, default=None,
                     help="where the model files come from: auto (default: Hugging Face), huggingface or modelscope "
                          "(mainland China: the same files, checked against ModelScope's published SHA-256; "
@@ -7749,6 +8005,12 @@ def main() -> int:
     ap.add_argument("--parallel", type=int, metavar="N",
                     help="up to N requests decode together (batch slots, opt-in; default: one at a time, the others "
                          "wait). Each slot takes VRAM from the expert cache; setup says what it recommends")
+    ap.add_argument("--warm-start", nargs="?", const=True, metavar="FILE",
+                    help="an agent's system prompt with its tools is ready when the server starts (\"warm_start\" in "
+                         "the run config, opt-in): the server keeps the one the last agent sent, and strata-poly keeps "
+                         "it in memory beside the conversations. FILE: a chat request (JSON with messages and tools, "
+                         "as /v1/chat/completions takes them) whose system prompt it is, so the first start has it too; "
+                         "it may be written later (by the agent): until then the server starts without it")
     ap.add_argument("--replicas", type=int, metavar="N",
                     help="several GPUs: run N independent engines, each on its own equal group of the chosen cards (2 "
                          "replicas on 4 cards = two 2-card engines), requests spread over them (opt-in; more total "
@@ -8052,7 +8314,7 @@ def main() -> int:
              "CPU's share of the experts runs on ggml-cpu's kernels, a few times slower than on an AVX2 CPU. "
              "See \"Older CPUs\" in docs/INSTALL.md")
         if hip and WIN:
-            fail("the older-CPU engine is compiled from source, and setup compiles the AMD engine on Linux only",
+            fail("the older-CPU engine is not compiled on Windows for an AMD card",
                  "use Linux for an AMD card on this CPU, or an NVIDIA card")
         a.build = True
     if a.check:
@@ -8098,18 +8360,20 @@ def main() -> int:
     # ---- 2. the questions
     step(2, "your choices")
     fams = menu_families(hip)
+    coloured = colours()
+    cyan, reset = ("\033[36m", "\033[0m") if coloured else ("", "")
     if a.family:
         family = a.family
     else:
         rec_fam = STRIX_HALO_FAMILY if strix_halo_recommends(gpu, ram) and STRIX_HALO_FAMILY in fams else fams[0]
         for i, f in enumerate(fams, 1):
             d = FAMILIES[f]
-            say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
+            say(f"  {i}) {cyan}{d['title']:20s}{reset} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else "")
                 + family_menu_note(f, hip, gpu, avx2, avx512)
                 + (f"   (recommended for Strix Halo: {STRIX_HALO_MODEL})" if f == rec_fam and rec_fam != fams[0] else ""))
         for j, f in enumerate(OWN_PATH_FAMILIES, len(fams) + 1):   # families with an engine path of their own
             d = OWN_PATH_FAMILIES[f]
-            say(f"  {j}) {d['title']:20s} {d['by']} - {d['about']}   [new]")
+            say(f"  {j}) {cyan}{d['title']:20s}{reset} {d['by']} - {d['about']}   [new]")
         allf = fams + list(OWN_PATH_FAMILIES)
         family = allf[int(ask("Which model?", [str(i) for i in range(1, len(allf) + 1)],
                               str(allf.index(rec_fam) + 1), a.yes)) - 1]
@@ -8133,6 +8397,8 @@ def main() -> int:
         say(f"  Its license: {fam['license']}")
     if fam.get("engine") == "poly":                     # another engine: its own questions and steps
         return poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, adopted)
+    if a.kv and a.kv not in STRATA_KV:
+        fail(f"{fam['title']} has no --kv {a.kv}", "its KV cache is int8 (the default), q4_0 or k8v4")
     say()
     names = [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))]
     names.sort(key=lambda m: bool(MODELS[m].get("experimental")))   # an experimental size last, never the default
@@ -8156,7 +8422,10 @@ def main() -> int:
         if low_ram_needed(m, ram) and low_ram_fits(m, ram, low_ram_vram(gpu)) and a.low_ram != "off":
             fit = (f"   <- fits in the low-RAM mode (the GPU holds ~{100 * low_ram_gpu_share(m, low_ram_vram(gpu)):.0f}%, "
                    + ("the rest in RAM)" if low_ram_resident(m, ram, low_ram_vram(gpu)) else "the rest from the SSD)"))
-        say(f"  {i}) {m:8s}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
+        label = f"{m:8s}"
+        if coloured:
+            label = f"\033[35m{label}\033[0m"
+        say(f"  {i}) {label}{size_tag(family, m, installed)} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index(installed or recommended_size(family, names, ram)) + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget, q4_split = None, False
@@ -8427,7 +8696,9 @@ def main() -> int:
             tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit()) < MODELS[model]["engine"]:
         # a ready-made engine from before NVFP4 cannot read these experts: one compiled from this source can
         warn(f"the ready-made engine {meta.get('version')} has no NVFP4 experts yet: compiling the engine from this source")
-        eng = build_engine(gpu, vision, a.yes, llama, toolkit=cuda_tk)
+        eng = build_engine(gpu, vision, a.yes, llama, toolkit=cuda_tk,
+                           portable=bool(WIN and (getattr(a, "max_compatibility", False) or
+                                                  (not a.build and meta.get("portable")))))
         meta = json.loads((eng / "BUILD.json").read_text(encoding="utf-8"))
         lib_dirs = meta.get("lib_dirs") or meta.get("cuda_dirs") or cuda_lib_dirs(cuda_tk)
     engine_ver = tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:4] if x.isdigit())
@@ -8822,6 +9093,7 @@ def main() -> int:
             say("  " + line)
     for line in bench_tips(cfg["args"], cfg.get("env"), ram, MODELS[model]["ram_gb"], gpu.get("vram_gb", 0.0), vision, WIN):
         say("  " + line)
+    warm_start_into(cfg, a)
     write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it

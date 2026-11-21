@@ -1,0 +1,53 @@
+{
+ "gguf": "<models>/models/ornith-APEX-I-COMPACT/Ornith-1.5-35B-A3B-APEX-MTP-I-Compact.gguf",
+ "llama_server": "<llama.cpp>/build/bin/llama-server",
+ "strata_cfg": "<PolyStrata>/strata-ornith-apex-i-compact.json",
+ "serve": "<PolyStrata>/serve",
+ "cwd": "<PolyStrata>",
+ "configs": [
+  {
+   "name": "polystrata",
+   "kind": "strata",
+   "args": [],
+   "override": {
+    "--max-context": "36864"
+   }
+  },
+  {
+   "name": "llama-mtp",
+   "kind": "llama",
+   "args": [
+    "--fit",
+    "on",
+    "-c",
+    "36864",
+    "-fa",
+    "on",
+    "-ctk",
+    "q8_0",
+    "-ctv",
+    "q8_0",
+    "--spec-type",
+    "draft-mtp",
+    "--spec-draft-n-max",
+    "2"
+   ]
+  },
+  {
+   "name": "llama",
+   "kind": "llama",
+   "args": [
+    "--fit",
+    "on",
+    "-c",
+    "36864",
+    "-fa",
+    "on",
+    "-ctk",
+    "q8_0",
+    "-ctv",
+    "q8_0"
+   ]
+  }
+ ]
+}

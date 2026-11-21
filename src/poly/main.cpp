@@ -8,6 +8,7 @@
 #include "conversations.hpp"
 #include "engine.hpp"
 #include "guesses.hpp"
+#include "strata/core/conversation_file.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -21,6 +22,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -76,6 +79,14 @@ constexpr int kCopyMatch = 8;
 // the time the piece took.  A piece is a call (max_rows()) while slots write, so that they are not held up long,
 // and this many calls while none does, as Strata's engine reads its chunks.
 constexpr int kPiece = 8;
+
+// A session file (SAVE, RESTORE) starts with this, moves its rows this many bytes at a time, each followed by a
+// SESSION line, and a SAVE leaves this much of its disk free, the default of the other engine's.
+constexpr char kSessionMagic[8] = {'P', 'O', 'L', 'Y', 'S', 'E', 'S', '1'};
+constexpr size_t kSessionPiece = 16u << 20;
+constexpr uint64_t kSessionFreeMib = 4096;
+constexpr uint64_t kSessionFrame = sizeof kSessionMagic + 8 + 8;   // around the conversation's bytes: the magic,
+                                                                   // what the file is bound to, the hash
 
 struct Sampling {
     float temperature = 0.f;   // 0: the most likely token
@@ -346,6 +357,7 @@ struct Session {
     strata::spec::DraftPolicy policy;
     Guesses guesses;                      // whether the block is asked in a round, and for how many (guesses.hpp)
     int piece_calls = kPiece;             // generate()'s pieces when it is given `between`
+    std::string pinned;                   // --pinned-session: the file serve() pins before its first request
 
     Session(Engine& e, std::vector<int32_t> eos_ids, const CacheFlags& f, int lookup)
         : engine(e), eos(std::move(eos_ids)), flags(f), kept(e, with_floor(f)),
@@ -399,10 +411,11 @@ struct Session {
         if (s.seed != 0) rng.seed(s.seed);
 
         // The last token goes in alone, for the logits that come with it.  The tokens before it go in as many at
-        // a time as the engine takes.  A prompt without pictures goes in several calls' worth at once, which the
-        // engine reads faster than the calls (read()), and the checkpoints due inside are the engine's to write.
-        // One with pictures goes in a call at a time up to the next checkpoint, a picture whole.
-        const bool text = pictures.at.empty();
+        // a time as the engine takes.  A stretch of prompt without pictures goes in several calls' worth at once,
+        // which the engine reads faster than the calls (read()), and the checkpoints due inside are the engine's
+        // to write.  A stretch with a picture in it goes in eval() calls, a picture whole, up to the checkpoint;
+        // the text before and after that picture is read like a prompt without pictures.
+        const bool pictures_any = !pictures.at.empty();
         std::vector<std::pair<int64_t, uint8_t*>> due;
         std::vector<Engine::Mark> marks;
         for (int64_t i = r.resume; i < n;) {
@@ -412,7 +425,19 @@ struct Session {
             }
             const bool last = i == n - 1;
             const int64_t most = between ? (int64_t) piece_calls * engine.max_rows() : INT64_MAX;
-            const int64_t room = std::min<int64_t>({n - 1 - i, text ? engine.max_read() : engine.max_rows(), most});
+            // How far the text from i runs: to the next picture's first row, or to the last token, which goes in
+            // alone.  read() takes no row of a picture, so only a run of text can go through it.  A run shorter
+            // than a call keeps to eval(): its pieces are the calls it would take anyway.
+            int64_t picture_at = n;
+            bool in_picture = false;
+            for (const auto& im : pictures.at) {
+                if (i >= im.at && i < im.at + im.n) in_picture = true;
+                else if (im.at > i && im.at < picture_at) picture_at = im.at;
+            }
+            const int64_t text_run = in_picture ? 0 : std::min<int64_t>(picture_at, n - 1) - i;
+            const bool text = !pictures_any || text_run >= engine.max_rows();
+            const int64_t room = std::min<int64_t>({text ? text_run : n - 1 - i,
+                                                    text ? engine.max_read() : engine.max_rows(), most});
             const int64_t m = last ? 1 : text ? room : engine.whole(i, kept.until_checkpoint(i, room));
             kept.before(i, last);
             if (text && !last) {
@@ -599,16 +624,243 @@ struct Slot {
     Clock::time_point t0;
 };
 
+// What a session file is bound to: this engine version, the model's files (each one's size, first and last MiB,
+// read from where the engine has them mapped) and what decides the bytes of a row and of a state.  A change in
+// the middle of a model file that keeps its size is not seen.
+uint64_t session_binds(const Engine& engine) {
+    strata::core::SessionIdentityBuilder b(0x504f4c5953455353ull);
+    b.str("engine", STRATA_VERSION);
+    for (const auto& [data, size] : engine.model_views()) {
+        const size_t edge = std::min<size_t>(size, 1u << 20);
+        b.u64("size", size);
+        b.bytes("head", data, edge);
+        b.bytes("tail", data + (size - edge), edge);
+    }
+    b.i64("kv", engine.kv_format());
+    b.u64("row", engine.row_bytes());
+    b.u64("state", engine.state_bytes());
+    return b.digest();
+}
+
+// A session file's name as the server sends it and a command line gives it: UTF-8.
+std::filesystem::path session_path(const std::string& name) {
+    std::u8string utf8(name.size(), u8'\0');
+    std::memcpy(utf8.data(), name.data(), name.size());
+    return std::filesystem::path(utf8);
+}
+
+// Whether a file of `total` bytes starts as this engine's session files do: the magic and the binding, read with
+// get().  Returns what is wrong with it, or nothing.
+template<class Get>
+std::string session_starts(uint64_t total, uint64_t binds, Get&& get) {
+    char magic[sizeof kSessionMagic];
+    uint64_t bound = 0;
+    if (total < kSessionFrame || !get(magic, sizeof magic) || std::memcmp(magic, kSessionMagic, sizeof magic) != 0)
+        return "not a strata-poly session file";
+    if (!get(&bound, 8) || bound != binds) return "the file was saved with another model, engine version or --kv";
+    return {};
+}
+
+// --pinned-session FILE before the first request, and PIN <path> between requests: the file's conversation becomes
+// the pinned one (Conversations::pin()), a system prompt that was read once and saved, in place of one pinned
+// before.  Returns what is wrong with the file, or nothing; then nothing is pinned.  `io`: it could not be read.
+std::string pin_session(Session& ss, const std::string& name, bool& io) {
+    namespace fs = std::filesystem;
+    using Restored = Conversations<Engine>::Restored;
+    const Clock::time_point t0 = Clock::now();
+    io = false;
+    const auto no = [&](const std::string& why) {
+        ss.kept.unpin();
+        return why;
+    };
+    std::error_code ec;
+    const fs::path path = session_path(name);
+    const uint64_t total = fs::file_size(path, ec);
+    io = true;
+    if (ec) return no("the file cannot be read: " + ec.message());
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) return no("the file cannot be opened");
+    io = false;
+    strata::core::SessionHasher hash;
+    const auto get = [&](void* p, size_t n) {
+        in.read((char*) p, (std::streamsize) n);
+        if ((size_t) in.gcount() != n) return false;
+        hash.update(p, n);
+        return true;
+    };
+    if (const std::string why = session_starts(total, session_binds(ss.engine), get); !why.empty()) return no(why);
+    const Restored r = ss.kept.pin(total - kSessionFrame, ss.engine.max_context(), kSessionPiece, get);
+    if (r == Restored::other) return no("the file is not a whole session of this model within --max-context");
+    if (r == Restored::memory) return no("no memory for it");
+    uint64_t want = 0;
+    if (r == Restored::ok) in.read((char*) &want, 8);
+    if (r != Restored::ok || in.gcount() != 8 || want != hash.digest()) return no("the file is damaged");
+    std::fprintf(stderr, "strata-poly: pinned session: %lld tokens, %zu MiB of rows and states beside the conversation "
+                         "cache, read in %.0f ms; a prompt that starts with them goes on from there\n",
+                 (long long) ss.kept.pinned_tokens(), ss.kept.pinned_bytes() >> 20, ms_since(t0));
+    return {};
+}
+
+// SAVE <path> | RESTORE <path> between requests, answered as the Strata project's engine answers them
+// (docs/DETAILS.md, Session files): SAVED / RESTORED <tokens> <bytes> <ms>, SESSION <done> <total> on the way, and
+// SERR <invalid|storage|memory|io> 0 <reason> for a file that is refused or fails, after which the engine goes on.
+// The file: kSessionMagic, what it is bound to (session_binds()), Conversations::save()'s bytes, and a hash of all
+// that.  It is written beside its name and renamed.  It is not flushed to the disk: a file that a power loss cut
+// short fails its hash and is refused.  False: the engine cannot go on, and FATAL was answered.
+bool session_file(Session& ss, bool save, const std::string& name, bool batch) {
+    namespace fs = std::filesystem;
+    using strata::core::SessionError;
+    using Restored = Conversations<Engine>::Restored;
+    Engine& engine = ss.engine;
+    const Clock::time_point t0 = Clock::now();
+    const auto refuse = [&](SessionError kind, std::string why) {
+        for (char& c : why)
+            if (c == '\n' || c == '\r') c = ' ';
+        std::fprintf(stderr, "strata-poly: session %s %s: %s\n", save ? "save" : "restore", name.c_str(), why.c_str());
+        std::printf("SERR %s 0 %s\n", strata::core::session_error_name(kind), why.c_str());
+        std::fflush(stdout);
+        return true;
+    };
+    if (name.empty()) return refuse(SessionError::invalid, "missing path");
+    if (batch) return refuse(SessionError::invalid, "session files do not support --batch (parallel requests)");
+    const uint64_t binds = session_binds(engine);
+    const fs::path path = session_path(name);
+    const uint64_t frame = kSessionFrame;
+    std::error_code ec;
+    strata::core::SessionHasher hash;
+    uint64_t done = 0, said = 0, total = 0;
+    const auto moved = [&] {
+        std::printf("SESSION %llu %llu\n", (unsigned long long) (said = done), (unsigned long long) total);
+        std::fflush(stdout);
+    };
+
+    if (save) {
+        const uint64_t body = ss.kept.save_bytes();
+        if (body == 0 || engine.pos() != (int64_t) ss.kept.seq().size())
+            return refuse(SessionError::invalid, "no complete conversation to save");
+        total = frame + body;
+        const fs::path dir = path.has_parent_path() ? path.parent_path() : fs::path(".");
+        const fs::space_info room = fs::space(dir, ec);
+        if (ec) return refuse(SessionError::io, "the folder of the file: " + ec.message());
+        if (room.available < total + (kSessionFreeMib << 20))
+            return refuse(SessionError::storage,
+                          "the file takes " + std::to_string(total >> 20) + " MiB and has to leave " +
+                              std::to_string(kSessionFreeMib) + " MiB free; the disk has " +
+                              std::to_string(room.available >> 20) + " MiB");
+        fs::path part = path;
+        part += ".part";
+        std::ofstream out(part, std::ios::binary | std::ios::trunc);
+        // a conversation is its owner's to read, as the other engine's session files are (mode 0600)
+        fs::permissions(part, fs::perms::owner_read | fs::perms::owner_write, ec);
+        const auto put = [&](const void* p, size_t n) {
+            out.write((const char*) p, (std::streamsize) n);
+            hash.update(p, n);
+            done += n;
+            if (done - said >= kSessionPiece) moved();
+            return out.good();
+        };
+        std::string why;
+        bool ok = out.is_open() && put(kSessionMagic, sizeof kSessionMagic) && put(&binds, 8), no_memory = false;
+        try {
+            if (ok && !ss.kept.save(kSessionPiece, put)) ok = false, no_memory = out.good();
+        } catch (const std::exception& e) {
+            ok = false;
+            why = e.what();
+        }
+        const uint64_t h = hash.digest();
+        if (ok) out.write((const char*) &h, 8);
+        out.close();
+        ok = ok && !out.fail();
+        if (ok) {
+            fs::rename(part, path, ec);
+            if (ec) ok = false, why = ec.message();
+        }
+        if (!ok) {
+            fs::remove(part, ec);
+            if (no_memory) return refuse(SessionError::memory, "no memory to move the conversation's rows");
+            const fs::space_info left = fs::space(dir, ec);
+            return refuse(!ec && left.available < total ? SessionError::storage : SessionError::io,
+                          why.empty() ? "the file cannot be written" : why);
+        }
+        done = total;
+        moved();
+        std::fprintf(stderr, "strata-poly: session saved: %zu tokens, %llu MiB in %.0f ms\n", ss.kept.seq().size(),
+                     (unsigned long long) (total >> 20), ms_since(t0));
+        std::printf("SAVED %zu %llu %.1f\n", ss.kept.seq().size(), (unsigned long long) total, ms_since(t0));
+        std::fflush(stdout);
+        return true;
+    }
+
+    total = fs::file_size(path, ec);
+    if (ec) return refuse(SessionError::io, "the file cannot be read: " + ec.message());
+    std::ifstream in(path, std::ios::binary);
+    if (!in.is_open()) return refuse(SessionError::io, "the file cannot be opened");
+    const auto get = [&](void* p, size_t n) {
+        in.read((char*) p, (std::streamsize) n);
+        if ((size_t) in.gcount() != n) return false;
+        hash.update(p, n);
+        done += n;
+        if (done - said >= kSessionPiece) moved();
+        return true;
+    };
+    uint64_t want = 0;
+    if (const std::string why = session_starts(total, binds, get); !why.empty())
+        return refuse(SessionError::invalid, why);
+    Restored r = Restored::other;
+    try {
+        r = ss.kept.restore(total - frame, engine.max_context(), kSessionPiece, get);
+        if (r == Restored::ok) {
+            in.read((char*) &want, 8);
+            if (in.gcount() != 8 || want != hash.digest()) {
+                ss.kept.drop();
+                engine.reset();
+                r = Restored::cut;
+            }
+        }
+    } catch (const std::exception& e) {
+        // the engine's state is unknown now, as after a request that failed
+        ss.kept.drop();
+        try {
+            engine.reset();
+        } catch (const std::exception& again) {
+            std::printf("FATAL %s\n", again.what());
+            std::fflush(stdout);
+            return false;
+        }
+        return refuse(SessionError::io, std::string(e.what()) + "; the engine holds no conversation now");
+    }
+    if (r == Restored::other)
+        return refuse(SessionError::invalid, "the file is not a whole session of this model within --max-context");
+    if (r == Restored::memory) return refuse(SessionError::memory, "no memory for the session's checkpoints");
+    if (r == Restored::cut)
+        return refuse(SessionError::invalid, "the file is damaged; the engine holds no conversation now");
+    done = total;
+    moved();
+    std::fprintf(stderr, "strata-poly: session restored: %zu tokens, %llu MiB in %.0f ms\n", ss.kept.seq().size(),
+                 (unsigned long long) (total >> 20), ms_since(t0));
+    std::printf("RESTORED %zu %llu %.1f\n", ss.kept.seq().size(), (unsigned long long) total, ms_since(t0));
+    std::fflush(stdout);
+    return true;
+}
+
 int serve(Session& ss) {
     Engine& engine = ss.engine;
     std::vector<Slot> slots((size_t) engine.sequences() - 1);
+    if (!ss.pinned.empty()) {
+        // A file that cannot be used is named and the engine starts without it: the first request that brings the
+        // prompt reads it then.
+        bool io = false;
+        if (const std::string why = pin_session(ss, ss.pinned, io); !why.empty())
+            std::fprintf(stderr, "strata-poly: --pinned-session %s: %s; the engine starts without it\n",
+                         ss.pinned.c_str(), why.c_str());
+    }
     engine.trim();
     std::printf("INFO context=%d expert_slots=%d expert_cache_mib=%lld pool_workers=%d conversation_cache_mib=%lld "
                 "conversation_cache_slots=%d conversation_cache_min_free_mib=%lld vram_free_mib=%lld vram_elastic=1 "
-                "batch_slots=%d engine=" STRATA_VERSION "\n",
+                "batch_slots=%d sessions=1 pinned_tokens=%lld engine=" STRATA_VERSION "\n",
                 engine.max_context(), engine.cached_experts(), (long long) (engine.cached_gib() * 1024.0),
                 engine.threads(), (long long) ss.flags.o.park_mib, ss.flags.o.park_slots, ss.flags.min_free_mib,
-                (long long) engine.vram_free_mib(), (int) slots.size());
+                (long long) engine.vram_free_mib(), (int) slots.size(), (long long) ss.kept.pinned_tokens());
     std::printf("READY %d stop\n", engine.max_context());
     std::fflush(stdout);
 
@@ -622,40 +874,74 @@ int serve(Session& ss) {
     // A token for every slot that writes: BT <slot> <token> each, and BDONE <slot> <produced> <finish> <ms> for a
     // slot that ends with it.  False when the engine failed, which leaves it in no known state.
     Sampler slot_sampler;
-    std::vector<int> seqs;
-    std::vector<int32_t> feed;
+    std::vector<int> seqs, kept;
+    std::vector<int32_t> feed, guess;
     std::vector<size_t> which;
     const auto step = [&] {
         seqs.clear();
         feed.clear();
         which.clear();
+        guess.clear();
         for (size_t b = 0; b < slots.size(); ++b)
             if (slots[b].active) {
                 seqs.push_back((int) b + 1);
                 feed.push_back(slots[b].next);
                 which.push_back(b);
             }
+        // --batch-mtp: each slot's draft block guesses the token after its next one, and the step checks it
+        const bool guessing = engine.steps_guesses();
         try {
-            engine.step(seqs.data(), feed.data(), (int) seqs.size());
+            if (guessing) {
+                guess.resize(seqs.size());
+                engine.draft_many(seqs.data(), feed.data(), (int) seqs.size(), guess.data());
+                engine.step(seqs.data(), feed.data(), (int) seqs.size(), guess.data());
+            } else {
+                engine.step(seqs.data(), feed.data(), (int) seqs.size());
+            }
         } catch (const std::exception& e) {
             std::fprintf(stderr, "strata-poly: batch: %s\n", e.what());
             std::printf("ERR %s\n", e.what());
             std::fflush(stdout);
             return false;
         }
-        for (size_t i = 0; i < which.size(); ++i) {
+        kept.assign(which.size(), 1);
+        for (size_t i = 0, row = 0; i < which.size(); ++i) {
             Slot& sl = slots[which[i]];
             sl.held.push_back(feed[i]);
-            const int32_t t = (int32_t) slot_sampler.pick(engine.logits_of((int) i), engine.n_vocab(), sl.s, sl.held, sl.rng);
-            ++sl.produced;
-            std::printf("BT %zu %d\n", which[i], (int) t);
-            const char* fin = ss.is_eos(t) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
-                            : (long long) sl.held.size() + 2 > engine.max_context() ? "length" : nullptr;
-            if (fin) {
-                std::printf("BDONE %zu %lld %s %.1f\n", which[i], sl.produced, fin, ms_since(sl.t0));
-                sl.active = false;
+            // a token for the slot: false when its answer ends with it
+            const auto emit = [&](int32_t t) {
+                ++sl.produced;
+                std::printf("BT %zu %d\n", which[i], (int) t);
+                const char* fin = ss.is_eos(t) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                                : (long long) sl.held.size() + 2 > engine.max_context() ? "length" : nullptr;
+                if (fin) {
+                    std::printf("BDONE %zu %lld %s %.1f\n", which[i], sl.produced, fin, ms_since(sl.t0));
+                    sl.active = false;
+                }
+                return fin == nullptr;
+            };
+            const bool guessed = guessing && guess[i] >= 0;
+            int32_t t = (int32_t) slot_sampler.pick(engine.logits_of((int) row), engine.n_vocab(), sl.s, sl.held, sl.rng);
+            // a guess that is what was picked has been through the model already, so the token after it is picked
+            // too; the token an answer ends with is shown and never fed, as without guesses
+            if (emit(t) && guessed && t == guess[i]) {
+                sl.held.push_back(t);
+                kept[i] = 2;
+                t = (int32_t) slot_sampler.pick(engine.logits_of((int) row + 1), engine.n_vocab(), sl.s, sl.held, sl.rng);
+                emit(t);
             }
             sl.next = t;
+            row += guessed ? 2 : 1;
+        }
+        if (guessing) {
+            try {
+                engine.keep_step(kept.data());
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "strata-poly: batch: %s\n", e.what());
+                std::printf("ERR %s\n", e.what());
+                std::fflush(stdout);
+                return false;
+            }
         }
         std::fflush(stdout);
         return true;
@@ -796,10 +1082,27 @@ int serve(Session& ss) {
             std::fflush(stdout);
             continue;
         }
-        // Disk sessions are the Strata engine's.  Refused in the session protocol's own words: a bare ERR is a
-        // reply out of step there, and the server ended this engine for it (issue 114).
+        // A refusal is in the session protocol's own words: a bare ERR is a reply out of step there, and the server
+        // ended this engine for it (issue 114).
         if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
-            std::printf("SERR invalid 0 strata-poly keeps no disk sessions\n");
+            const bool save = line[0] == 'S';
+            if (!session_file(ss, save, line.substr(save ? 5 : 8), !slots.empty())) return 1;
+            continue;
+        }
+        // PIN <path>: the start's --pinned-session, between requests (a server that has just saved the prompt).
+        // PINNED <tokens> <bytes> <ms>, or SERR as a session file's
+        if (line.rfind("PIN ", 0) == 0) {
+            const Clock::time_point t0 = Clock::now();
+            bool io = false;
+            const std::string why = slots.empty() ? pin_session(ss, line.substr(4), io)
+                                                  : "session files do not support --batch (parallel requests)";
+            if (why.empty()) {
+                std::printf("PINNED %lld %zu %.1f\n", (long long) ss.kept.pinned_tokens(), ss.kept.pinned_bytes(),
+                            ms_since(t0));
+            } else {
+                std::fprintf(stderr, "strata-poly: session pin %s: %s\n", line.c_str() + 4, why.c_str());
+                std::printf("SERR %s 0 %s\n", io ? "io" : "invalid", why.c_str());
+            }
             std::fflush(stdout);
             continue;
         }
@@ -1024,13 +1327,56 @@ int check_batch(Engine& engine, const std::vector<int32_t>& ids, int k, long lon
     engine.bind(0);
     const double read_ms = ms_since(t0);
     const Clock::time_point t1 = Clock::now();
-    for (long long n = 0; n < max_new; ++n) {
-        for (int j = 0; j < k; ++j) got[(size_t) j].push_back(next[(size_t) j]);
-        engine.step(seqs.data(), next.data(), k);
+    // --batch-mtp: each sequence guesses the token after its next one, a step checks the guesses, and a sequence
+    // that has its max_new tokens leaves the steps
+    const bool guessing = engine.steps_guesses();
+    long long steps = 0, offered = 0, right = 0;
+    std::vector<int> live, kept;
+    std::vector<int32_t> feed, guess;
+    while (true) {
+        live.clear();
+        feed.clear();
+        guess.clear();
         for (int j = 0; j < k; ++j)
-            next[(size_t) j] = (int32_t) strata::poly::most_likely(engine.logits_of(j), engine.n_vocab());
+            if ((long long) got[(size_t) j].size() < max_new) {
+                got[(size_t) j].push_back(next[(size_t) j]);
+                live.push_back(j + 1);
+                feed.push_back(next[(size_t) j]);
+            }
+        if (live.empty()) break;
+        if (guessing) {
+            guess.resize(live.size());
+            engine.draft_many(live.data(), feed.data(), (int) live.size(), guess.data());
+            for (size_t i = 0; i < live.size(); ++i) {
+                if ((long long) got[(size_t) live[i] - 1].size() >= max_new) guess[i] = -1;   // no token wanted after
+                offered += guess[i] >= 0;
+            }
+            engine.step(live.data(), feed.data(), (int) live.size(), guess.data());
+        } else {
+            engine.step(live.data(), feed.data(), (int) live.size());
+        }
+        ++steps;
+        kept.assign(live.size(), 1);
+        for (size_t i = 0, row = 0; i < live.size(); ++i) {
+            const size_t j = (size_t) live[i] - 1;
+            int32_t t = (int32_t) strata::poly::most_likely(engine.logits_of((int) row), engine.n_vocab());
+            const bool guessed = guessing && guess[i] >= 0;
+            if (guessed && t == guess[i]) {
+                got[j].push_back(t);
+                kept[i] = 2;
+                ++right;
+                t = (int32_t) strata::poly::most_likely(engine.logits_of((int) row + 1), engine.n_vocab());
+            }
+            next[j] = t;
+            row += guessed ? 2 : 1;
+        }
+        if (guessing) engine.keep_step(kept.data());
     }
+    for (int j = 0; j < k; ++j) got[(size_t) j].resize((size_t) max_new);
     const double step_ms = ms_since(t1);
+    if (guessing)
+        std::fprintf(stderr, "check-batch: --batch-mtp: %lld steps, %lld of %lld guesses right\n", steps, right,
+                     offered);
     int rc = 0;
     for (int j = 0; j < k; ++j) {
         size_t same = 0;
@@ -1046,14 +1392,23 @@ int check_batch(Engine& engine, const std::vector<int32_t>& ids, int k, long lon
 }
 
 void usage() {
+#if defined(STRATA_GPU_METAL)
+    std::fprintf(stderr, "Metal defaults: optimized expert overlap and compact MMQ (disable: --no-metal-optimize), "
+                         "--metal-memory legacy|balanced (default balanced)\n");
+#endif
     std::fprintf(stderr,
                  "usage: strata-poly --model FILE.gguf (--serve | --tokens ID,ID,... [--max-new N])\n"
                  "  --max-context N        tokens the attention caches hold (default 8192)\n"
-                 "  --threads N            CPU threads for the experts that are not in VRAM (default: all usable)\n"
+                 "  --threads N            CPU threads for the experts that are not in VRAM (default: 70%% of the usable\n"
+                 "                         CPUs; all of them in a container with a CPU quota)\n"
                  "  --vram-reserve-mib N   VRAM left free beside the expert cache, 256 at least (default: a\n"
                  "                         thirty-second of the card, 256 to 768, or a sixteenth, 512 to 1024,\n"
                  "                         when the PC's free RAM is within 4 GiB of the model's files, and then\n"
                  "                         kept whole; else half of it after the first request)\n"
+                 "  --vram-pool            claim the card's VRAM once at load (what is free but for the reserve above,\n"
+                 "                         which is then the margin left outside), keep it for the whole run and move\n"
+                 "                         it between the expert cache and the attention caches as the context grows\n"
+                 "                         and shrinks, in 2 MiB pieces; nothing is given back to the card (needs VMM)\n"
                  "  --layer-split S        the model's layers across the CUDA devices this process sees, in their\n"
                  "                         order: S is auto (by each card's free VRAM) or the first layer of each\n"
                  "                         later card, as 20 or 20,30 (default: the first card alone)\n"
@@ -1079,16 +1434,22 @@ void usage() {
                  "                         the conversation grows, the expert cache having the rest until then)\n"
                  "  --kv fmt               the K and V attention caches' format, opt-in: fp16 (default,\n"
                  "                         unchanged); q8_0 (ggml Q8_0 blocks: half the KV VRAM, slightly\n"
-                 "                         different answers; qwen35moe's and kolibri1's); int8 / int8k (Gemma 4's:\n"
+                 "                         different answers; qwen35moe's, kolibri1's and Flint's); int8 / int8k (Gemma 4's:\n"
                  "                         the same Q8_0 rule with the codes and their deltas in two arrays, so a\n"
                  "                         reader takes four codes to a load; int8k keeps the keys' side\n"
                  "                         quantized and the values' in fp16)\n"
+#if defined(STRATA_GPU_METAL)
+                 "                         Metal default: q8_0 for a compatible Qwen35MoE geometry, else fp16\n"
+#endif
                  "  --expert-swaps N       while an answer is written, up to N experts it keeps using are on their way\n"
                  "                         into VRAM, in place of cached ones it uses less (default 64, 0 = the cache\n"
                  "                         stays as it was loaded)\n"
                  "  --ram-experts-mib N    hold N MiB of RAM for the experts outside VRAM, during answers too: the ones\n"
                  "                         used most lately; the rest stay in the file cache for other programs to take,\n"
-                 "                         and are read back when a token needs them (default: all of them)\n"
+                 "                         and are read back when a token needs them (default: all of them when they\n"
+                 "                         fit in the RAM that is free, else what is free less 4 GiB; -1: all of them)\n"
+                 "  --lock-experts         lock the experts outside VRAM in RAM, so the system cannot drop them from the\n"
+                 "                         file cache when other programs want the memory (Linux: up to ulimit -l)\n"
                  "  --prompt-batch N       prompt tokens read at a time (default 1024); about 1.4 MiB of VRAM each\n"
                  "  --stage-mib N          VRAM the experts outside the cache pass through in a prompt batch (default\n"
                  "                         128 on an NVIDIA card where a longer read widens it, else 2048; never more\n"
@@ -1112,9 +1473,15 @@ void usage() {
                  "  --conversation-cache-min-tokens N   a conversation shorter than this is not parked (default 1024)\n"
                  "  --conversation-cache-min-free-mib N park only while this much physical RAM stays free (default\n"
                  "                         2560)\n"
+                 "  --pinned-session FILE  --serve: a session file (SAVE) whose conversation stays for the whole run,\n"
+                 "                         a system prompt read once: a prompt that starts with it goes on from\n"
+                 "                         its end, whatever took the engine since; it is never pushed out\n"
                  "  --batch N              N answers written together, each in a sequence of its own with its own\n"
                  "                         state and attention rows (default 0 = one at a time; at most 8);\n"
                  "                         --slots N is the same\n"
+                 "  --batch-mtp            with --batch and a draft block: each answer written together guesses its\n"
+                 "                         next token and the step checks it, a guess right gives two tokens\n"
+                 "                         (Qwen3.6's family; STRATA_BATCH_MTP=1 does the same)\n"
                  "  --check-batch K        with --tokens and --batch K or more: K prompts answered on their own and\n"
                  "                         then together, compared token by token (takes --kv-whole, so the expert\n"
                  "                         cache stays as it is)\n"
@@ -1163,7 +1530,7 @@ int main(int argc, char** argv) {
     bool want_serve = false;
     long long max_new = 32;
     int top_probs = 0, lookup = 3, image_pad = -1, check = 0;
-    std::string images;
+    std::string images, pinned;
     std::vector<int32_t> ids, eos, follow;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1176,12 +1543,27 @@ int main(int argc, char** argv) {
         };
         if (a == "--model") o.model = val();
         else if (a == "--serve") want_serve = true;
+#if defined(STRATA_GPU_METAL)
+        else if (a == "--metal-optimize") o.metal_optimize = true;
+        else if (a == "--no-metal-optimize") o.metal_optimize = false;
+        else if (a == "--metal-memory") {
+            const std::string policy = val();
+            if (policy != "legacy" && policy != "balanced") {
+                std::fprintf(stderr, "strata-poly: --metal-memory requires legacy or balanced\n");
+                return 2;
+            }
+            o.metal_balanced = policy == "balanced";
+        }
+#endif
         else if (a == "--max-context") o.max_context = std::atoi(val());
         else if (a == "--threads") o.threads = std::atoi(val());
         else if (a == "--vram-reserve-mib") o.vram_reserve_mib = std::atoi(val());
+        else if (a == "--vram-pool") o.vram_pool = true;
         else if (a == "--expert-profile") o.profile = val();
+        else if (a == "--pinned-session") pinned = val();
         else if (a == "--no-gpu-experts") o.gpu_experts = false;
         else if (a == "--any-node") o.stay_near = false;
+        else if (a == "--lock-experts") o.lock_experts = true;
         else if (a == "--no-graphs") o.graphs = false;
         else if (a == "--kv-whole") o.kv_grow = false;
         else if (a == "--kv") {
@@ -1207,6 +1589,7 @@ int main(int argc, char** argv) {
         else if (a == "--cache-bias") o.cache_bias = (float) std::atof(val());
         else if (a == "--layer-split") o.layer_split = val();
         else if (a == "--batch" || a == "--slots") o.batch = std::atoi(val());
+        else if (a == "--batch-mtp") o.batch_mtp = true;
         else if (a == "--check-batch") check = std::atoi(val());
         else if (a == "--draft-vocab") o.draft_vocab = std::atoi(val());
         else if (a == "--prompt-batch") o.prompt_batch = std::atoi(val());
@@ -1254,6 +1637,7 @@ int main(int argc, char** argv) {
                              "with tokens left of --tokens\n");
         return 2;
     }
+    if (const char* v = std::getenv("STRATA_BATCH_MTP"); v && std::string(v) == "1") o.batch_mtp = true;
     // --check-batch: K sequences growing together would take VRAM from the expert cache that the single runs had,
     // and an expert moved to the CPU rounds differently (issue 55).  Their attention rows get VRAM at load instead.
     if (check > 0) o.kv_grow = false;
@@ -1322,6 +1706,7 @@ int main(int argc, char** argv) {
                                      "(--conversation-cache-mib N asks for one anyway)\n");
         }
         Session ss(engine, eos, cache, lookup);
+        ss.pinned = pinned;
         int rc = 0;
         if (want_serve) {
             rc = serve(ss);

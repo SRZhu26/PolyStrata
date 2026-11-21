@@ -162,8 +162,21 @@ class Main(unittest.TestCase):
                 self.assertNotIn("has run on no card", out)   # each has run on one of 8 GB
                 self.assertEqual((self.encoder, cfg.get("vision")), ("none", None))   # --yes: no images
 
+    def test_kv_formats_of_each_architecture(self):
+        # issue 183: Gemma 4's are int8 and int8k, the Qwen3.6 family's is q8_0
+        code, out, cfg = self.main(["--kv", "int8k"], family="gemma4", ram=64.0, vram=16.0)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["args"][cfg["args"].index("--kv") + 1], "int8k")
+        code, out, cfg = self.main(["--kv", "q8_0"], family="qwen36", ram=64.0, vram=24.0)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["args"][cfg["args"].index("--kv") + 1], "q8_0")
+        code, out, cfg = self.main(["--kv", "q8_0"], family="gemma4", ram=64.0, vram=16.0)   # not Gemma 4's
+        self.assertEqual(code, 0, out)
+        self.assertIn("--kv", next(ln for ln in out.splitlines() if "not used with Gemma 4" in ln))
+        self.assertNotIn("--kv", cfg["args"])
+
     def test_a_hybrid_cpu_gets_a_thread_count(self):
-        """The engine's own count is every logical CPU, which is the slowest on a hybrid one."""
+        """A hybrid CPU gets setup's count, the performance cores but one and half of the efficiency cores."""
         code, out, cfg = self.main(family="gemma4", ram=32.0, vram=8.0, cores=(8, 12))
         self.assertEqual(code, 0, out)
         args = cfg["args"]
