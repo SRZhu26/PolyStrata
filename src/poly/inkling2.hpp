@@ -23,7 +23,15 @@ protected:
     void load_geometry() override;
     void load_layer(int il) override;
     void begin_pass() override;
-    size_t recurrent_floats() const override { return 0; }
+    int n_steps() const override { return (int) steps_.size(); }
+    int step_phys(int s) const override { return steps_[(size_t) s].phys; }
+    int next_moe(int il) const override {
+        (void) il;
+        const size_t s = (size_t) cur_step_ + 1;
+        return s < steps_.size() ? steps_[s].phys : n_layer_;
+    }
+    bool halves_ok() const override { return false; }   // until Phase 3
+    size_t recurrent_floats() const override;
     void alloc_caches() override;
     void assign_scratch() override;
     int widest() const override { return n_head_ * head_dim_; }

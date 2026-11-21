@@ -490,6 +490,18 @@ protected:
     virtual bool batch_heads() const { return false; }
     /// The architecture's step() rows leave the recurrent state after a row at Row::snap (step() with guesses).
     virtual bool rows_snaps() const { return false; }
+    /// The model's layer visits, in order: by default each layer in [lo_, hi_) once.
+    virtual int n_steps() const { return hi_ - lo_; }
+    virtual int step_phys(int s) const { return lo_ + s; }
+    /// The next MoE layer to prefetch after layer il (moe()).  Default: the next layer in the file.
+    virtual int next_moe(int il) const {
+        int j = il + 1;
+        while (j < n_layer_ && !layers_[(size_t) j].moe) ++j;
+        return j;
+    }
+    /// Whether a window's tokens may go through the layers in two halves (halves_).
+    virtual bool halves_ok() const { return true; }
+    int cur_step_ = 0;   ///< the visit run() / step() is on; read by layer_head/layer_tail/head_key/next_moe
     /// While step() runs a head in one call: each row's sequence and position, row after row; else null.  snap: for
     /// the first of a sequence's two rows, where every recurrent layer leaves the state after it (at its place in
     /// state_, as a window's snapshots), for keep_step() to go back to; else null.

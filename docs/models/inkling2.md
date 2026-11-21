@@ -35,14 +35,14 @@ for KV + hot experts):
 
 | Context | FP16 KV Total | Q8_0 KV Total | Est. VRAM Left for Experts (Q8_0) |
 | --- | ---: | ---: | ---: |
-| 32K | 1.31 GiB | 0.70 GiB | ~3.7 GiB |
+| **32K (default)** | 1.31 GiB | **0.70 GiB** | **~3.7 GiB** |
 | 64K | 2.31 GiB | 1.23 GiB | ~3.2 GiB |
-| **128K (default)** | 4.31 GiB | **2.29 GiB** | **~2.1 GiB** |
+| 128K | 4.31 GiB | 2.29 GiB | ~2.1 GiB |
 | 192K | 6.31 GiB | 3.35 GiB | ~1.0 GiB |
 | 256K | 8.31 GiB | 4.42 GiB | ~0 GiB |
 
-`setup.py --family inkling2` defaults to **128K** context, **`--kv q8_0`**, and **`UD-Q4_K_M`** (with
-**`UD-Q4_K_XL`** as the second choice).
+`setup.py --family inkling2` defaults to **32K** context (128K available via `--context 131072` once measured),
+**`--kv q8_0`**, and **`UD-Q4_K_M`** (with **`UD-Q4_K_XL`** as the second choice).
 
 ## Bringup on the RTX 5060 Laptop (Windows, 32 GB RAM, 8 GB VRAM)
 
@@ -56,7 +56,7 @@ git checkout add-inkling2-mini
 Install the model files (or pass `--gguf-dir` if you already downloaded them; rename `.gguf_file` to `.gguf`):
 
 ```powershell
-python setup.py --family inkling2 --model UD-Q4_K_M --context 131072 --kv q8_0 --vision no --yes --no-start
+python setup.py --family inkling2 --model UD-Q4_K_XL --context 32768 --kv q8_0 --vision no --yes --no-start
 ```
 
 ### 2. Build `strata-poly` from source (CUDA)
@@ -64,18 +64,18 @@ python setup.py --family inkling2 --model UD-Q4_K_M --context 131072 --kv q8_0 -
 Requires Visual Studio Build Tools (C++), CUDA Toolkit, and CMake:
 
 ```powershell
-python setup.py --family inkling2 --model UD-Q4_K_M --build --yes --no-start
+python setup.py --family inkling2 --model UD-Q4_K_XL --build --yes --no-start
 ```
 
 Verify that `Engine::open()` recognizes `inkling2_loop` and prints the 48-layer geometry and Q8_0 KV row size
 before hitting the `Inkling2::load_layer()` bringup stub.
 
-### 3. Reference run with `llama.cpp` (for greedy parity)
+### 3. Reference run with `llama.cpp` (for baseline & greedy parity)
 
 Until the remaining kernels in `src/poly/inkling2.cpp` are filled in, run Inkling-2-Mini with mainline `llama.cpp`
-pinned to PR `#32704` commit `2a28df0f9bd55c4975b6bffb35229a6020720f13` (keeps per-expert NVFP4 scales bound on
-looped passes 2 and 3). On an 8 GB VRAM card, offload experts with `-ot "exps=CPU"` (or `--n-cpu-moe N`) rather than
-`-ngl 99` alone, which would silently spill into Windows shared GPU memory:
+pinned to PR `#32704` commit `2a28df0f9bd55c4975b6bffb35229a6020720f13` (if that commit does not load the file,
+use Unsloth's prebuilt `b12588-mix-c0c3de8`). Let `llama.cpp` fit the model to 8 GB itself (`--fit-target`, no
+`-ngl`/`-ot`, since `-ot "exps=CPU"` was measured 2–8× slower):
 
 ```powershell
 git clone https://github.com/ggml-org/llama.cpp
@@ -83,19 +83,18 @@ cd llama.cpp
 git fetch origin pull/32704/head:inkling2-loop-fix
 git checkout 2a28df0f9bd55c4975b6bffb35229a6020720f13
 cmake -B build -DGGML_CUDA=ON
-cmake --build build --config Release -j --target llama-cli llama-server llama-eval-callback
+cmake --build build --config Release -j --target llama-cli llama-bench llama-server llama-tokenize
 
-# Greedy parity oracle (--temp 0 --seed 42):
-.\build\bin\Release\llama-cli.exe `
-  -m ..\models\inkling2-ud-q4_k_xl\Inkling-2-Mini-UD-Q4_K_XL.gguf `
-  --jinja -ngl 99 -ot "exps=CPU" -c 32768 -ctk q8_0 -ctv q8_0 `
-  --temp 0 --seed 42 -n 128 -p "Explain quicksort in three sentences."
+# 0. Confirm the pinned build loads the file:
+.\build\bin\Release\llama-cli.exe -m ..\models\inkling2-ud-q4_k_xl\Inkling-2-Mini-UD-Q4_K_XL.gguf -n 1 -p "hi"
 
-# Interactive server baseline (recommended sampling):
-.\build\bin\Release\llama-server.exe `
-  -m ..\models\inkling2-ud-q4_k_xl\Inkling-2-Mini-UD-Q4_K_XL.gguf `
-  --jinja -ngl 99 -ot "exps=CPU" -c 65536 -ctk q8_0 -ctv q8_0 `
-  --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0.0 --port 8001
+# 1. Speed baseline (llama.cpp auto-fits to 8 GB VRAM):
+.\build\bin\Release\llama-bench.exe -m ..\models\inkling2-ud-q4_k_xl\Inkling-2-Mini-UD-Q4_K_XL.gguf `
+  -fa 1 -ctk q8_0 -ctv q8_0 --fit-target 1024 --fit-ctx 32768 -p 2048 -n 128 -r 3
+
+# 2. Greedy parity reference (--temp 0 --seed 42):
+.\build\bin\Release\llama-cli.exe -m ..\models\inkling2-ud-q4_k_xl\Inkling-2-Mini-UD-Q4_K_XL.gguf `
+  --jinja -c 32768 -ctk q8_0 -ctv q8_0 --temp 0 --seed 42 -n 128 -p "Explain quicksort in three sentences."
 ```
 
 ### 4. Remaining `src/poly/inkling2.cpp` bringup checklist

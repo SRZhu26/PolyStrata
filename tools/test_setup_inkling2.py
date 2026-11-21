@@ -13,11 +13,11 @@ import setup
 
 
 class Inkling2SetupTest(unittest.TestCase):
-    def test_family_registered_with_128k_q8_defaults(self):
+    def test_family_registered_with_32k_q8_defaults(self):
         self.assertIn("inkling2", setup.FAMILIES)
         fam = setup.FAMILIES["inkling2"]
         self.assertEqual(fam["engine"], "poly")
-        self.assertEqual(fam["default_context"], 131072)
+        self.assertEqual(fam["default_context"], 32768)
         self.assertEqual(fam["default_kv"], "q8_0")
         self.assertEqual(fam["row_bytes"], 17408)
         self.assertTrue(fam["experimental"])

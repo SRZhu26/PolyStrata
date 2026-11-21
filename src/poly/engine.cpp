@@ -4055,8 +4055,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
         size_t part = 0;
         for (size_t q = 0; q < 8; ++q)
             if (ev_ == ev_row_[q]) part = q;
-        int j = il + 1;
-        while (j < n_layer_ && !layers_[(size_t) j].moe) ++j;
+        const int j = next_moe(il);
         if (j < n_layer_) pool_ahead(j, n, part, prefetch_k_);
     }
 
@@ -4887,7 +4886,7 @@ void Engine::run(const int32_t* tokens, int n) {
     //
     // A half's launches are the ones its tokens have in a call of their own, at their rows of the buffers
     // (shift_rows()), so each token comes out as it would alone.
-    if (n > 1 && windowed_ && !all_cached() && halves_) {
+    if (n > 1 && windowed_ && !all_cached() && halves_ && halves_ok()) {
         const int first[3] = {0, (n + 1) / 2, n};   // half k is the tokens [first[k], first[k + 1])
         const unsigned bits = snap_bits_;           // the window's tokens that leave the recurrent state
         int at = 0;
@@ -4970,7 +4969,9 @@ void Engine::run(const int32_t* tokens, int n) {
     // Once every layer has shown that, a call's layers are one recording: on an RTX 5090 the card waited 2 to 4
     // microseconds from one layer's recording to the next, four of them a layer.
     bool whole = card && replay;
-    for (int il = lo_; il < hi_ && whole; ++il) {
+    for (int s = 0; s < n_steps() && whole; ++s) {
+        cur_step_ = s;
+        const int il = step_phys(s);
         const Layer& L = layers_[(size_t) il];
         whole = L.fixed && (!L.moe || L.card == 1);
     }
@@ -4978,11 +4979,16 @@ void Engine::run(const int32_t* tokens, int n) {
     if (block_pass_ && !whole) replay = false;
     if (whole) {
         std::vector<int> key{block_pass_ ? -n : n};
-        for (int il = lo_; il < hi_; ++il) key.push_back(head_key(il, n));
+        for (int s = 0; s < n_steps(); ++s) {
+            cur_step_ = s;
+            key.push_back(head_key(step_phys(s), n));
+        }
         void*& pass = passes_[key];
         if (!pass)
             pass = record([&] {
-                for (int il = lo_; il < hi_; ++il) {
+                for (int s = 0; s < n_steps(); ++s) {
+                    cur_step_ = s;
+                    const int il = step_phys(s);
                     Layer& L = layers_[(size_t) il];
                     layer_head(L, il, n);
                     if (!L.moe) continue;
@@ -4992,10 +4998,15 @@ void Engine::run(const int32_t* tokens, int n) {
                 }
             });
         ck(cudaGraphLaunch((cudaGraphExec_t) pass, cs(st_)), "layer graph");
-        for (int il = lo_; il < hi_; ++il) stats_.gpu_experts += layers_[(size_t) il].moe ? n * n_used_ : 0;
+        for (int s = 0; s < n_steps(); ++s) {
+            cur_step_ = s;
+            stats_.gpu_experts += layers_[(size_t) step_phys(s)].moe ? n * n_used_ : 0;
+        }
         return;
     }
-    for (int il = lo_; il < hi_; ++il) {
+    for (int s = 0; s < n_steps(); ++s) {
+        cur_step_ = s;
+        const int il = step_phys(s);
         Layer& L = layers_[(size_t) il];
         up(il, n, (size_t) n - 1);
         if (!L.moe) continue;
@@ -5089,7 +5100,9 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         ~Clear() { p = nullptr; }
     } clear{rows_of_};
     std::vector<int> key;
-    for (int il = lo_; il < hi_; ++il) {
+    for (int s = 0; s < n_steps(); ++s) {
+        cur_step_ = s;
+        const int il = step_phys(s);
         Layer& L = layers_[(size_t) il];
         if (batch_heads()) {
             const int64_t keep = pos_;

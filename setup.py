@@ -663,28 +663,28 @@ FAMILIES = {
                          "mmproj-GrootTeam_Groot-19B-A3B-261023-bf16.gguf":
                          (902822208, "0140cef0473d63595a030c68b75b2c8d110bb623bb12ae5993c0cfdfb2d2b0a7")}},
     # Inkling 2 Mini 26B-A5B (Thinking Machines Lab; Unsloth Mainline_Support inkling2_loop GGUFs): 24 physical layers
-    # with layers 6..17 looped 3x (48 logical layers: 8 global + 40 SWA=1024).  Default 128K context + Q8_0 KV
-    # (17,408 B/tok global = 2.125 GiB + 0.166 GiB SWA rings = 2.29 GiB total KV), leaving ~2.1-2.5 GiB VRAM for
-    # hot experts on an 8 GB card alongside 32 GB RAM.  Engine forward kernels in src/poly/inkling2.cpp are scaffolded
-    # for CUDA/HIP bringup (see docs/models/inkling2.md).
+    # with layers 6..17 looped 3x (48 logical layers: 8 global + 40 SWA=1024).  Defaults to 32K context + Q8_0 KV
+    # (17,408 B/tok global = 0.53 GiB + 0.17 GiB SWA rings = 0.70 GiB total KV; 128K is available via --context 131072
+    # at 2.29 GiB KV once measured).  Engine forward kernels in src/poly/inkling2.cpp are scaffolded for CUDA/HIP
+    # bringup (see docs/models/inkling2_plan.md).
     "inkling2": {"title": "Inkling 2 Mini 26B-A5B", "by": "Thinking Machines Lab; quantized by Unsloth",
-                 "about": "experimental inkling2_loop scaffolding on strata-poly; 128K default with Q8_0 KV; "
+                 "about": "experimental inkling2_loop scaffolding on strata-poly; 32K default (128K option) with Q8_0 KV; "
                           "UD-Q4_K_M (16.6 GB) and UD-Q4_K_XL (17.6 GB) for 32 GB RAM / 8 GB VRAM",
                  "hf": hf("unsloth/Inkling-2-Mini-GGUF"), "file": "Inkling-2-Mini-{q}.gguf", "shards": 1,
                  "tag": "inkling2-", "name": "inkling-2-mini-26b-a5b", "engine": "poly",
                  "vision": True, "experimental": True, "windows": True,
-                 "default_context": 131072, "default_kv": "q8_0",
+                 "default_context": 32768, "default_kv": "q8_0",
                  "row_bytes": 17408, "mmproj_hf": hf("unsloth/Inkling-2-Mini-GGUF"), "mmproj": "mmproj-BF16.gguf",
                  "vision_gb": 0.64, "vision_vram_gb": 0.8,
-                 "models": {"UD-Q4_K_M": {"about": "4-bit Unsloth Dynamic (NVFP4/Q5_K/Q8_0 experts); 128K Q8_0 KV default",
+                 "models": {"UD-Q4_K_M": {"about": "4-bit Unsloth Dynamic (NVFP4/Q5_K/Q8_0 experts); Q8_0 KV default",
                                           "download_gb": 16.6, "ram_gb": 21, "arena_gb": 14.7786,
-                                          "vram_beside_gb": 4.9,
-                                          "memory_basis": "estimated from GGUF headers (1.71 GiB non-expert + 2.29 GiB 128K Q8_0 KV + scratch)",
+                                          "vram_beside_gb": 3.3,
+                                          "memory_basis": "estimated from GGUF headers (1.71 GiB non-expert + 0.70 GiB 32K Q8_0 KV + scratch)",
                                           "remote_file": "Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file"},
-                            "UD-Q4_K_XL": {"about": "4-bit Unsloth Dynamic XL (NVFP4/Q8_0 experts only); 128K Q8_0 KV default",
+                            "UD-Q4_K_XL": {"about": "4-bit Unsloth Dynamic XL (NVFP4/Q8_0 experts only); Q8_0 KV default",
                                            "download_gb": 17.6, "ram_gb": 22, "arena_gb": 15.7978,
-                                           "vram_beside_gb": 4.9,
-                                           "memory_basis": "estimated from GGUF headers (1.71 GiB non-expert + 2.29 GiB 128K Q8_0 KV + scratch)",
+                                           "vram_beside_gb": 3.3,
+                                           "memory_basis": "estimated from GGUF headers (1.71 GiB non-expert + 0.70 GiB 32K Q8_0 KV + scratch)",
                                            "remote_file": "Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file"}},
                  "sha256": {"Inkling-2-Mini-UD-Q4_K_M.gguf":
                             (16610544608, "78fcedcf93c5d1bfe83e225513b71392bb52259be0eaa5f8899c856a2e5834ae"),

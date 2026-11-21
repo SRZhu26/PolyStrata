@@ -8,6 +8,8 @@
 // residuals, and fused NVFP4 ffn_gate_up_exps with situ softcaps) are stubbed for bringup on a CUDA/HIP machine.
 #include "inkling2.hpp"
 
+#include "ggml.h"
+
 #include <algorithm>
 #include <cstdio>
 #include <stdexcept>
@@ -48,6 +50,7 @@ void Inkling2::load_geometry() {
     auto need = [](bool ok, const char* what) {
         if (!ok) throw std::runtime_error(std::string("unsupported inkling2_loop model: ") + what);
     };
+    need(opt_.layer_split.empty(), "--layer-split (the looped core spans the split)");
     auto must = [&](const char* key) -> const MetaValue& {
         const MetaValue* v = find(key);
         need(v != nullptr, key);
@@ -132,8 +135,32 @@ size_t Inkling2::extra_bytes() const {
     return (size_t) n_local_steps_ * (size_t) k * 2 * kv_row_bytes_for(n_kv_, head_dim_, use_q8);
 }
 
+// Each visit's causal-conv history (l_cache - 1 rows): K, V, the attention update, the FFN update.
+size_t Inkling2::recurrent_floats() const {
+    const size_t per_row = 2 * (size_t) n_kv_ * (size_t) head_dim_ + 2 * (size_t) n_embd_;   // 1024+1024+2304+2304
+    return steps_.size() * (size_t) (sconv_len_ - 1) * per_row;                               // 48*3*6656 = 958,464
+}
+
 void Inkling2::load_layer(int il) {
-    (void) il;
+    Layer& L = layers_[(size_t) il];
+    // llama.cpp applies ffn_*_exps.scale whatever the type; Engine::load_moe() only binds NVFP4's.
+    // Keep this check in Inkling2 (not shared Engine) so Gemma 4's non-NVFP4 ffn_down_exps.scale is untouched.
+    for (const char* n : {"ffn_gate_up_exps.scale", "ffn_down_exps.scale"}) {
+        const TensorInfo* t = tensor(il, n);
+        const uint32_t type = std::string(n).rfind("ffn_down", 0) == 0 ? L.d_type : L.gu_type;
+        if (!t || type == GGML_TYPE_NVFP4) continue;
+        const float* s = (const float*) home(*t).data(*t);
+        for (int e = 0; e < n_expert_; ++e)
+            if (s[e] != 1.f)
+                throw std::runtime_error(blk(il, n) + ": scale on a non-NVFP4 expert layer is not supported yet");
+    }
+    // Check optional global-layer tensors from llama.cpp's inkling2_loop list and log which are present;
+    // when implementing the full loader, also reject any unconsumed blk.N.* tensor so missing features fail loudly.
+    for (const char* opt_name : {"attn_k_conv_proj.weight", "attn_v_conv_proj.weight",
+                                 "attn_q_inp_norm.weight", "attn_k_inp_norm.weight", "attn_v_inp_norm.weight"}) {
+        if (tensor(il, opt_name))
+            std::fprintf(stderr, "strata-poly: inkling2_loop: blk.%d has %s\n", il, opt_name);
+    }
     not_yet_implemented("Inkling2::load_layer()");
 }
 
@@ -221,7 +248,9 @@ void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
 int Inkling2::head_key(int il, int n) const {
     (void) il;
     (void) n;
-    return 0;
+    // The three passes of a core layer share one Layer, so include the pass index so recorded graphs never collide.
+    // Combine with ring/window state (matching Flint::head_key) once attention is implemented.
+    return steps_[(size_t) cur_step_].pass;
 }
 
 }  // namespace strata::poly
