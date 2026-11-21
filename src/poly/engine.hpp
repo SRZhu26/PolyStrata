@@ -501,7 +501,9 @@ protected:
     }
     /// Whether a window's tokens may go through the layers in two halves (halves_).
     virtual bool halves_ok() const { return true; }
-    int cur_step_ = 0;   ///< the visit run() / step() is on; read by layer_head/layer_tail/head_key/next_moe
+    /// Whether read() may process a long prompt across multiple calls layer-major (sharing experts across calls).
+    virtual bool read_layer_major() const { return true; }
+    int cur_step_ = 0;   ///< the visit run() / step() / read() is on; read by layer_head/layer_tail/head_key/next_moe/save_layer
     /// While step() runs a head in one call: each row's sequence and position, row after row; else null.  snap: for
     /// the first of a sequence's two rows, where every recurrent layer leaves the state after it (at its place in
     /// state_, as a window's snapshots), for keep_step() to go back to; else null.

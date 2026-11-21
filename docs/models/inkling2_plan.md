@@ -119,40 +119,51 @@ Unrolled 48 logical steps = **8 global** (`blk.5` ×1, `blk.11` ×3, `blk.17` ×
 - `src/poly/engine.cpp:1622-1639`: uploads `ffn_gate_up_exps.scale` (F32 `[n_expert_]`) once and binds the same
   `Dev` handle / host vector to both `L.s_gate`/`L.h_s_gate` and `L.s_up`/`L.h_s_up`. Models without
   `ffn_gate_up_exps.scale` take the unchanged path.
-- `Inkling2::load_layer()` additionally checks non-NVFP4 expert layers and throws if any `.scale` element != `1.f`
-  (kept inside `Inkling2` so Gemma 4's own non-NVFP4 `ffn_down_exps.scale` is untouched).
+- `Inkling2::load_layer()` additionally checks non-NVFP4 expert layers using the **weight tensor's own type**
+  (`tw->type`, since `load_layer()` runs before `load_moe()` sets `L.gu_type`/`L.d_type`), validates `F32`, calls
+  `home(*t).payload(*t)`, and throws if any `.scale` element != `1.f` (kept inside `Inkling2` so Gemma 4's own
+  non-NVFP4 `ffn_down_exps.scale` is untouched).
 
 ### 3.2 Logical-to-Physical Step Tracking in `Engine` (Already Applied)
 - **24 physical `Layer` entries** (`layers_[0..23]`) share one VRAM expert-slot pool (`L.slot`) and one set of
   NVFP4 scales per physical layer across all 3 core passes — never duplicated 48×.
-- `Engine` tracks the active visit via `int cur_step_ = 0` and four virtual hooks (defaulting to identity so every
+- `Engine` tracks the active visit via `int cur_step_ = 0` and five virtual hooks (defaulting to identity so every
   other model is 100% unchanged):
   - `n_steps()` (`48` for Inkling, `hi_ - lo_` by default)
   - `step_phys(s)` (`steps_[s].phys` for Inkling, `lo_ + s` by default)
   - `next_moe(il)` (`steps_[cur_step_ + 1].phys` for Inkling)
   - `halves_ok()` (`false` for Inkling until Phase 3, `true` by default)
-- All engine loops updated in `src/poly/engine.cpp`:
+  - `read_layer_major()` (`false` for Inkling until per-call state can be moved to host memory, `true` by default)
+- All six engine loops updated in `src/poly/engine.cpp`:
   1. Whole-pass check, `head_key` key loop, whole-pass CUDA Graph recording, and stats (`~4971-5005`).
   2. Plain per-layer loop (`~5006-5016`).
   3. `Engine::step()` (`~5102`).
   4. `moe()` prefetch (`~4058`, via `next_moe(il)`).
   5. Two-halves window path (`~4889`, gated by `&& halves_ok()`).
-- `Inkling2::head_key()` includes `steps_[cur_step_].pass` (combined with ring/window state once attention is
-  written) so the 3 passes of a core layer never collide in recorded CUDA graphs.
+  6. Long-prompt `Engine::read()` (`~5553-5590`, plus `read_rows_` opt-out at `~3070` via `read_layer_major()`).
+     `Inkling2::save_layer()` must save the current visit (`cur_step_`): its SWA ring and its conv history.
+- **CUDA graph safety across the 3 core passes**:
+  - **Phase 1**: keep **`L.fixed = false`** in `Inkling2::load_layer()` (`L.tail`, `L.shared`, and `L.card_moe` are
+    keyed by `rec` only, so enabling CUDA graphs before Phase 3 would replay pass 1's tail on passes 2 and 3).
+  - **Phase 3**: add a pass-aware `tail_key()` virtual (defaulting to `0`, used as `rec + tail_key() * recs`) and
+    combine `pass` with `room_key(n)` on global layers as `pass * (max_room_key + 1) + room_key(n)` so keys never
+    collide.
 - `Engine::layer()` (`~5401`) and `card_moe()` slot table (`~4266`, keyed by `il * n_expert_`) are intentionally
   unchanged: all 3 passes share the physical expert pool.
 
 ### 3.3 Per-Token State Across Visits
 - **Within one call (scratch, sized by `rows_`):**
   - Depth-attention (Attention Residuals) history: up to **8 block states** of `n_embd` floats per token (`block_size = 6`).
-  - Previous pass's `q`/`k`/`v`/`ffn` loop messages for each core layer `6..17` (**`12 × 4 × n_embd`** floats per
-    token), read by passes 2 and 3.
+  - Previous pass's `q`/`k`/`v`/`ffn` loop messages for core layers `6..17`, read by passes 2 and 3.
+    *(Verify the exact tensor size from `src/models/inkling2.cpp` before sizing scratch — the controllers are rank 64,
+    so the real buffer may be smaller than `12 × 4 × n_embd` per token.)*
 - **Across calls (recurrent state, `Inkling2::recurrent_floats()`):**
   - Each of the 48 visits keeps its own causal-conv history (`l_cache - 1 = 3` rows) for K (`1024`), V (`1024`),
     attention post-conv (`2304`), and FFN post-conv (`2304`): `48 × 3 × 6,656 = 958,464` floats (~3.66 MiB).
   - Because it lives in `Engine`'s recurrent state, it must be saved and restored cleanly across prefix reuse,
     pinned sessions (`--pinned-session`), and `save_layer()` / `load_extra()`.
-- **Phase 1 limits**: `halves_ok() = false` and `--layer-split` refused in `load_geometry()`.
+- **Phase 1 limits**: `halves_ok() = false`, `read_layer_major() = false`, `L.fixed = false`, and `--layer-split`
+  refused in `load_geometry()`.
 
 ---
 
@@ -241,9 +252,12 @@ Apply one fusion at a time, re-running Stage 2 greedy parity after **each** chan
   no existing `draft_step()` path in `Engine`.
 
 ### Phase 5 — Cross-Backend Compile Check & Regression Hygiene
-- **HIP**: Compile-only check on the Windows NVIDIA laptop if ROCm/HIP SDK is installed (runtime HIP validation
-  requires AMD hardware or CI; document what was and was not tested per `AGENTS.md`).
-- Confirm all existing models (`qwen35moe`/Groot, `flint`, `gemma4`, `lfm2moe`) remain byte-identical on default paths.
+Because `src/poly/engine.hpp` and `src/poly/engine.cpp` touch shared code, before any PR:
+- Build CUDA on the laptop and compile HIP if ROCm/HIP SDK is available (runtime HIP validation requires AMD
+  hardware or CI; document what was and was not tested per `AGENTS.md`).
+- **Existing-model regression check**: greedy-compare one existing model (Groot `qwen35moe`, or Flint with
+  `--kv q8_0`) against a `main` build on **both** a short prompt and a long prompt (`>= max_rows()`) that goes
+  through `Engine::read()` to prove byte-identical default paths.
 - Record measured RTX 5060 Laptop numbers (32K, 64K, 128K) in `docs/models/inkling2.md` and `bench/results/`.
 
 ---

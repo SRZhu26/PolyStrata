@@ -3067,7 +3067,7 @@ void Engine::alloc() {
     // --dump-layers prints one token's stages
     rows_ = opt_.dump ? 1 : std::min(opt_.prompt_batch, opt_.max_context);
     const size_t most = std::min<size_t>(kReadBytes / ((size_t) streams() * n_embd_ * sizeof(float)), opt_.max_context);
-    read_rows_ = rows_ < kStageRows ? rows_ : std::max(rows_, (int) most / rows_ * rows_);
+    read_rows_ = !read_layer_major() || rows_ < kStageRows ? rows_ : std::max(rows_, (int) most / rows_ * rows_);
     rec_n_ = recurrent_floats();
     state_n_ = rec_n_ + (draft_ ? (size_t) n_embd_ : 0);
     const size_t state_floats = state_n_ + (draft_ ? (size_t) rows_ * n_embd_ : 0);
@@ -5550,12 +5550,14 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         fetch(0);
         fetch(1);
     }
-    // a turn for each layer, and one for the model's output, which the draft block keeps a row of
-    const int turns = hi_ - lo_ + (draft_ ? 1 : 0);
+    // a turn for each layer visit, and one for the model's output, which the draft block keeps a row of
+    const int turns = n_steps() + (draft_ ? 1 : 0);
     shared_ahead_ = true;
     try {
         for (int k = 0; k < turns; ++k) {
-            const int il = lo_ + k;
+            const bool model = k < n_steps();
+            if (model) cur_step_ = k;
+            const int il = model ? step_phys(k) : lo_ + k;
             // Between two turns the caller may give the read up.  The layers so far have the read's tokens in
             // their state and the others have not: the sequence cannot go on from here, nor from where it was.
             if (turn && k > 0 && !(*turn)(k, turns)) {
@@ -5572,7 +5574,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
                 pos_ = pos0 + call.at;
                 tok_ = tokens + call.at;
                 if (host) ck(cudaStreamWaitEvent(cs(st_), (cudaEvent_t) ev_in_[c % 2], 0), "read");
-                if (il < n_layer_) {
+                if (model) {
                     layer(il, call.m);
                 } else {
                     output_rows(0, call.m, hn_ + n_embd_);
@@ -5582,7 +5584,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
                 if (uint8_t* state = call.mark >= 0 ? marks[call.mark].state : nullptr) {
                     ck(cudaStreamSynchronize(cs(st_)), "read");
                     const int64_t pos = pos_ + call.m;
-                    if (il < n_layer_) save_layer(il, pos, state);
+                    if (model) save_layer(il, pos, state);
                     if (k == turns - 1) {   // what no turn is for: a layer behind the model's, the last output
                         for (int j = n_layer_; j < (int) layers_.size(); ++j) save_layer(j, pos, state);
                         save_last(state);

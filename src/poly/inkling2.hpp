@@ -30,7 +30,8 @@ protected:
         const size_t s = (size_t) cur_step_ + 1;
         return s < steps_.size() ? steps_[s].phys : n_layer_;
     }
-    bool halves_ok() const override { return false; }   // until Phase 3
+    bool halves_ok() const override { return false; }          // until Phase 3
+    bool read_layer_major() const override { return false; }   // until per-call state can be moved to host memory
     size_t recurrent_floats() const override;
     void alloc_caches() override;
     void assign_scratch() override;

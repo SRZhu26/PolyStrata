@@ -142,13 +142,18 @@ size_t Inkling2::recurrent_floats() const {
 }
 
 void Inkling2::load_layer(int il) {
-    Layer& L = layers_[(size_t) il];
+    // Keep L.fixed = false during Phase 1 (L.tail/L.shared/L.card_moe are keyed by rec only, so enabling CUDA graphs
+    // before Phase 3 adds a pass-aware tail_key() would replay pass 1's tail on passes 2 and 3).
     // llama.cpp applies ffn_*_exps.scale whatever the type; Engine::load_moe() only binds NVFP4's.
+    // Read the weight tensor's own type here because load_layer() runs before load_moe() sets L.gu_type/L.d_type.
     // Keep this check in Inkling2 (not shared Engine) so Gemma 4's non-NVFP4 ffn_down_exps.scale is untouched.
     for (const char* n : {"ffn_gate_up_exps.scale", "ffn_down_exps.scale"}) {
         const TensorInfo* t = tensor(il, n);
-        const uint32_t type = std::string(n).rfind("ffn_down", 0) == 0 ? L.d_type : L.gu_type;
-        if (!t || type == GGML_TYPE_NVFP4) continue;
+        const char* w = std::string(n).rfind("ffn_down", 0) == 0 ? "ffn_down_exps.weight" : "ffn_gate_up_exps.weight";
+        const TensorInfo* tw = tensor(il, w);
+        if (!t || !tw || tw->type == GGML_TYPE_NVFP4) continue;
+        if (t->type != kTypeF32) throw std::runtime_error(t->name + " is not F32");
+        home(*t).payload(*t);
         const float* s = (const float*) home(*t).data(*t);
         for (int e = 0; e < n_expert_; ++e)
             if (s[e] != 1.f)
