@@ -144,8 +144,13 @@ size_t Inkling2::recurrent_floats() const {
 void Inkling2::load_layer(int il) {
     // Keep L.fixed = false during Phase 1 (L.tail/L.shared/L.card_moe are keyed by rec only, so enabling CUDA graphs
     // before Phase 3 adds a pass-aware tail_key() would replay pass 1's tail on passes 2 and 3).
-    // llama.cpp applies ffn_*_exps.scale whatever the type; Engine::load_moe() only binds NVFP4's.
-    // Read the weight tensor's own type here because load_layer() runs before load_moe() sets L.gu_type/L.d_type.
+    // When implementing the full loader:
+    //   1. Call load_moe(il, false) first, then check/bind ffn_*_exps.scale (for any type if Q3/IQ4 layers carry
+    //      non-1.0 scales; both Engine::expert_scales() and the CPU path in engine.cpp:4106-4114 are type-agnostic).
+    //   2. Load every non-expert matrix through upload(..., kAnyMat) — Q3/IQ4 files use Q5_K/Q6_K attention and head
+    //      weights, not just Q8_0.
+    //   3. Reject any unconsumed blk.N.* tensor so missing features fail loudly.
+    // Until load_moe() is wired here, read the weight tensor's own type (load_layer() runs before load_moe()).
     // Keep this check in Inkling2 (not shared Engine) so Gemma 4's non-NVFP4 ffn_down_exps.scale is untouched.
     for (const char* n : {"ffn_gate_up_exps.scale", "ffn_down_exps.scale"}) {
         const TensorInfo* t = tensor(il, n);

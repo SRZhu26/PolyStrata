@@ -30,19 +30,20 @@ class Inkling2SetupTest(unittest.TestCase):
 
     def test_primary_quants_and_pinned_hashes(self):
         fam = setup.FAMILIES["inkling2"]
-        self.assertEqual(list(fam["models"].keys()), ["UD-Q4_K_M", "UD-Q4_K_XL"])
-        for q in ("UD-Q4_K_M", "UD-Q4_K_XL"):
+        expected = ["UD-IQ4_XS", "UD-Q3_K_XL", "UD-IQ3_XXS", "UD-Q4_K_XL", "UD-Q4_K_M"]
+        self.assertEqual(list(fam["models"].keys()), expected)
+        for q in expected:
             d = fam["models"][q]
             local_name = setup.model_file(fam, q, 1)
             self.assertEqual(local_name, f"Inkling-2-Mini-{q}.gguf")
             self.assertEqual(d["remote_file"], f"Mainline_Support/Inkling-2-Mini-{q}.gguf_file")
             self.assertIn(local_name, fam["sha256"])
             size, sha = fam["sha256"][local_name]
-            self.assertGreater(size, 15_000_000_000)
+            self.assertGreater(size, 11_000_000_000)
             self.assertEqual(len(sha), 64)
             # Fits comfortably in 32 GB RAM / 8 GB VRAM setup
             self.assertLessEqual(d["ram_gb"], 24)
-            self.assertLessEqual(d["vram_beside_gb"], 5.5)
+            self.assertLessEqual(d["vram_beside_gb"], 4.0)
 
     def test_hf_revision_pinned(self):
         rev = setup.HF_REVISIONS.get("unsloth/Inkling-2-Mini-GGUF", "")

@@ -24,9 +24,11 @@ From `Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file` (`ea0c79b2ecd73669e77
   - **Q8_0**: `2,176 B/tok/layer` (`1,088 B` per K or V row) → **17,408 B/tok** (17 KiB/tok) across 8 global layers
     + **170 MiB** SWA rings (46.88% less KV VRAM).
 - **Tensor sizes (from GGUF headers)**:
-  - `UD-Q4_K_M` (16.61 GB): 14.78 GB routed experts (`NVFP4`, `Q5_K`, `Q8_0`), 1.83 GB non-expert weights (`Q8_0`,
-    `BF16`, `F32`).
-  - `UD-Q4_K_XL` (17.63 GB): 15.80 GB routed experts (`NVFP4`, `Q8_0` only), 1.83 GB non-expert weights.
+  - `UD-IQ4_XS` (15.73 GB, provisional default, KLD 0.0109): 14.04 GB routed experts, 1.69 GB non-expert weights, 0 non-NVFP4 `.scale` layers.
+  - `UD-Q3_K_XL` (13.63 GB, speed/low-RAM option, KLD 0.0174): 12.20 GB routed experts, 1.42 GB non-expert weights, 8 non-NVFP4 `.scale` layers.
+  - `UD-IQ3_XXS` (11.66 GB, smallest Q3, KLD 0.0269): 10.30 GB routed experts, 1.35 GB non-expert weights, 20 non-NVFP4 `.scale` layers.
+  - `UD-Q4_K_XL` (17.63 GB, bringup reference, KLD 0.0107): 15.80 GB routed experts (`NVFP4`, `Q8_0` only), 1.83 GB non-expert weights.
+  - `UD-Q4_K_M` (16.61 GB, KLD 0.0108): 14.78 GB routed experts (`NVFP4`, `Q5_K`, `Q8_0`), 1.83 GB non-expert weights.
 
 ### Estimated VRAM budget on 8 GB VRAM / 32 GB RAM (RTX 5060 Laptop)
 
@@ -42,7 +44,8 @@ for KV + hot experts):
 | 256K | 8.31 GiB | 4.42 GiB | ~0 GiB |
 
 `setup.py --family inkling2` defaults to **32K** context (128K available via `--context 131072` once measured),
-**`--kv q8_0`**, and **`UD-Q4_K_M`** (with **`UD-Q4_K_XL`** as the second choice).
+**`--kv q8_0`**, and **`UD-IQ4_XS`** (provisional default; `UD-Q3_K_XL`, `UD-IQ3_XXS`, `UD-Q4_K_XL`, and
+`UD-Q4_K_M` are also offered, with the final default chosen after Stage 4 benchmarks).
 
 ## Bringup on the RTX 5060 Laptop (Windows, 32 GB RAM, 8 GB VRAM)
 

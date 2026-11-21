@@ -13,17 +13,33 @@ Branch: `fork/add-inkling2-mini` (never push directly to `origin/main`).
 Extracted directly from the live GGUF headers of `unsloth/Inkling-2-Mini-GGUF` at pinned revision
 `ea0c79b2ecd73669e774c8519b79bfabfddbc027` (`Mainline_Support` layout, matching merged `ggml-org/llama.cpp` PR `#32694`):
 
-### 1.1 Pinned Files & Exact Sizes
+### 1.1 Pinned Files, Exact Sizes & Quality vs `UD-Q8_K_XL`
 
-| Local Filename | Remote Path (`unsloth/Inkling-2-Mini-GGUF`) | Bytes | Routed Experts (`arena_gb`) | Non-Expert Weights | Expert Types |
-| --- | --- | ---: | ---: | ---: | --- |
-| `Inkling-2-Mini-UD-Q4_K_M.gguf` | `Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file` | 16,610,544,608 | 14.78 GB (13.76 GiB) | 1.83 GB (1.71 GiB) | `NVFP4`, `Q5_K`, `Q8_0` |
-| `Inkling-2-Mini-UD-Q4_K_XL.gguf` | `Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file` | 17,629,760,736 | 15.80 GB (14.71 GiB) | 1.83 GB (1.71 GiB) | `NVFP4`, `Q8_0` |
-| `mmproj-BF16.gguf` | `mmproj-BF16.gguf` | 641,805,760 | — | 0.64 GB | `BF16` |
+| Quant | File Size | Mean KLD | Same Top Token | Routed Experts (`arena_gb`) | Non-Expert Weights | Gate+Up / Down Expert Types | Non-NVFP4 `.scale` Layers |
+| --- | ---: | ---: | ---: | ---: | ---: | --- | ---: |
+| **UD-IQ4_XS** *(provisional default)* | 15.73 GB | 0.0109 | 97.7% | 14.04 GB (13.07 GiB) | 1.69 GB (1.57 GiB) | `IQ4_XS, NVFP4, Q4_K, Q5_K` / `IQ4_NL, NVFP4, Q5_0` | **0** |
+| **UD-Q3_K_XL** *(speed/low-RAM)* | 13.63 GB | 0.0174 | 96.3% | 12.20 GB (11.36 GiB) | 1.42 GB (1.32 GiB) | `IQ2_S, IQ2_XS, IQ3_S, IQ3_XXS, NVFP4, Q3_K` / `IQ4_NL, NVFP4` | **8** |
+| UD-IQ3_XXS *(smallest Q3)* | 11.66 GB | 0.0269 | 94.7% | 10.30 GB (9.59 GiB) | 1.35 GB (1.26 GiB) | `IQ2_S, IQ2_XS, IQ2_XXS, IQ3_XXS` / `IQ4_NL, NVFP4` | **20** |
+| UD-Q4_K_XL *(bringup ref)* | 17.63 GB | 0.0107 | 98.0% | 15.80 GB (14.71 GiB) | 1.83 GB (1.71 GiB) | `NVFP4, Q8_0` / `NVFP4, Q8_0` | **0** |
+| UD-Q4_K_M | 16.61 GB | 0.0108 | 97.9% | 14.78 GB (13.76 GiB) | 1.83 GB (1.71 GiB) | `NVFP4, Q5_K, Q8_0` / `NVFP4, Q8_0` | **0** |
+| `mmproj-BF16.gguf` | 0.64 GB | — | — | — | 0.64 GB | `BF16` | — |
 
-- Non-expert weight types in both quants: `Q8_0`, `BF16`, `F32`.
-- **`UD-Q4_K_XL` advantage on Blackwell**: its routed experts are **pure `NVFP4` + `Q8_0`** (no `Q5_K`), which maps
-  cleanly onto `strata-poly`'s native `NVFP4` paths (`src/poly/mmq_nvfp4.cu` and `src/kernels/cuda/native_mmvq.cu`).
+- **Non-expert weight types depend on the quant**: `Q8_0/BF16/F32` on the two `Q4_K` files, adding `Q5_K/Q6_K` on
+  `UD-IQ4_XS` and `Q4_K/Q5_K/Q6_K` on `UD-Q3_K_XL` / `UD-IQ3_XXS`. Load every non-expert matrix through
+  `upload(..., kAnyMat)`.
+- **Down projections (rows of 1,152 = 4.5 × 256)** cannot use 256-value block types, so they use 32- or 64-value
+  block types (`IQ4_NL`, `Q5_0`, `NVFP4`, `Q8_0`). `native_mmvq.cu` and `mmq.cu` already support all of these types.
+- **Q3 non-NVFP4 `.scale` finding (verified from headers)**: `UD-IQ4_XS`, `UD-Q4_K_M`, and `UD-Q4_K_XL` have **0**
+  non-NVFP4 `.scale` tensors. `UD-Q3_K_XL` has **8** and `UD-IQ3_XXS` has **20** (`blk.*.ffn_gate_up_exps.scale`
+  on `IQ2_S`/`IQ2_XS`/`IQ2_XXS`). Because both `Engine::expert_scales()` (`engine.cpp:3571`) and the CPU path
+  (`engine.cpp:4106-4114`) are already type-agnostic, `Inkling2::load_layer()` can bind those scales for any type
+  after `load_moe(il, false)` with zero shared-engine changes if their values are not 1.0.
+- **Bringup order**:
+  1. **`UD-Q4_K_XL`** (simplest: pure `NVFP4`/`Q8_0` experts) to prove Stage 1 & Stage 2 math.
+  2. **`UD-IQ4_XS`** (adds `IQ4_XS`/`Q4_K`/`Q5_K` gate+up, `Q5_0`/`IQ4_NL` downs, `Q6_K` attention/head; 0 non-NVFP4 scales).
+  3. **`UD-Q3_K_XL`** (exercises non-NVFP4 `.scale` binding and int8 `mmq` prefill; measure prefill separately since FP4×FP4 only helps NVFP4 layers).
+  4. **`UD-IQ3_XXS`** (optional).
+- Lock in the final default (`UD-IQ4_XS` vs `UD-Q3_K_XL`) only after Stage 4 benchmarks on the laptop (`AGENTS.md`).
 
 ### 1.2 Exact GGUF Metadata (`inkling2_loop.*`)
 
@@ -171,14 +187,17 @@ Unrolled 48 logical steps = **8 global** (`blk.5` ×1, `blk.11` ×3, `blk.17` ×
 
 Order to execute: **Phase 0 (Oracle) → Phase 1 (Exact Unfused Forward) → Phase 1b (Tokenizer/Server) → Phase 2 (Offload/NVFP4) → Phase 3 (Fusion/Graphs) → Phase 4 (Vision) → Phase 5 (Compile/Regression)**.
 
-### Phase 0 — Reference Oracle on RTX 5060 Laptop
+### Phase 0 — Reference Oracle & Header Audit on RTX 5060 Laptop
 1. Install Visual Studio Build Tools (C++), CUDA Toolkit (12.8 or 13.0), and CMake.
-2. Checkout this branch and download the model (`UD-Q4_K_XL` recommended first: pure `NVFP4`/`Q8_0` experts):
+2. Checkout this branch and download the target files (`UD-Q4_K_XL` for Stage 1 bringup, then `UD-IQ4_XS` and
+   `UD-Q3_K_XL` for benchmarking):
    ```powershell
    git fetch fork
    git checkout add-inkling2-mini
    python setup.py --family inkling2 --model UD-Q4_K_XL --vision no --yes --no-start
    ```
+   Run a per-layer header audit with `tools/gguf_reader.py` on each downloaded file (recording `gate_up`/`down`
+   types, `.scale` min/max values on any non-NVFP4 layers, and attention/head types).
 3. Build mainline `llama.cpp` pinned to PR `#32704` commit **`2a28df0f9bd55c4975b6bffb35229a6020720f13`**
    *(PR `#32704` is open as of 2026-11-21; if `2a28df0f9b` does not load the file, use Unsloth's prebuilt
    `b12588-mix-c0c3de8`, the build ninfer-all measured against)*:
@@ -277,13 +296,13 @@ Because `src/poly/engine.hpp` and `src/poly/engine.cpp` touch shared code, befor
   - One run past **8,192 tokens** to exercise global-layer log-scaling.
   - *(Calibration reference: ninfer-all measured `+0.03%` vs FP64 and `-0.06%` vs `llama.cpp`.)*
 
-### Stage 2 — Greedy Token-by-Token Parity vs `llama.cpp`
-- Run with `temperature = 0`, `--no-draft` on both `UD-Q4_K_M` and `UD-Q4_K_XL` against `llama.cpp` (`2a28df0f9b` or
-  `b12588-mix-c0c3de8`):
-  - 5 short factual/coding prompts + prefixes of a 3,740-token prompt (100, 600, 1500, 3740 tokens — same method as
-    Flint commit `5ff592f1`).
-- **Pass criteria**: Exact token match, **or** any first divergence occurs only where `llama.cpp`'s top-2 logits are
-  within ~0.5 log-prob (verify by printing top-3 logits at the diverging step).
+### Stage 2 — Per-Quant Greedy Token Parity & NLL vs `llama.cpp`
+- Run with `temperature = 0`, `--no-draft` on each target quant (`UD-Q4_K_XL`, `UD-IQ4_XS`, `UD-Q3_K_XL`, optional
+  `UD-IQ3_XXS`) against `llama.cpp` (`2a28df0f9b` or `b12588-mix-c0c3de8`) on the **same file**:
+  - Mean NLL within **0.1%** of `llama.cpp` on the same file.
+  - Greedy top-1 agreement with `llama.cpp` of at least **~97%** over 5 × 256 steps (plus exact or near-tie match
+    on 5 short prompts and prefixes of a 3,740-token prompt, printing top-3 logits at any first divergence).
+  - Optionally, top-1 agreement vs `UD-Q8_K_XL` within ~1 point of Unsloth's figures (`98.0 / 97.7 / 96.3 / 94.7%`).
 
 ### Stage 3 — Q8_0 KV & Long-Context Needle Verification (Requires Phase 1b)
 ```powershell
@@ -334,9 +353,11 @@ python serve/test_models.py
 python tools/test_strata_mcp.py
 ```
 - **Pass criteria**:
+  - Benchmark **`UD-IQ4_XS`** and **`UD-Q3_K_XL`** at **32K with Q8_0 KV** against same-day `llama.cpp --fit-target`
+    (including peak RAM), and choose the final `setup.py` default from those measured numbers.
   - At **32K with Q8_0 KV**: decode **`>= 1.5×`** the same-day `llama.cpp` baseline from Phase 0.
     *(Reference point: ninfer-all on a desktop RTX 5060 8 GB decoded 33.1 tok/s and prefilled 1,267 tok/s at 2K
-    against `llama.cpp`'s 14.7 and 305; expect less on the laptop.)*
+    on `UD-IQ4_XS` against `llama.cpp`'s 14.7 and 305; expect less on the laptop.)*
   - Peak VRAM `<= 7.5 GiB`, peak RAM `<= 26 GiB`.
   - All unit tests pass; existing `groot` (`qwen35moe`) greedy output unchanged.
 
