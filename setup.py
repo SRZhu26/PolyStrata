@@ -96,6 +96,7 @@ HF_REVISIONS = {
     "unsloth/Ornith-1.5-122B-GGUF": "3842d003341507c216295c6f28dfcd30349925c6",                          # 2026-10-20
     "ornith-ai/Ornith-1.5-122B": "dfa07bab90e90746ffbfc0b0cba3126eb9265de2",                              # 2026-10-20
     "bartowski/GrootTeam_Groot-19B-A3B-261023-GGUF": "0025df0d03fb385344394f4e5afd73ce47da0680",
+    "unsloth/Inkling-2-Mini-GGUF": "ea0c79b2ecd73669e774c8519b79bfabfddbc027",                        # 2026-11-21
 }
 
 
@@ -661,6 +662,36 @@ FAMILIES = {
                          (20230129536, "7e414a5e4dbb5aa3074a69b36104b2c8cdc188432527956a6ed9c916906a1882"),
                          "mmproj-GrootTeam_Groot-19B-A3B-261023-bf16.gguf":
                          (902822208, "0140cef0473d63595a030c68b75b2c8d110bb623bb12ae5993c0cfdfb2d2b0a7")}},
+    # Inkling 2 Mini 26B-A5B (Thinking Machines Lab; Unsloth Mainline_Support inkling2_loop GGUFs): 24 physical layers
+    # with layers 6..17 looped 3x (48 logical layers: 8 global + 40 SWA=1024).  Default 128K context + Q8_0 KV
+    # (17,408 B/tok global = 2.125 GiB + 0.166 GiB SWA rings = 2.29 GiB total KV), leaving ~2.1-2.5 GiB VRAM for
+    # hot experts on an 8 GB card alongside 32 GB RAM.  Engine forward kernels in src/poly/inkling2.cpp are scaffolded
+    # for CUDA/HIP bringup (see docs/models/inkling2.md).
+    "inkling2": {"title": "Inkling 2 Mini 26B-A5B", "by": "Thinking Machines Lab; quantized by Unsloth",
+                 "about": "experimental inkling2_loop scaffolding on strata-poly; 128K default with Q8_0 KV; "
+                          "UD-Q4_K_M (16.6 GB) and UD-Q4_K_XL (17.6 GB) for 32 GB RAM / 8 GB VRAM",
+                 "hf": hf("unsloth/Inkling-2-Mini-GGUF"), "file": "Inkling-2-Mini-{q}.gguf", "shards": 1,
+                 "tag": "inkling2-", "name": "inkling-2-mini-26b-a5b", "engine": "poly",
+                 "vision": True, "experimental": True, "windows": True,
+                 "default_context": 131072, "default_kv": "q8_0",
+                 "row_bytes": 17408, "mmproj_hf": hf("unsloth/Inkling-2-Mini-GGUF"), "mmproj": "mmproj-BF16.gguf",
+                 "vision_gb": 0.64, "vision_vram_gb": 0.8,
+                 "models": {"UD-Q4_K_M": {"about": "4-bit Unsloth Dynamic (NVFP4/Q5_K/Q8_0 experts); 128K Q8_0 KV default",
+                                          "download_gb": 16.6, "ram_gb": 21, "arena_gb": 14.7786,
+                                          "vram_beside_gb": 4.9,
+                                          "memory_basis": "estimated from GGUF headers (1.71 GiB non-expert + 2.29 GiB 128K Q8_0 KV + scratch)",
+                                          "remote_file": "Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file"},
+                            "UD-Q4_K_XL": {"about": "4-bit Unsloth Dynamic XL (NVFP4/Q8_0 experts only); 128K Q8_0 KV default",
+                                           "download_gb": 17.6, "ram_gb": 22, "arena_gb": 15.7978,
+                                           "vram_beside_gb": 4.9,
+                                           "memory_basis": "estimated from GGUF headers (1.71 GiB non-expert + 2.29 GiB 128K Q8_0 KV + scratch)",
+                                           "remote_file": "Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file"}},
+                 "sha256": {"Inkling-2-Mini-UD-Q4_K_M.gguf":
+                            (16610544608, "78fcedcf93c5d1bfe83e225513b71392bb52259be0eaa5f8899c856a2e5834ae"),
+                            "Inkling-2-Mini-UD-Q4_K_XL.gguf":
+                            (17629760736, "e64276656f072e9b2197a61723667cbdb71da66a716ffd966e572c21088f3cd3"),
+                            "mmproj-BF16.gguf":
+                            (641805760, "2c165c78790e78a3f45a2d1e9e931083e52ee69d45ff2a0dc9c281fdf1a666e7")}},
     "qwen36": {"title": "Qwen3.6-35B-A3B", "by": "Qwen; quantized by Unsloth",
                "about": "on the strata-poly engine: one NVIDIA card, Linux or Windows; a 17 GB file, ~21 GB of RAM "
                         "beside an 8 GB card; a smaller and a larger size too",
@@ -2428,7 +2459,8 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False) -> None:
 # general.architecture of each strata-poly family's GGUFs, the name Engine::open() (src/poly/engine.cpp) picks its
 # code by; the families not listed are qwen35moe
 POLY_GGUF_ARCHS = {"glm": ("glm5-next", "glm5next"), "deepseek": ("deepseek4",), "lfm25": ("lfm2moe",),
-                   "gemma4": ("gemma4",), "flint": ("flint",), "kolibri": ("kolibri1",), "clover": ("clover_moe",)}
+                   "gemma4": ("gemma4",), "flint": ("flint",), "kolibri": ("kolibri1",), "clover": ("clover_moe",),
+                   "inkling2": ("inkling2_loop",)}
 
 
 def gguf_arch(s: Path) -> str:
@@ -6564,7 +6596,7 @@ def poly_verdict(d, ram, vram_gb, hip, windows=False) -> str:
 
 # --kv for a model of strata-poly (docs/Q8_KV.md): the formats its architecture's attention caches have beside
 # fp16, the default.  The other engine's own are STRATA_KV.
-POLY_KV = {"q8_0": ("qwen36", "ornith", "ornith122", "tiel", "groot", "minicpmv", "kolibri", "flint", "lfm25"),
+POLY_KV = {"q8_0": ("qwen36", "ornith", "ornith122", "tiel", "groot", "inkling2", "minicpmv", "kolibri", "flint", "lfm25"),
            "int8": ("gemma4",), "int8k": ("gemma4",)}
 STRATA_KV = ("int8", "q4_0", "k8v4")
 
@@ -7059,20 +7091,21 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
         # writing after a prompt that fills the context, tokens/s, on the 8 GB laptop (docs/BACKENDS.md, docs/LFM.md)
         laptop = fam.get("laptop_tps") or ({32768: "52-58", 65536: "42-46", 131072: "28-30"}
                                            if fam.get("ran_on_gb") == 8 else {})
+        default_ctx = fam.get("default_context", 32768)
         for i, c in enumerate(POLY_CONTEXTS, 1):
             on8 = f"; 8 GB card: {laptop[c]} tokens/s after a full prompt" if c in laptop else ""
-            note = f"   (recommended{on8})" if c == 32768 else \
-                f"   ({(c - 32768) * row / 1e9:.1f} GB more VRAM{on8 or '; no long prompt run'})" if c > 32768 else ""
+            note = f"   (recommended{on8})" if c == default_ctx else \
+                f"   ({(c - default_ctx) * row / 1e9:.1f} GB more VRAM{on8 or '; no long prompt run'})" if c > default_ctx else ""
             say(f"  {i}) {c // 1024}K tokens{note}")
         ctx = POLY_CONTEXTS[int(ask("Context?", [str(i) for i in range(1, len(POLY_CONTEXTS) + 1)],
-                                   str(POLY_CONTEXTS.index(32768) + 1), a.yes)) - 1]
+                                   str(POLY_CONTEXTS.index(default_ctx) + 1), a.yes)) - 1]
     ok(f"context: {ctx} tokens")
 
     # the conversation cache: asked once, then kept as the model's run config has it
     cfg_path = ROOT / f"strata-{tag.lower()}.json"
     # the attention caches' format (issue 183): --kv when this model has that one, else what its run config had;
     # --kv fp16 goes back to the default
-    kv = a.kv or poly_saved_kv([cfg_path, adopted if adopted is not None and adopted.name == cfg_path.name else None])
+    kv = a.kv or poly_saved_kv([cfg_path, adopted if adopted is not None and adopted.name == cfg_path.name else None]) or fam.get("default_kv")
     if family not in POLY_KV.get(kv, ()):
         kv = None
     conv = poly_saved_conv([cfg_path, adopted if adopted is not None and adopted.name == cfg_path.name else None])
@@ -7169,7 +7202,7 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
                 ok(f"{s.name} already downloaded")
                 continue
             rel = s.relative_to(models_dir).as_posix() if s.is_relative_to(models_dir) else s.name
-            download(d.get("hf", fam["hf"]) + rel, s)
+            download(d.get("hf", fam["hf"]) + d.get("remote_file", rel), s)
     check_shards(shards)
     # a size from another repository can ship a draft model or an image encoder of the family's file names
     sha = {**fam["sha256"], **d.get("sha256", {})}
