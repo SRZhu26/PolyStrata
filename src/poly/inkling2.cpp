@@ -8,6 +8,7 @@
 // residuals, and fused NVFP4 ffn_gate_up_exps with situ softcaps) are stubbed for bringup on a CUDA/HIP machine.
 #include "inkling2.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -108,18 +109,16 @@ void Inkling2::load_geometry() {
         for (int il = core_start_; il < core_end_; ++il) push(il, p);
     for (int il = core_end_; il < n_layer_; ++il) push(il, 0);
 
-    keep_ = window_;
-    ring_ = window_ + rows_;
-
+    // Note: rows_ (prompt batch size) is not settled until after load_geometry() (Engine::load() sets it before
+    // alloc_caches()).  Size ring_ and keep_ in alloc_caches(), matching Flint::alloc_caches().
     const bool use_q8 = opt_.kv_format == KvFmt::kQ8_0;
     const size_t side = kv_row_bytes_for(n_kv_, head_dim_, use_q8);
     const size_t global_tok = (size_t) n_global_steps_ * 2 * side;
-    const size_t swa_ring = (size_t) n_local_steps_ * (size_t) ring_ * 2 * side;
     std::fprintf(stderr,
                  "strata-poly: inkling2_loop: %d physical -> %zu logical layers (%d global, %d SWA=%d), "
-                 "%s KV: %zu B/row (%zu B/tok global, %.1f MiB SWA rings)\n",
+                 "%s KV: %zu B/row (%zu B/tok global)\n",
                  n_layer_, steps_.size(), n_global_steps_, n_local_steps_, window_,
-                 use_q8 ? "q8_0" : "fp16", side, global_tok, (double) swa_ring / (1024.0 * 1024.0));
+                 use_q8 ? "q8_0" : "fp16", side, global_tok);
 }
 
 size_t Inkling2::card_row_bytes() const {
@@ -129,7 +128,8 @@ size_t Inkling2::card_row_bytes() const {
 
 size_t Inkling2::extra_bytes() const {
     const bool use_q8 = opt_.kv_format == KvFmt::kQ8_0;
-    return (size_t) n_local_steps_ * (size_t) keep_ * 2 * kv_row_bytes_for(n_kv_, head_dim_, use_q8);
+    const int k = keep_ > 0 ? keep_ : std::min(window_, opt_.max_context);
+    return (size_t) n_local_steps_ * (size_t) k * 2 * kv_row_bytes_for(n_kv_, head_dim_, use_q8);
 }
 
 void Inkling2::load_layer(int il) {
@@ -137,7 +137,11 @@ void Inkling2::load_layer(int il) {
     not_yet_implemented("Inkling2::load_layer()");
 }
 
-void Inkling2::alloc_caches() { not_yet_implemented("Inkling2::alloc_caches()"); }
+void Inkling2::alloc_caches() {
+    ring_ = std::min(opt_.max_context, window_ + rows_);
+    keep_ = std::min(window_, ring_);
+    not_yet_implemented("Inkling2::alloc_caches()");
+}
 void Inkling2::assign_scratch() { not_yet_implemented("Inkling2::assign_scratch()"); }
 
 void Inkling2::layer_head(Layer& L, int il, int n) {

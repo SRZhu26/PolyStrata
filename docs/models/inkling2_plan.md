@@ -11,7 +11,7 @@ Branch: `fork/add-inkling2-mini` (never push directly to `origin/main`).
 ## 1. Verified Model & GGUF Ground Truth
 
 Extracted directly from the live GGUF headers of `unsloth/Inkling-2-Mini-GGUF` at pinned revision
-`ea0c79b2ecd73669e774c8519b79bfabfddbc027` (`Mainline_Support` layout, matching `ggml-org/llama.cpp` PR `#32694`):
+`ea0c79b2ecd73669e774c8519b79bfabfddbc027` (`Mainline_Support` layout, matching merged `ggml-org/llama.cpp` PR `#32694`):
 
 ### 1.1 Pinned Files & Exact Sizes
 
@@ -54,7 +54,7 @@ Extracted directly from the live GGUF headers of `unsloth/Inkling-2-Mini-GGUF` a
 | `inkling2_loop.expert_weights_scale` | `8.0` | Router weight scale |
 | `inkling2_loop.activation.situ_beta` / `situ_linear_beta` | `4.0` / `25.0` | MoE gate/up softcap betas |
 | `inkling2_loop.final_logit_softcapping` | `30.0` | Final logits softcap (`30 * tanh(x / 30)`) |
-| `general.sampling.*` | `temp=1.0, top_p=1.0, top_k=0, min_p=0.0` | Recommended sampling defaults |
+| `general.sampling.*` | `temp=1.0, top_p=1.0, top_k=0, min_p=0.0` | Recommended interactive sampling defaults |
 
 ### 1.3 Complete GGUF Tensor Inventory (744 Tensors)
 
@@ -90,7 +90,7 @@ Extracted directly from the live GGUF headers of `unsloth/Inkling-2-Mini-GGUF` a
 
 ---
 
-## 2. KV Cache & 32 GB RAM / 8 GB VRAM Sizing
+## 2. KV Cache, Memory Budget & Realistic RTX 5060 Expectations
 
 Unrolled 48 logical steps = **8 global** (`blk.5` ×1, `blk.11` ×3, `blk.17` ×3, `blk.23` ×1) + **40 local SWA** (`window = 1024`).
 
@@ -103,120 +103,185 @@ Unrolled 48 logical steps = **8 global** (`blk.5` ×1, `blk.11` ×3, `blk.17` ×
 
 | Context | FP16 KV Total | Q8_0 KV Total | Est. VRAM Left for Experts on 8 GB Card (Q8_0) | Notes |
 | --- | ---: | ---: | ---: | --- |
-| 32K | 1.31 GiB | 0.70 GiB | ~3.7 GiB | Fastest decode |
-| 64K | 2.31 GiB | 1.23 GiB | ~3.2 GiB | Great speed + context balance |
-| **128K (default)** | 4.31 GiB | **2.29 GiB** | **~2.1 GiB** | **Default for 32 GB RAM / 8 GB VRAM** |
+| 32K | 1.31 GiB | 0.70 GiB | ~3.7 GiB (~25% of experts) | Benchmark first |
+| 64K | 2.31 GiB | 1.23 GiB | ~3.2 GiB (~22% of experts) | Benchmark second |
+| **128K (default)** | 4.31 GiB | **2.29 GiB** | **~2.1 GiB (~14% of experts)** | Keep as default only if measured decode speed holds up |
 | 192K | 6.31 GiB | 3.35 GiB | ~1.0 GiB | Tight expert cache |
 | 256K | 8.31 GiB | 4.42 GiB | ~0 GiB | Full CPU expert offload |
 
+### Realistic Speed Expectations (Not Yet Measured)
+Each decode token evaluates **384 experts** (48 logical steps × top-8 experts ≈ ~2 GB of expert weights). At 128K on
+an 8 GB card, only ~2.1 GiB (~14% of the 14.78 GB experts) fits in VRAM, so most expert reads come from system RAM
+(estimated ~10–20 tok/s decode once working, unmeasured). **Measure 32K and 64K first**, then 128K; keep 128K as
+`setup.py`'s default only if measured speed at 128K is acceptable on the RTX 5060 Laptop.
+
 ---
 
-## 3. Phased Implementation & Optimization Plan
+## 3. Required Shared-Engine Changes (`src/poly/engine.cpp`)
 
-Follow strict order: **Reference Oracle → Exact Unfused Forward → Offload/NVFP4 → Kernel Fusion & Graphs → DSpark/Vision → HIP/CUDA Parity**. Never fuse or optimize before Stage 1 & Stage 2 parity pass.
+Before implementing `Inkling2`'s forward kernels, two shared-engine items must be in place:
 
-### Phase 0 — Baseline Oracle on RTX 5060 Laptop
+1. **Joined `ffn_gate_up_exps.scale` support** (**already applied** in `src/poly/engine.cpp:1622-1639`):
+   - Previously `engine.cpp` threw `"NVFP4 scales of a joined gate and up are not supported"`.
+   - It now uploads `ffn_gate_up_exps.scale` (F32 `[n_expert_]`) once and binds the same `Dev` pointer/host vector
+     to both `L.s_gate`/`L.h_s_gate` and `L.s_up`/`L.h_s_up`. Models without `ffn_gate_up_exps.scale` take the
+     unchanged `ffn_gate_exps.scale` / `ffn_up_exps.scale` path.
+
+2. **Logical-to-physical layer schedule in `Engine::run()`** (`src/poly/engine.cpp:4969-5000`, **to implement in Phase 1**):
+   - `Engine` currently loops `for (int il = lo_; il < hi_; ++il)` over `layers_`, where each `Layer` owns its
+     VRAM expert cache (`L.slot`), NVFP4 scales (`s_gate`/`s_up`/`s_down`), and CUDA graph handles.
+   - **Do NOT duplicate `Layer` 48 times** — that would triple the core layers' VRAM expert cache or risk dropping
+     scales on passes 2 & 3.
+   - **Design**:
+     - Keep **24 physical `Layer` entries** (`layers_[0..23]`) so each physical layer has **one** VRAM expert-slot
+       pool and **one** set of NVFP4 scales shared across all 3 passes.
+     - Add two virtuals on `Engine` (defaulting to identity so every existing model is 100% untouched/byte-identical):
+       - `virtual int n_steps() const { return hi_ - lo_; }`
+       - `virtual int step_phys(int s) const { return lo_ + s; }`
+     - In `Inkling2`, `n_steps()` returns `48` and `step_phys(s)` returns `steps_[s].phys` (`0..5`, `6..17` ×3, `18..23`).
+     - In `Engine::run()`, loop `for (int s = 0; s < n_steps(); ++s)` with `int phys = step_phys(s); Layer& L = layers_[phys];`:
+       - Pass `s` (logical step `0..47`) to `layer_head(L, s, n)` and `layer_tail(L, s, n)` so `Inkling2` indexes its
+         own per-step KV cache (`kv_slots_[s]`) and loop pass (`steps_[s].pass`).
+       - Pass `phys` (physical layer `0..23`) and `L` to `moe()`, `moe_card()`, and `moe_rows()` so all 3 core passes
+         share the same physical expert cache and NVFP4 scales.
+       - Key per-step CUDA graph caches (`heads`, `tails`) by logical step `s` (not `phys`) so step 6 (pass 0),
+         step 18 (pass 1), and step 30 (pass 2) each record their own KV buffer pointers.
+
+---
+
+## 4. Phased Implementation & Optimization Plan
+
+Follow strict order: **Reference Oracle → Exact Unfused Forward → Offload/NVFP4 → Kernel Fusion & Graphs → Vision → Compile/Regression Checks**. Never fuse or optimize before Stage 1 & Stage 2 parity pass.
+
+### Phase 0 — Reference Oracle on RTX 5060 Laptop
 1. Install Visual Studio Build Tools (C++), CUDA Toolkit (12.8 or 13.0), and CMake.
-2. Pull this branch and download the model (`UD-Q4_K_M` or `UD-Q4_K_XL`):
+2. Pull this branch and download the model (`UD-Q4_K_XL` recommended first since its experts are pure `NVFP4`/`Q8_0`):
    ```powershell
    git fetch fork
    git checkout add-inkling2-mini
    python setup.py --family inkling2 --model UD-Q4_K_XL --vision no --yes --no-start
    ```
-3. Build mainline `llama.cpp` with PR `#32704`:
+3. Build mainline `llama.cpp` pinned to PR `#32704` commit **`2a28df0f9bd55c4975b6bffb35229a6020720f13`**
+   *(PR `#32704` is open as of 2026-11-21; pinning this commit keeps the reference reproducible)*:
    ```powershell
    git clone https://github.com/ggml-org/llama.cpp
    cd llama.cpp
    git fetch origin pull/32704/head:inkling2-loop-fix
-   git checkout inkling2-loop-fix
+   git checkout 2a28df0f9bd55c4975b6bffb35229a6020720f13
    cmake -B build -DGGML_CUDA=ON
-   cmake --build build --config Release -j --target llama-cli llama-server
+   cmake --build build --config Release -j --target llama-cli llama-server llama-eval-callback
    ```
-4. Record baseline speed/VRAM/RAM at 128K + `-ctk q8_0 -ctv q8_0` and save greedy (`--temp 0`) outputs on 5–10 fixed prompts (short factual, coding, and prefixes of a 3,740-token prompt) as the exact parity oracle.
+4. **Never run `-ngl 99` alone on an 8 GB VRAM card** — a 17.6 GB model will silently spill into Windows shared GPU
+   memory and invalidate the baseline. Offload routed experts to CPU (`-ot "exps=CPU"` or tune `--n-cpu-moe N`):
+   ```powershell
+   # Greedy parity reference (--temp 0 --seed 42):
+   .\build\bin\Release\llama-cli.exe `
+     -m ..\models\inkling2-ud-q4_k_xl\Inkling-2-Mini-UD-Q4_K_XL.gguf `
+     --jinja -ngl 99 -ot "exps=CPU" -c 32768 -ctk q8_0 -ctv q8_0 `
+     --temp 0 --seed 42 -n 128 -p "Explain quicksort in three sentences."
+
+   # Interactive / server baseline (recommended sampling):
+   .\build\bin\Release\llama-server.exe `
+     -m ..\models\inkling2-ud-q4_k_xl\Inkling-2-Mini-UD-Q4_K_XL.gguf `
+     --jinja -ngl 99 -ot "exps=CPU" -c 65536 -ctk q8_0 -ctv q8_0 `
+     --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0.0 --port 8001
+   ```
+5. Save greedy reference outputs on 5–10 fixed prompts (short factual, coding, and prefixes of a 3,740-token prompt)
+   plus `llama-eval-callback` tensor dumps for Stage 1.
 
 ### Phase 1 — Exact Unfused Forward Pass (`src/poly/inkling2.cpp`)
-Reference templates already in this repo:
-- `src/poly/flint.cpp`: hybrid SWA ring buffers + global KV + Q8_0 KV + `save_layer()` / `load_extra()`.
-- `src/poly/lfm2moe.cpp`: causal shortconv (`l_cache = 4`) state handling.
-- `src/poly/mmq_nvfp4.cu` & `src/poly/engine.cpp`: NVFP4 global-scale binding (`*.scale` tensors).
-- Reference math: `ggml-org/llama.cpp` PR `#32694` (`src/models/inkling2.cpp`) + PR `#32704`.
+- **Math reference**: Port every formula **directly from `ggml-org/llama.cpp`'s `src/models/inkling2.cpp`** at commit
+  `2a28df0f9bd55c4975b6bffb35229a6020720f13` (relative-position attention, QK/rel L2 clip, log-scaling, value norm
+  without gamma, shortconv `k=4`, `attn_k_conv_proj` on global layers, rank-64 loop gates, block-6 attention
+  residuals, router + `exp_probs_b.bias`, situ softcaps `4.0`/`25.0`, and `final_logit_softcapping = 30.0`).
+- **PolyStrata code templates**:
+  - `src/poly/flint.cpp`: hybrid SWA ring buffers (`ring_ = std::min(opt_.max_context, window_ + rows_)` inside
+    `alloc_caches()`, **never** `load_geometry()`), Q8_0 KV, `save_layer()` / `load_extra()`.
+  - `src/poly/lfm2moe.cpp`: causal shortconv (`l_cache = 4`) state management.
+  - `src/poly/engine.cpp`: logical/physical step schedule (Section 3.2) and `ffn_gate_up_exps.scale` (already done).
+- **Keep every kernel simple and FP32-accumulated** in Phase 1; do not enable Blackwell FP4×FP4 activation
+  quantization or kernel fusion until Stage 1 & Stage 2 pass.
 
-Implementation steps:
-1. **`Inkling2::load_layer()`**:
-   - Upload all non-expert tensors listed in Section 1.3 into per-physical-layer `Block` structs (`24` blocks).
-   - Register fused `ffn_gate_up_exps.{weight,scale}` and `ffn_down_exps.{weight,scale}` with `Engine`'s expert store.
-   - Note: `Engine` currently expects separate `ffn_gate_exps` and `ffn_up_exps` for some architectures; add a clean fused-`gate_up` path (or split view at expert-upload time) that preserves per-expert `.scale` on all 3 passes.
-2. **`Inkling2::alloc_caches()` & `assign_scratch()`**:
-   - Allocate **48 logical KV slots** (indexed by `step` in `0..47`): 8 global (`kv_alloc`, grows dynamically with `cover()`) + 40 SWA (`seq_alloc`, fixed `window_ + rows_` ring).
-   - Allocate per-step shortconv state (`4 × 1024` for K/V + `4 × 2304` for attn/ffn post-conv) and block-6 Attention Residual history buffer.
-3. **Unfused CUDA/HIP kernels in `src/poly/kernels.cu`** (simple, FP32-accumulated first):
-   - Causal shortconv (`k=4`), QK/rel L2 clipping (`22.6274` / `8.0`), value norm without gamma.
-   - Relative-position attention (`d_rel=16`, `rel_extent=1024`) + log-scaling (`n_floor=8192`, `alpha=0.1`) + learned sink (`attn_sink_proj`), for FP16 first, then Q8_0 KV.
-   - Rank-64 loop-controller gates (`loop_{q,k,v,ffn}_ctrl_{down,forget,gain}` + `loop_msg_query`) and block-6 Attention Residuals (normalized values).
-   - Router (`route_scale=8.0`, `exp_probs_b.bias`, top-8/128), situ softcap activation (`4.0` / `25.0`), and final logit softcap (`30.0`).
-4. **Loop unrolling inside `Engine`**:
-   - Either drive the 48-step schedule directly via `steps_` (mapping logical step `s -> phys = steps_[s].phys`) while sharing the 24 physical weight sets and 24 expert-cache pools.
-
-### Phase 2 — Memory Placement & Offload Optimization (3–5× Win on 8 GB VRAM)
-1. **Enable `--kv q8_0`**: Cuts 128K KV from 4.31 GiB → 2.29 GiB, returning ~2.0 GiB VRAM directly to the expert cache.
-2. **Loop-core-weighted VRAM LRU expert cache**:
-   - In `Engine`'s expert cache scoring, weight experts in core layers `6..17` by `loop_count_` (**3×**), since each cached core expert serves 3 passes per token instead of 1.
-3. **Native NVFP4 execution on Blackwell (`sm_120`)**:
-   - Route `UD-Q4_K_XL` / `UD-Q4_K_M` NVFP4 experts through `src/poly/mmq_nvfp4.cu` (FP4×FP4 tensor-core prefill) and `iq_mmvq` (`src/kernels/cuda/native_mmvq.cu`) for decode — zero FP16 dequantization buffers in VRAM.
-4. **Profile with Nsight Systems (`nsys`)**: Capture 10 decode steps + 1 prefill batch to rank actual bottlenecks before fusing kernels.
+### Phase 2 — Memory Placement & Offload Optimization
+1. **Enable `--kv q8_0`**: Verify 2.29 GiB total KV at 128K (vs 4.31 GiB FP16).
+2. **Loop-core-weighted VRAM LRU expert cache**: Weight hits on core layers `6..17` by `loop_count_` (**3×**) so
+   hot core experts stay pinned in VRAM over prelude/epilogue experts.
+3. **Native NVFP4 execution on Blackwell (`sm_120`)**: Enable `src/poly/mmq_nvfp4.cu` FP4×FP4 prefill and `iq_mmvq`
+   (`src/kernels/cuda/native_mmvq.cu`) decode, then re-verify Stage 2 greedy parity.
+4. **Profile with Nsight Systems (`nsys`)**: Capture 10 decode steps + 1 prefill batch at 32K, 64K, and 128K before
+   writing fused kernels.
 
 ### Phase 3 — Kernel Fusion & CUDA Graphs
-Apply one fusion at a time, re-running Stage 2 greedy parity after **each** change:
-1. **Attention prep fusion**: Fuse `shortconv (k=4)` + `QK/rel L2 clip` + `value norm` + `Q8_0 KV quantize-and-store` (cuts 6–8 launches/layer down to 1–2).
-2. **Flash-decode fusion**: Fold `relative-position bias (d_rel=16)` + `log-scaling` + `learned sink` directly into the decode attention kernel (single VRAM pass over K/V).
+Apply one fusion at a time, re-running Stage 2 greedy parity after **each** fusion:
+1. **Attention prep fusion**: Fuse `shortconv (k=4)` + `QK/rel L2 clip` + `value norm` + `Q8_0 KV quantize-and-store`.
+2. **Flash-decode fusion**: Fold `relative-position bias (d_rel=16)` + `log-scaling` + `learned sink` into a single
+   decode attention kernel (1 VRAM pass over K/V).
 3. **Residual & loop-gate fusion**: Fuse `rank-64 loop gate` + `attention residual (block 6)` + `post-conv` + `RMSNorm`.
-4. **MoE activation fusion**: Since `ffn_gate_up_exps` is already fused in the GGUF, fuse `situ softcap (4.0/25.0)` + activation + input quantization for `ffn_down_exps` in registers.
-5. **CUDA Graph capture**: Set `L.fixed = true` so `Engine::passes_` / `tail_` replays all 48 logical steps with minimal CPU launch overhead.
+4. **MoE activation fusion**: Fuse `situ softcap (4.0/25.0)` + activation + input quantization for `ffn_down_exps` in
+   registers.
+5. **CUDA Graph capture**: Set `L.fixed = true` so `Engine::passes_` / `tail_` replays all 48 logical steps with
+   minimal CPU launch overhead.
 
-### Phase 4 — DSpark Speculative Decoding & Vision
-1. **DSpark drafter** (`dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB): Implement the 3-layer Markov/RNN-hidden drafter (`mtp_config`: `block_size=8`, `markov_rank=256`, `target_layer_ids=[5, 23, 41, 48]`) via `Engine::draft_step()`.
-2. **Vision**: Validate `mmproj-BF16.gguf` through `strata-vision` on image prompts.
+### Phase 4 — Vision & Deferred Follow-Ups
+- **Vision**: Verify `mmproj-BF16.gguf` through `strata-vision` on image prompts.
+- **DSpark speculative decoding (`dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB)**: **Deferred to a separate follow-up
+  branch/PR** — the drafter file is not pinned yet and its 3-layer Markov/RNN-hidden architecture (`mtp_config`) has
+  no existing `draft_step()` path in `Engine`.
 
-### Phase 5 — Cross-Backend & Upstream Hygiene
-- Build and verify **both CUDA and HIP** (`AGENTS.md`).
-- Confirm all existing models remain byte-identical on default paths.
-- Record measured RTX 5060 Laptop numbers in `docs/models/inkling2.md` and `bench/results/`.
+### Phase 5 — Cross-Backend Compile Check & Regression Hygiene
+- **HIP**: Compile-only check on the Windows NVIDIA laptop if ROCm/HIP SDK is installed (runtime HIP validation
+  requires AMD hardware or CI; document what was and was not tested per `AGENTS.md`).
+- Confirm all existing models (`qwen35moe`/Groot, `flint`, `gemma4`, `lfm2moe`) remain byte-identical on default paths.
+- Record measured RTX 5060 Laptop numbers (32K, 64K, 128K) in `docs/models/inkling2.md` and `bench/results/`.
 
 ---
 
-## 4. 4-Stage Verification & Test Plan (Run on RTX 5060 Laptop)
+## 5. 4-Stage Verification & Test Plan (Run on RTX 5060 Laptop)
 
-### Stage 1 — Layer-by-Layer Tensor Parity (Bringup)
-- Dump hidden states on a 1-token and 16-token prompt after:
-  - `blk.0` (SWA + shortconv + situ MoE)
-  - `blk.5` (1st global attention + `attn_k_conv_proj`)
-  - `blk.6` **pass 1, pass 2, pass 3** (verifies loop gates, attention residuals, and per-pass NVFP4 scales!)
-  - `blk.23` and final logits (`final_logit_softcapping = 30.0`)
-- **Pass criteria**: Cosine similarity `>= 0.9999` vs `llama.cpp` (+ `#32704`) at every checkpoint; zero NaN/Inf.
+### Stage 1 — Layer-by-Layer Tensor Parity (Unfused, Non-FP4×FP4 Path)
+- **Requirement**: Run **without** Blackwell FP4×FP4 activation quantization (activation quantization introduces noise
+  that will falsely fail a 0.9999 cosine threshold).
+- **How to dump hidden states**:
+  - `llama.cpp` side: run `llama-eval-callback` (built in Phase 0) on a 1-token and 16-token prompt to dump tensors
+    after `blk.0`, `blk.5` (1st global), `blk.6` **pass 1, pass 2, pass 3**, `blk.23`, and final logits.
+  - `strata-poly` side: add a temporary opt-in `STRATA_INKLING2_DUMP=1` `cudaMemcpy` hook at the end of
+    `Inkling2::layer_tail()` (removed before PR) dumping the same checkpoints to `.bin` files.
+- **Pass criteria**: Cosine similarity `>= 0.9999` at every checkpoint; zero NaN/Inf; pass 2 & pass 3 match pass 1
+  accuracy (confirms per-expert NVFP4 scales stay bound).
 
 ### Stage 2 — Greedy Token-by-Token Parity
-- Run with `temperature = 0`, `--no-draft` on both `UD-Q4_K_M` and `UD-Q4_K_XL`:
-  - 5 short factual/coding prompts (must match `llama.cpp` token-for-token).
-  - Prefixes of a 3,740-token prompt (100, 600, 1500, 3740 tokens — same method as Flint commit `5ff592f1`; any divergence must only occur where top-2 logits are within ~0.5 log-prob).
+- Run with `temperature = 0`, `--no-draft` on both `UD-Q4_K_M` and `UD-Q4_K_XL` against `llama.cpp` (`2a28df0f9b`):
+  - 5 short factual/coding prompts + prefixes of a 3,740-token prompt (100, 600, 1500, 3740 tokens — same method as
+    Flint commit `5ff592f1`).
+- **Pass criteria**: Exact token match on short and long prompts, **or** any first divergence occurs only where
+  `llama.cpp`'s top-2 logits are within ~0.5 log-prob (verify by printing top-3 logits at the diverging step).
 
-### Stage 3 — Q8_0 KV & Long-Context Verification
+### Stage 3 — Q8_0 KV & Long-Context Needle Verification
 ```powershell
-# 1. FP16 vs Q8_0 KV agreement:
-python tools/kv_agree.py ...
+# 1. Teacher-forced FP16 vs Q8_0 KV agreement:
+python tools/kv_agree.py `
+  --model models/inkling2-ud-q4_k_xl/Inkling-2-Mini-UD-Q4_K_XL.gguf `
+  --bin build/Release/strata-poly.exe `
+  --ref fp16 --kv q8_0 --prompts 5 --max-new 128 --max-context 2048 --min-agree 0.97
 
-# 2. Needle recall at 32K, 64K, and 128K (verifies SWA ring wraparound >1024 and log-scaling >8192):
-python tools/needle_bench.py --context 32768
-python tools/needle_bench.py --context 65536
-python tools/needle_bench.py --context 131072
+# 2. Needle recall at 32K, 64K, and 128K (requires running PolyStrata server on :8080):
+python tools/needle_bench.py `
+  --url http://127.0.0.1:8080 `
+  --lengths 32k,64k,128k --depths 10,50,90 `
+  --out bench/inkling2_needle.json
 ```
-- **Pass criteria**: Teacher-forced FP16/Q8_0 agreement `>= 97%`; 100% needle recall at 32K, 64K, and 128K.
+- **Pass criteria**: FP16/Q8_0 agreement `>= 97%`; 100% needle recall at 32K, 64K, and 128K (confirms SWA ring
+  wraparound past 1,024 tokens and log-scaling past 8,192 tokens).
 
 ### Stage 4 — Same-Day A/B Benchmark & Regression Suite
 ```powershell
-# Same-day A/B speed & memory vs llama.cpp at 128K + Q8_0 KV:
-python bench/bench_vs_llama.py ...
+# 1. Generate prompts and run same-day A/B comparison against llama.cpp (measure 32K, 64K, then 128K):
+python bench/bench_vs_llama.py prompts --out bench/inkling2_vs_llama --tokenizer models/inkling2-ud-q4_k_xl
+python bench/bench_vs_llama.py run --out bench/inkling2_vs_llama --machine rtx5060-laptop --configs bench/inkling2_configs.json --rounds 1
+python bench/bench_vs_llama.py summary --out bench/inkling2_vs_llama
 
-# Offline setup & server unit tests:
+# 2. Offline setup, server, and MCP unit tests:
+$env:PYTHONPATH="."
 python tools/test_setup_inkling2.py
 python tools/test_setup_groot.py
 python tools/test_setup_menu.py
@@ -225,14 +290,18 @@ python tools/test_setup_pins.py
 python serve/test_models.py
 python tools/test_strata_mcp.py
 ```
-- **Pass criteria**: Faster than `llama.cpp` on 8 GB VRAM / 32 GB RAM offload; peak VRAM `<= 7.5 GiB`, peak RAM `<= 26 GiB`; all unit tests pass; existing `groot` (`qwen35moe`) greedy output unchanged.
+- **Pass criteria**: Peak VRAM `<= 7.5 GiB`, peak RAM `<= 26 GiB`; all unit tests pass; existing `groot`
+  (`qwen35moe`) greedy output unchanged.
 
 ---
 
-## 5. GPU Portability Notes (One GPU vs All GPUs)
+## 6. GPU Portability Notes (One GPU vs All GPUs)
 
 - **~80–90% of speedups transfer automatically to all GPUs (NVIDIA RTX 20–50 & AMD HIP)**:
-  - Q8_0 KV cache, SWA ring buffers, 3× loop-core-weighted VRAM LRU expert cache, kernel fusion (fewer VRAM round-trips and launches across 48 logical layers), CUDA/HIP Graph capture, and DSpark speculative decoding.
+  - Q8_0 KV cache, SWA ring buffers, 3× loop-core-weighted VRAM LRU expert cache, kernel fusion (fewer VRAM
+    round-trips and launches across 48 logical layers), and CUDA/HIP Graph capture.
 - **~10–20% is generation/vendor specific**:
-  - Native **FP4×FP4** tensor-core prefill (`src/poly/mmq_nvfp4.cu`) is Blackwell (`sm_120`, RTX 50) specific; RTX 20/30/40 fall back to their existing MMA/`dp4a` paths automatically.
-  - AMD HIP wavefront (32 vs 64 lanes) and dot-product intrinsics use thin `#if defined(__HIPCC__)` guards inside shared kernel headers.
+  - Native **FP4×FP4** tensor-core prefill (`src/poly/mmq_nvfp4.cu`) is Blackwell (`sm_120`, RTX 50) specific;
+    RTX 20/30/40 fall back to their existing MMA/`dp4a` paths automatically.
+  - AMD HIP wavefront (32 vs 64 lanes) and dot-product intrinsics use thin `#if defined(__HIPCC__)` guards inside
+    shared kernel headers.

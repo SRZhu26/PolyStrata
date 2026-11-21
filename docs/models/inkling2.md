@@ -73,19 +73,28 @@ before hitting the `Inkling2::load_layer()` bringup stub.
 ### 3. Reference run with `llama.cpp` (for greedy parity)
 
 Until the remaining kernels in `src/poly/inkling2.cpp` are filled in, run Inkling-2-Mini with mainline `llama.cpp`
-(including PR `#32704` for per-expert NVFP4 scales on looped passes 2 and 3) at 128K + Q8_0 KV:
+pinned to PR `#32704` commit `2a28df0f9bd55c4975b6bffb35229a6020720f13` (keeps per-expert NVFP4 scales bound on
+looped passes 2 and 3). On an 8 GB VRAM card, offload experts with `-ot "exps=CPU"` (or `--n-cpu-moe N`) rather than
+`-ngl 99` alone, which would silently spill into Windows shared GPU memory:
 
 ```powershell
 git clone https://github.com/ggml-org/llama.cpp
 cd llama.cpp
 git fetch origin pull/32704/head:inkling2-loop-fix
-git checkout inkling2-loop-fix
+git checkout 2a28df0f9bd55c4975b6bffb35229a6020720f13
 cmake -B build -DGGML_CUDA=ON
-cmake --build build --config Release -j --target llama-cli llama-server
+cmake --build build --config Release -j --target llama-cli llama-server llama-eval-callback
 
+# Greedy parity oracle (--temp 0 --seed 42):
+.\build\bin\Release\llama-cli.exe `
+  -m ..\models\inkling2-ud-q4_k_xl\Inkling-2-Mini-UD-Q4_K_XL.gguf `
+  --jinja -ngl 99 -ot "exps=CPU" -c 32768 -ctk q8_0 -ctv q8_0 `
+  --temp 0 --seed 42 -n 128 -p "Explain quicksort in three sentences."
+
+# Interactive server baseline (recommended sampling):
 .\build\bin\Release\llama-server.exe `
-  -m ..\models\inkling2-ud-q4_k_m\Inkling-2-Mini-UD-Q4_K_M.gguf `
-  --jinja -ngl 99 -c 131072 -ctk q8_0 -ctv q8_0 `
+  -m ..\models\inkling2-ud-q4_k_xl\Inkling-2-Mini-UD-Q4_K_XL.gguf `
+  --jinja -ngl 99 -ot "exps=CPU" -c 65536 -ctk q8_0 -ctv q8_0 `
   --temp 1.0 --top-p 1.0 --top-k 0 --min-p 0.0 --port 8001
 ```
 
