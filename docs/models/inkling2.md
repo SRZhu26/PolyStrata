@@ -57,9 +57,9 @@ The architecture is not reachable through the generic engine path, so it has its
 
 | File | Lines | Contents |
 | --- | ---: | --- |
-| `src/poly/inkling2.cpp` | 758 | the `Inkling2` class: 27 hook overrides |
+| `src/poly/inkling2.cpp` | 758 | the `Inkling2` class: 29 hook overrides |
 | `src/poly/inkling2.hpp` | 170 | its interface and capability flags |
-| `src/poly/inkling2_kernels.cu` | 585 | 13 CUDA kernels |
+| `src/poly/inkling2_kernels.cu` | 585 | 12 CUDA kernels |
 | `src/poly/inkling2_test.cu` | 485 | kernel tests against an FP64 reference |
 
 Engine-side integration (`src/poly/engine.cpp`, `engine.hpp`, `kernels.hpp`, `cpu_experts.cpp/hpp`,

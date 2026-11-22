@@ -4,7 +4,13 @@ Self-contained engineering handoff for bringing up, optimizing, and verifying **
 (`general.architecture = "inkling2_loop"`) in PolyStrata's `strata-poly` engine on a **Windows 11 laptop with an
 NVIDIA RTX 5060 Laptop (8 GB VRAM, Blackwell `sm_120`) and 32 GB RAM**.
 
-Branch: `fork/add-inkling2-mini` (never push directly to `origin/main`).
+Branch: `add-inkling2-mini` is the pull-request head and must stay clean; the engine work and these adjustments
+live on `inkling2-engine-local` (never push directly to `origin/main`).
+
+> **Read [inkling2_progress.md](inkling2_progress.md) first.** It records what has actually been built and measured, and
+> it supersedes every `llama.cpp` baseline below: mainline `llama.cpp` cannot load this architecture at all, so no
+> `llama.cpp` speed or parity comparison can be run. Phase 0 steps 3–4, Stage 1's reference, Stage 2 and the Stage 4 decode
+> gate have been rewritten accordingly; the FP64 oracle in `tools/ref_core.py` is the reference.
 
 ---
 
@@ -198,37 +204,32 @@ Order to execute: **Phase 0 (Oracle) → Phase 1 (Exact Unfused Forward) → Pha
    ```
    Run a per-layer header audit with `tools/gguf_reader.py` on each downloaded file (recording `gate_up`/`down`
    types, `.scale` min/max values on any non-NVFP4 layers, and attention/head types).
-3. Build mainline `llama.cpp` pinned to PR `#32704` commit **`2a28df0f9bd55c4975b6bffb35229a6020720f13`**
-   *(PR `#32704` is open as of 2026-11-21; if `2a28df0f9b` does not load the file, use Unsloth's prebuilt
-   `b12588-mix-c0c3de8`, the build ninfer-all measured against)*:
+3. **Confirm the `llama.cpp` question once, and record the answer.** Build `b11669` (commit `620d2225c`) and point it at
+   the file:
    ```powershell
-   git clone https://github.com/ggml-org/llama.cpp
-   cd llama.cpp
-   git fetch origin pull/32704/head:inkling2-loop-fix
-   git checkout 2a28df0f9bd55c4975b6bffb35229a6020720f13
-   cmake -B build -DGGML_CUDA=ON
-   cmake --build build --config Release -j --target llama-cli llama-bench llama-server llama-tokenize
+   llama-cli.exe -m ..\models\inkling2-mainline\Inkling-2-Mini-UD-Q4_K_XL.gguf -n 1 -p "hi"
    ```
-4. First confirm the file loads, then measure the speed baseline using **`llama.cpp`'s own memory fitting**
-   (`--fit-target`, no `-ngl`/`-ot` — ninfer-all measured `-ot "exps=CPU"` 2–8× slower):
-   ```powershell
-   # 0. Confirm the pinned build loads the Mainline_Support file:
-   .\build\bin\Release\llama-cli.exe -m ..\models\inkling2-ud-q4_k_xl\Inkling-2-Mini-UD-Q4_K_XL.gguf -n 1 -p "hi"
-
-   # 1. Speed baseline (llama.cpp fits the model to 8 GB itself):
-   .\build\bin\Release\llama-bench.exe -m ..\models\inkling2-ud-q4_k_xl\Inkling-2-Mini-UD-Q4_K_XL.gguf `
-     -fa 1 -ctk q8_0 -ctv q8_0 --fit-target 1024 --fit-ctx 32768 -p 2048 -n 128 -r 3
-
-   # 2. Greedy reference (same fitting, --temp 0):
-   .\build\bin\Release\llama-cli.exe -m ..\models\inkling2-ud-q4_k_xl\Inkling-2-Mini-UD-Q4_K_XL.gguf `
-     --jinja -c 32768 -ctk q8_0 -ctv q8_0 --temp 0 --seed 42 -n 128 -p "Explain quicksort in three sentences."
-   ```
+   It answers `unknown model architecture: 'inkling2_loop'`, and neither `llama-server.exe` nor `llama.dll` contains the
+   string `inkling`. **Mainline `llama.cpp` has no `inkling2` implementation**, so there is no speed baseline and no greedy
+   reference to obtain — porting one would mean writing the same ~2,000 lines, including the nine kernels listed in
+   [inkling2_progress.md](inkling2_progress.md) §3. Do not re-litigate this per session; re-run the command only if a
+   newer `llama.cpp` claims support.
+4. **Use the FP64 oracle as the reference instead.** `tools/ref_core.py` runs the whole model — all 74 stages plus logits —
+   in double precision from the same GGUF, and `tools/ref_prelude.py` is the validated per-stage version. This replaces the
+   `llama-bench` speed baseline and the `llama-cli --temp 0` greedy reference the earlier draft of this plan called for.
+   - Prefill and decode are then measured absolutely (§4 below), not as a ratio.
+   - The `≥ 1.5×` decode gate is replaced by the VRAM, RAM and absolute-throughput gates in Stage 4.
 
 ### Phase 1 — Exact Unfused Forward Pass (`src/poly/inkling2.cpp`)
-- **Math reference**: Port every formula **directly from `ggml-org/llama.cpp`'s `src/models/inkling2.cpp`** at commit
-  `2a28df0f9bd55c4975b6bffb35229a6020720f13` (relative-position attention, QK/rel L2 clip, global-only log-scaling,
-  value norm without gamma, shortconv `k=4`, global K/V conv taps, rank-64 loop gates, block-6 attention residuals,
-  router + `exp_probs_b.bias`, situ softcaps `4.0`/`25.0`, 966-row vocab padding mask, `final_logit_softcapping = 30.0`).
+
+**Status: implemented, not yet verified.** The kernels and overrides exist and produce coherent text; the exit
+criterion (Stage 1 cosine) has not been run. See [inkling2_progress.md](inkling2_progress.md) §3 and §7.
+
+- **Math reference**: the formula list below is the specification (relative-position attention, QK/rel L2 clip,
+  global-only log-scaling, value norm without gamma, shortconv `k=4`, global K/V conv taps, rank-64 loop gates, block-6
+  attention residuals, router + `exp_probs_b.bias`, situ softcaps `4.0`/`25.0`, 966-row vocab padding mask,
+  `final_logit_softcapping = 30.0`). PR `#32704`'s `src/models/inkling2.cpp` remains a cross-check for the formulas, but
+  its build cannot load the file (Phase 0 step 3), so it cannot be used as an executable reference.
 - **PolyStrata code templates**:
   - `src/poly/flint.cpp`: hybrid SWA ring buffers (`ring_ = std::min(opt_.max_context, window_ + rows_)` inside
     `alloc_caches()`, **never** `load_geometry()`), Q8_0 KV, `save_layer()` / `load_extra()`.
@@ -236,10 +237,27 @@ Order to execute: **Phase 0 (Oracle) → Phase 1 (Exact Unfused Forward) → Pha
 - **Keep every kernel simple and FP32-accumulated** in Phase 1; do not enable Blackwell FP4×FP4 activation
   quantization or kernel fusion until Stage 1 & Stage 2 pass.
 
+### Phase 1a — Defects found during bringup (close before Phase 2)
+
+These were not in the original plan; they are now the gating work. Detail in
+[inkling2_progress.md](inkling2_progress.md) §8.
+
+1. **Intermittent long-context corruption** — ~2 of 3 prefills near 10,900 tokens degenerate into a repetition loop,
+   while the same binary on the same prompt sometimes stays coherent. A race, proven by a coherent 10,890 vs a degenerate
+   10,898. Suspects left: `moe_rows()`'s `kStageRows = 32` staging and `copy_seq()`'s per-chunk recurrent state.
+2. **Depth-attention bank leak** — the 6th sequential request dies with `bank is full (5 of 5 at step 42)`; one state leaks
+   per request against `max_states_ = 5`.
+3. **CUDA-graph invalidation gap** — `shrink_cache()` / `resize_card_cache()` move experts between slots without
+   invalidating graphs except under `STRATA_GPU_METAL`. Latent while `L.card == 1` is false.
+4. **Run the end-to-end cosine gate** — `STRATA_DUMP_BIN` + `tools/dump_cos.py` vs `tools/ref_core.py` at `blk.6`,
+   `blk.23` and the logits. Kernel parity (`poly_inkling2_test`, 17 checks) is not a substitute.
+5. **Redefine the speed gate** — the `llama.cpp` ratio is undefined; use the absolute floors in Stage 4.
+
 ### Phase 1b — Tokenizer, Chat Template & Server (Required Before Stages 3 & 4)
 1. Read `tokenizer.ggml.pre` from the GGUF. If its pre-tokenizer pattern is not already in `strata_tokenizer.py`,
    add it to `PRE_PATTERNS`.
-2. Encode 20 mixed strings (code, CJK, emoji, numbers) and compare token IDs byte-for-byte against `llama-tokenize`.
+2. Encode 20 mixed strings (code, CJK, emoji, numbers) and compare token IDs byte-for-byte against the Hugging Face
+   tokenizer for this model. *(Not against `llama-tokenize`: that build cannot load the file — Phase 0 step 3.)*
 3. Server (`serve/`): wire the GGUF chat template, expose `<|content_thinking|>` blocks as `reasoning_content`, and
    parse `<|content_invoke_tool_json|>` blocks into OpenAI `tool_calls`. Add unit tests in `serve/test_models.py`.
 
@@ -284,25 +302,36 @@ Because `src/poly/engine.hpp` and `src/poly/engine.cpp` touch shared code, befor
 ## 5. 4-Stage Verification & Test Plan (Run on RTX 5060 Laptop)
 
 ### Stage 1 — FP64 Reference Parity & NLL Check (Unfused, Non-FP4×FP4 Path)
-- **Reference**: Use ninfer-all's Apache-2.0 FP64 reference (`tools/reference/inkling2.py`; check its CLI flags first),
-  which runs the model in FP64 over the exact decoded GGUF blocks.
+
+**Status: the cosine half of this stage is unrun; the kernel half already passes.** `poly_inkling2_test` compares each
+kernel against an FP64 reference of the same graph and its 17 checks pass, but that is not the assembled-model check below.
+
+- **Reference**: `tools/ref_core.py`, this repository's own FP64 reference, which runs all 74 stages plus logits over the
+  exact decoded GGUF blocks. `tools/ref_prelude.py` is the validated per-stage version and `tools/ref_blk0.py` /
+  `tools/ref_expert.py` are narrower ones. *(The earlier draft named ninfer-all's `tools/reference/inkling2.py`; that file is
+  not in this repository.)*
 - **Per-visit check** (add a temporary `STRATA_INKLING2_DUMP=1` `cudaMemcpy` hook at the end of `Inkling2::layer_tail()`):
   - Cosine similarity **`>= 0.999`** vs FP64 after `blk.0`, `blk.5`, `blk.6` on **passes 1, 2, and 3**, `blk.23`, and
     the final logits.
   - Zero NaN/Inf; passes 2 and 3 no worse than pass 1 (confirms per-expert NVFP4 scales stay bound).
 - **NLL / perplexity check**:
   - Mean NLL within **0.1%** of FP64 on ~1,150 WikiText tokens (past the 1,024 SWA window).
-  - Within **0.1%** of `llama.cpp`'s perplexity at `--context 4096`.
   - One run past **8,192 tokens** to exercise global-layer log-scaling.
-  - *(Calibration reference: ninfer-all measured `+0.03%` vs FP64 and `-0.06%` vs `llama.cpp`.)*
+  - *(Calibration reference: ninfer-all measured `+0.03%` vs FP64. There is no `llama.cpp` perplexity to compare
+    against, so the earlier `-0.06%` target is dropped.)*
 
-### Stage 2 — Per-Quant Greedy Token Parity & NLL vs `llama.cpp`
+### Stage 2 — Per-Quant Greedy Token Parity & NLL vs FP64
+
+There is no `llama.cpp` to compare against on the same file (see Phase 0 step 3), so parity is measured against the
+oracle and across quants instead:
+
 - Run with `temperature = 0`, `--no-draft` on each target quant (`UD-Q4_K_XL`, `UD-IQ4_XS`, `UD-Q3_K_XL`, optional
-  `UD-IQ3_XXS`) against `llama.cpp` (`2a28df0f9b` or `b12588-mix-c0c3de8`) on the **same file**:
-  - Mean NLL within **0.1%** of `llama.cpp` on the same file.
-  - Greedy top-1 agreement with `llama.cpp` of at least **~97%** over 5 × 256 steps (plus exact or near-tie match
+  `UD-IQ3_XXS`) and compare against `tools/ref_core.py` **on the same file**:
+  - Mean NLL within **0.1%** of the FP64 reference on that file.
+  - Greedy top-1 agreement with the FP64 reference of at least **~97%** over 5 × 256 steps (plus exact or near-tie match
     on 5 short prompts and prefixes of a 3,740-token prompt, printing top-3 logits at any first divergence).
-  - Optionally, top-1 agreement vs `UD-Q8_K_XL` within ~1 point of Unsloth's figures (`98.0 / 97.7 / 96.3 / 94.7%`).
+  - Cross-quant sanity: `UD-Q4_K_XL` vs `UD-IQ4_XS` top-1 agreement within ~1 point of Unsloth's published
+    `98.0 / 97.7 / 96.3 / 94.7%` figures, which is the only external calibration available.
 
 ### Stage 3 — Q8_0 KV & Long-Context Needle Verification (Requires Phase 1b)
 ```powershell
@@ -321,16 +350,15 @@ python tools/needle_bench.py `
 - **Pass criteria**: FP16/Q8_0 agreement `>= 97%`; 100% needle recall at 32K, 64K, and 128K.
 
 ### Stage 4 — Same-Day A/B Benchmark & Regression Suite (Requires Phase 1b)
-Create `bench/inkling2_machine.json` (verify exact JSON field names like `"-fa","on"` against `bench/bench_vs_llama.py`
-before running):
+`bench/inkling2_machine.json` carries a **single engine**, because there is no `llama.cpp` side to benchmark against on
+this architecture. The A/B is across **KV types and quants**, not across engines:
 ```json
 {
   "gguf": "models\\inkling2-ud-q4_k_xl\\Inkling-2-Mini-UD-Q4_K_XL.gguf",
   "strata_cfg": "strata-inkling2-ud-q4_k_xl.json",
-  "llama_server": "..\\llama.cpp\\build\\bin\\Release\\llama-server.exe",
   "configs": [
-    {"name": "llama", "kind": "llama", "args": ["--fit-target", "1024", "-ctk", "q8_0", "-ctv", "q8_0", "-fa", "on"]},
-    {"name": "strata", "kind": "strata", "args": []}
+    {"name": "fp16-kv", "kind": "strata", "args": []},
+    {"name": "q8_0-kv", "kind": "strata", "args": ["--kv", "q8_0"]}
   ]
 }
 ```
@@ -339,7 +367,7 @@ before running):
 python bench/bench_vs_llama.py prompts --out bench/inkling2_vs_llama --repo . `
   --tokenizer <pack>\tokenizer --corpus <text file of 40K+ tokens>
 python bench/bench_vs_llama.py run --machine bench/inkling2_machine.json --out bench/inkling2_vs_llama `
-  --configs llama,strata --rounds 3
+  --configs fp16-kv,q8_0-kv --rounds 3
 python bench/bench_vs_llama.py summary --out bench/inkling2_vs_llama
 
 # 2. Offline setup, server, and MCP unit tests:
@@ -352,24 +380,33 @@ python tools/test_setup_pins.py
 python serve/test_models.py
 python tools/test_strata_mcp.py
 ```
-- **Pass criteria**:
-  - Benchmark **`UD-IQ4_XS`** and **`UD-Q3_K_XL`** at **32K with Q8_0 KV** against same-day `llama.cpp --fit-target`
-    (including peak RAM), and choose the final `setup.py` default from those measured numbers.
-  - At **32K with Q8_0 KV**: decode **`>= 1.5×`** the same-day `llama.cpp` baseline from Phase 0.
-    *(Reference point: ninfer-all on a desktop RTX 5060 8 GB decoded 33.1 tok/s and prefilled 1,267 tok/s at 2K
-    on `UD-IQ4_XS` against `llama.cpp`'s 14.7 and 305; expect less on the laptop.)*
-  - Peak VRAM `<= 7.5 GiB`, peak RAM `<= 26 GiB`.
+- **Pass criteria** (revised: no `llama.cpp` ratio exists, so these are absolute and relative to the measured baseline
+  in [inkling2_progress.md](inkling2_progress.md) §4):
+  - Benchmark **`UD-IQ4_XS`** and **`UD-Q3_K_XL`** at **32K with Q8_0 KV** (including peak RAM), and choose the final
+    `setup.py` default from those measured numbers.
+  - **Peak VRAM `<= 7.5 GiB`, peak RAM `<= 26 GiB`** — both currently pass, narrowly (7,498 MiB and 25.2 GiB at 8K).
+  - **No regression against the current baseline**, measured at FP16 KV on `UD-Q4_K_XL`: prefill `>= 71.7 tok/s` at 8K
+    and `>= 84.4 tok/s` at 16K; decode `>= 10.1 tok/s` at 16K. Q8_0 KV must be no worse than FP16 within noise,
+    which is the actual point of this stage.
+  - Once `read_layer_major()` is enabled (§9 of the progress report), these floors are expected to move substantially and
+    should be re-baselined rather than treated as a ceiling.
   - All unit tests pass; existing `groot` (`qwen35moe`) greedy output unchanged.
 
 ---
 
 ## 6. GPU Portability Notes (One GPU vs All GPUs)
 
-- **~80–90% of speedups transfer automatically to all GPUs (NVIDIA RTX 20–50 & AMD HIP)**:
+> **Correction after implementation.** The transfer claimed below applies to the *shared* engine code, not to the
+> `inkling2` kernels. `src/poly/inkling2_kernels.cu:28` hardcodes `cudaStream_t` with no `__HIP__` branch (sibling
+> `kernels.cu` has one), and there is no Metal variant, so **an AMD or Apple build of this model does not compile today.**
+> Porting the nine kernels in [inkling2_progress.md](inkling2_progress.md) §3 is the prerequisite, and it is deliberately out
+> of scope for now. CPU-only is also unsupported: `strata-poly` is only built under `CUDA OR HIP`.
+
+- **~80–90% of the optimization work is backend-independent** (it transfers once the kernels are ported):
   - Q8_0 KV cache, SWA ring buffers, VRAM LRU expert cache (naturally counting core experts 3× per token), kernel
     fusion, and CUDA/HIP Graph capture.
 - **~10–20% is generation/vendor specific**:
   - Native **FP4×FP4** tensor-core prefill (`src/poly/mmq_nvfp4.cu`) is Blackwell (`sm_120`, RTX 50) specific;
     RTX 20/30/40 fall back to their existing MMA/`dp4a` paths automatically.
-  - AMD HIP wavefront (32 vs 64 lanes) and dot-product intrinsics use thin `#if defined(__HIPCC__)` guards inside
-    shared kernel headers.
+  - AMD HIP wavefront (32 vs 64 lanes) and dot-product intrinsics need thin `#if defined(__HIPCC__)` guards in the
+    `inkling2` kernels, which they do not have yet.
