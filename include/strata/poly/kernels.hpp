@@ -458,6 +458,10 @@ void ink_rel_table(const float* bias, int n_rel, const float* rcur, const float*
 void ink_attend_rel(const float* q, const uint16_t* kc, const uint16_t* vc, const float* kqb, const float* tau,
                     int64_t pos, int rows, float* out, int dim, int n_head, int kv_heads, float scale,
                     int window, int n_keys, int ring, void* stream);
+/// Same as ink_attend_rel(), reading Q8_0 K/V caches (32 int8 codes + 1 fp16 scale per 32-value block).
+void ink_attend_rel_q8(const float* q, const int8_t* kc, const uint16_t* ks, const int8_t* vc, const uint16_t* vs,
+                       const float* kqb, const float* tau, int64_t pos, int rows, float* out, int dim, int n_head,
+                       int kv_heads, float scale, int window, int n_keys, int ring, void* stream);
 
 /// The states the depth attention mixes, a token at a time: the bank's `n_bank` blocks newest first and then `cur`,
 /// which the reference's concat leaves last.  `bank` holds max_bank blocks of `bank_stride` floats each, and only the

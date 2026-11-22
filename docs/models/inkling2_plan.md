@@ -7,10 +7,77 @@ NVIDIA RTX 5060 Laptop (8 GB VRAM, Blackwell `sm_120`) and 32 GB RAM**.
 Branch: `add-inkling2-mini` is the pull-request head and must stay clean; the engine work and these adjustments
 live on `inkling2-engine-local` (never push directly to `origin/main`).
 
-> **Read [inkling2_progress.md](inkling2_progress.md) first.** It records what has actually been built and measured, and
-> it supersedes every `llama.cpp` baseline below: mainline `llama.cpp` cannot load this architecture at all, so no
-> `llama.cpp` speed or parity comparison can be run. Phase 0 steps 3–4, Stage 1's reference, Stage 2 and the Stage 4 decode
-> gate have been rewritten accordingly; the FP64 oracle in `tools/ref_core.py` is the reference.
+> **Read [inkling2_progress.md](inkling2_progress.md) first.** Note: the earlier `llama.cpp` refusal in that report
+> was from build `b11669`, which predates `inkling2_loop` (`ggml-org/llama.cpp` PR `#32694` + `#32704` commit
+> `2a28df0f9b` or Unsloth `b12588-mix-c0c3de8`). For quick iteration on this RTX 5060 Laptop, use the focused
+> `--kv q8_0` test plan in Section 0 below.
+
+---
+
+## 0. Quick Test Plan — RTX 5060 Laptop (8 GB VRAM, 32 GB RAM Offloading, `--kv q8_0`)
+
+Focused verification & benchmark sequence after four fixes/optimizations landed on `fork/inkling2-engine-local`:
+1. **`ink_conv` / `ink_conv_state` 256× redundant-thread & warp-race fix** (`src/poly/inkling2_kernels.cu`) — fixes
+   intra-block warp data race on `state[]` when `rows < 3` and cuts 192 conv launches/call by ~100–256×.
+2. **`Engine::read()` `n_bank_` leak/clobber fix** (`src/poly/engine.cpp:5538`: `!read_layer_major() ||`) — fixes
+   `the depth attention's bank is full (5 of 5 at step 42)` when conversation marks split a read into `n_calls >= 2`.
+3. **Parallel 32-lane warp softmax** in `ink_attend_rel_kernel` (replaces 128 serial `expf()` calls on `lane == 0`).
+4. **Full `--kv q8_0` support** (`ink_attend_rel_q8` + `store_q8` + Q8_0 save/load in `src/poly/inkling2.cpp`) —
+   cuts KV VRAM by 46.88% (128K KV drops from 4.31 GiB → **2.29 GiB**, freeing ~2.0 GiB VRAM for hot experts).
+
+### Step 1 — Rebuild & Kernel Unit Tests (~2 min)
+```powershell
+bash tools/build_poly_cuda_local.sh
+.\build-poly\poly_inkling2_test.exe
+```
+Confirm clean CUDA `sm_120` build and all 17 FP64 kernel checks pass.
+
+### Step 2 — Verify the Two Bug Fixes (~3 min)
+1. **Bank-leak fix (`5 of 5 at step 42`)**: Run 6+ sequential requests on one server via `tools/probe_context.py`
+   (with `--kv q8_0`) and confirm zero `bank is full` errors.
+2. **Conv-state warp-race fix (intermittent corruption at ~10,900 tokens)**: Run 3 consecutive ~10,900-token
+   prefills + 256-token decodes on a fresh server and verify all 3 produce coherent text (no repetition loop).
+
+### Step 3 — End-to-End Parity & Q8_0 KV Agreement (~5 min)
+```powershell
+# 1. End-to-end FP64 cosine gate at blk.6, blk.23, and logits (cosine >= 0.999):
+#    run with STRATA_DUMP_BIN + tools/dump_cos.py against tools/ref_core.py
+
+# 2. FP16 vs Q8_0 KV teacher-forced agreement (>= 97%):
+python tools/kv_agree.py `
+  --model <path-to-UD-IQ4_XS-or-UD-Q4_K_XL.gguf> `
+  --bin build-poly\strata-poly.exe `
+  --ref fp16 --kv q8_0 --prompts 5 --max-new 128 --max-context 2048 --min-agree 0.97
+```
+
+### Step 4 — 8K / 32K / 128K Speed & Memory Sweep with `--kv q8_0`
+Run on **`UD-IQ4_XS`** (15.73 GB, 0 non-NVFP4 scales, zero swap expected) and/or **`UD-Q4_K_XL`** (17.63 GB, for
+direct before/after comparison against the earlier FP16 KV numbers of 10.1 tok/s decode & 71.7/39.4/23.4 tok/s prefill):
+```powershell
+# Generate 8K, 32K, and 128K prompts once (if not already in bench/):
+python tools/make_long_prompt.py --out bench/prompt-8k.txt   --tokens 8000
+python tools/make_long_prompt.py --out bench/prompt-32k.txt  --tokens 32000
+python tools/make_long_prompt.py --out bench/prompt-128k.txt --tokens 126000
+
+# 8K with Q8_0 KV (~0.30 GiB KV, max VRAM left for experts):
+python tools/bench_128k_local.py --out bench/q8-8k   --models iq4xs=<gguf> --engines strata `
+  --prompt bench/prompt-8k.txt   --context 8192   --kv q8_0 --gen 256
+
+# 32K with Q8_0 KV (~0.70 GiB KV, ~3.7 GiB left for experts):
+python tools/bench_128k_local.py --out bench/q8-32k  --models iq4xs=<gguf> --engines strata `
+  --prompt bench/prompt-32k.txt  --context 32768  --kv q8_0 --gen 256
+
+# 128K with Q8_0 KV (~2.29 GiB KV vs 4.31 GiB FP16, ~2.1 GiB left for experts):
+python tools/bench_128k_local.py --out bench/q8-128k --models iq4xs=<gguf> --engines strata `
+  --prompt bench/prompt-128k.txt --context 131072 --kv q8_0 --gen 256
+```
+Record for each length: **prefill tok/s, decode tok/s, TTFT, peak VRAM (<= 7,680 MiB), peak RSS, and swap (target 0 GiB)**.
+
+### Step 5 — Next High-Impact Speedups (After Step 4 Numbers)
+1. **Enable `read_layer_major()`** (move per-call depth-bank/message scratch to host): eliminates re-reading experts
+   on every 1,024-token chunk (**4–10× faster 32K/128K prefill**).
+2. **Attention kernel upgrade**: MMA tensor-core prefill + split-K flash-decoding for `ink_attend_rel_q8`.
+3. **Pass-aware `tail_key()` + CUDA Graphs (`L.fixed = true`)** + kernel fusion for decode.
 
 ---
 

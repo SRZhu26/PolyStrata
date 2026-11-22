@@ -5535,7 +5535,7 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
         share = [&, to](int done, int of) { return (*asked)(lo_ * of + done * (to - lo_), n_layer_ * of); };
         return (const std::function<bool(int, int)>*) &share;
     };
-    if (n_calls == 1 || !mmq_ || all_cached() || n < opt_.stage_ahead) {
+    if (n_calls == 1 || !read_layer_major() || !mmq_ || all_cached() || n < opt_.stage_ahead) {
         turn = share_to(n_layer_);   // eval() takes the calls through the cards after this one
         // On several cards the next one takes a call on a thread of its own, while this one runs the call after
         // it.  Each card runs the calls as eval() does, in the same order.

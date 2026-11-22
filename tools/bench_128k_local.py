@@ -154,13 +154,13 @@ def chat(prompt, max_tokens, temp=0.0, seed=1):
 
 
 def run_one(engine, model, a, prompt, out):
-    tag = "%s-%s" % (engine, Path(model).stem[:28])
+    tag = "%s-%s-%dk" % (engine, Path(model).stem[:24], a.context // 1024)
     if engine == "llama":
         # llama.cpp spells the same cache type f16, where strata spells it fp16
         kv = {"fp16": "f16", "q8_0": "q8_0", "f32": "f32", "bf16": "bf16"}.get(a.kv, a.kv)
-        cmd = [str(LLAMA / "llama-server.exe"), "-m", str(model), "--port", str(PORT), "--host", "127.0.0.1",
+        cmd = [str(Path(a.llama_dir) / "llama-server.exe"), "-m", str(model), "--port", str(PORT), "--host", "127.0.0.1",
                "-np", "1", "--no-webui", "--jinja", "-c", str(a.context),
-               "-ctk", kv, "-ctv", kv, "-fa", "on", "-ngl", "99"] + a.llama_args
+               "-ctk", kv, "-ctv", kv, "-fa", "on", "--fit-target", "1024"] + a.llama_args
     else:
         cfg = strata_config(model, out, a.tokenizer, a.context, a.kv, a.threads, a.strata_args)
         cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata",
@@ -201,9 +201,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", required=True)
     ap.add_argument("--models", required=True, help="name=PATH,name=PATH")
-    ap.add_argument("--engines", default="llama,strata")
+    ap.add_argument("--engines", default="strata")
+    ap.add_argument("--llama-dir", default=str(LLAMA),
+                    help="directory containing llama-server.exe (needs inkling2_loop support: PR #32704 or Unsloth b12588+)")
     ap.add_argument("--prompt", default=str(ROOT / "bench" / "prompt-128k.txt"))
-    ap.add_argument("--tokenizer", default=str(ROOT / "bench" / "tok-byteshape" / "tokenizer"))
+    ap.add_argument("--tokenizer", default=str(ROOT / "bench" / "tok-inkling2" / "tokenizer"))
     ap.add_argument("--context", type=int, default=131072)
     ap.add_argument("--gen", type=int, default=256)
     ap.add_argument("--temp", type=float, default=0.0,

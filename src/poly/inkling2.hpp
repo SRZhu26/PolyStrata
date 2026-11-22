@@ -144,6 +144,9 @@ private:
 
     /// Per visit: the K and V caches (a full-context layer's own, a window layer's a ring of its own).
     std::vector<uint16_t*> step_keys_, step_vals_;
+    /// --kv q8_0: per-visit int8 codes (n_kv * head_dim) and fp16 block scales (n_kv * head_dim / 32).
+    std::vector<int8_t*> step_k_codes_, step_v_codes_;
+    std::vector<uint16_t*> step_k_scales_, step_v_scales_;
 
     // device scratch
     float* qraw_ = nullptr;   ///< n * n_head * head_dim

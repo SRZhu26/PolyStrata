@@ -125,9 +125,9 @@ __global__ void ink_situ_rows_kernel(const float* __restrict__ gate_up, float* _
 __global__ void ink_conv_kernel(const float* __restrict__ x, float* __restrict__ state,
                                const float* __restrict__ w, const float* __restrict__ dyn,
                                float* __restrict__ out, int channels, int rows, int k, int n_head) {
-    const int c = blockIdx.x;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int t = blockIdx.y;
-    if (t >= rows) return;
+    if (c >= channels || t >= rows) return;
     const float* tap = w + (size_t) c * k;
     float acc = 0.0f;
     for (int i = 0; i < k; ++i) {
@@ -162,7 +162,8 @@ __global__ void ink_conv_kernel(const float* __restrict__ x, float* __restrict__
 // channel's thread can go up from 0 without meeting a row it has overwritten.
 __global__ void ink_conv_state_kernel(const float* __restrict__ x, float* __restrict__ state, int channels,
                                      int rows, int k) {
-    const int c = blockIdx.x;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= channels) return;
     for (int s = 0; s < k - 1; ++s) {
         const int j = rows + s - (k - 1);
         state[(size_t) s * channels + c] = j < 0 ? state[(size_t) (j + k - 1) * channels + c]
@@ -284,15 +285,20 @@ __global__ void ink_attend_rel_kernel(const float* __restrict__ q, const half* _
             float tm = -INFINITY;
             for (int i = lane; i < jn; i += 32) tm = fmaxf(tm, sc[r][i]);
             tm = ink_warp_max(tm);
+            const float mnew = fmaxf(m[r], tm);
+            const float corr = expf(m[r] - mnew);
+            float ts = 0.0f;
+            for (int i = lane; i < jn; i += 32) {
+                const float w = expf(sc[r][i] - mnew);
+                wt[r][i] = w;
+                ts += w;
+            }
+            ts = ink_warp_sum(ts);
             if (lane == 0) {
-                const float mnew = fmaxf(m[r], tm), corr = expf(m[r] - mnew);
-                float ts = 0.0f;
-                for (int i = 0; i < jn; ++i) ts += expf(sc[r][i] - mnew);
                 sum_of[r] = sum_of[r] * corr + ts;
                 corr_of[r] = corr;
-                m[r] = mnew;
-                for (int i = 0; i < jn; ++i) wt[r][i] = expf(sc[r][i] - mnew);
             }
+            m[r] = mnew;
         }
         __syncthreads();
 
@@ -315,6 +321,127 @@ __global__ void ink_attend_rel_kernel(const float* __restrict__ q, const half* _
             }
         }
         __syncthreads();   // the next tile overwrites sc with its logits, and wt with its weights
+    }
+
+#pragma unroll
+    for (int r = 0; r < INK_ATTEND_ROWS; ++r) {
+        if (r < nr) {
+            float* oh = out + ((size_t) (row0 + r) * n_head + h) * dim;
+            for (int e = threadIdx.x; e < dim; e += blockDim.x) oh[e] = acc[r] / sum_of[r];
+        }
+    }
+}
+
+// Same online-softmax relative-position attention, reading Q8_0 K/V caches (32 int8 codes + 1 fp16 scale per block).
+__global__ void ink_attend_rel_q8_kernel(const float* __restrict__ q, const int8_t* __restrict__ kc,
+                                         const half* __restrict__ ks, const int8_t* __restrict__ vc,
+                                         const half* __restrict__ vs, const float* __restrict__ kqb,
+                                         const float* __restrict__ tau, long long pos, int rows,
+                                         float* __restrict__ out, int dim, int n_head, int kv_heads, float scale,
+                                         int window, int n_keys, int ring) {
+    __shared__ float sc[INK_ATTEND_ROWS][INK_ATTEND_TILE];
+    __shared__ float wt[INK_ATTEND_ROWS][INK_ATTEND_TILE];
+    __shared__ float corr_of[INK_ATTEND_ROWS];
+    __shared__ float sum_of[INK_ATTEND_ROWS];
+    const int h = blockIdx.x;
+    const int row0 = blockIdx.y * INK_ATTEND_ROWS;
+    const int nr = rows - row0 < INK_ATTEND_ROWS ? rows - row0 : INK_ATTEND_ROWS;
+    if (nr <= 0) return;
+    const int per = n_head / kv_heads;
+    const int hkv = h / per;
+    const int blocks_per_head = dim >> 5;
+    const size_t krow = (size_t) kv_heads * dim;
+    const size_t srow = (size_t) kv_heads * blocks_per_head;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nwarps = int(blockDim.x) >> 5;
+
+    int lo[INK_ATTEND_ROWS], hi[INK_ATTEND_ROWS];
+#pragma unroll
+    for (int r = 0; r < INK_ATTEND_ROWS; ++r) {
+        if (r < nr) {
+            const int p = int(pos) + row0 + r;
+            lo[r] = window > 0 && p >= window ? p - window + 1 : 0;
+            hi[r] = p;
+        }
+    }
+
+    auto crow = [&](int j) { return (size_t) (ring > 0 ? j % ring : j); };
+    auto bias_of = [&](int r, int j) {
+        const int d = hi[r] - j;
+        return kqb[((size_t) (row0 + r) * n_head + h) * n_keys + (size_t) (d < n_keys ? d : n_keys - 1)];
+    };
+
+    float m[INK_ATTEND_ROWS], acc[INK_ATTEND_ROWS];
+#pragma unroll
+    for (int r = 0; r < INK_ATTEND_ROWS; ++r) {
+        m[r] = 0.0f, acc[r] = 0.0f;
+        sum_of[r] = 1.0f;
+    }
+
+    const int last = hi[nr - 1];
+    for (int64_t j0 = lo[0]; j0 <= last; j0 += INK_ATTEND_TILE) {
+        const long long left = (long long) last + 1 - j0;
+        const int jn = int(left < INK_ATTEND_TILE ? left : INK_ATTEND_TILE);
+
+        for (int e = warp; e < nr * jn; e += nwarps) {
+            const int r = e / jn, k = e - r * jn, j = int(j0) + k;
+            if (j < lo[r] || j > hi[r]) {
+                if (lane == 0) sc[r][k] = -INFINITY;
+                continue;
+            }
+            const size_t cr = crow(j);
+            const int8_t* kr = kc + cr * krow + (size_t) hkv * dim;
+            const half* ksr = ks + cr * srow + (size_t) hkv * blocks_per_head;
+            const float* qr = q + ((size_t) (row0 + r) * n_head + h) * dim;
+            float s = 0.0f;
+            for (int d = lane; d < dim; d += 32) s += qr[d] * ((float) kr[d] * __half2float(ksr[d >> 5]));
+            s = ink_warp_sum(s);
+            if (lane == 0) {
+                const float t = tau ? tau[row0 + r] : 1.0f;
+                sc[r][k] = s * scale * t + bias_of(r, j);
+            }
+        }
+        __syncthreads();
+
+        for (int r = warp; r < nr; r += nwarps) {
+            float tm = -INFINITY;
+            for (int i = lane; i < jn; i += 32) tm = fmaxf(tm, sc[r][i]);
+            tm = ink_warp_max(tm);
+            const float mnew = fmaxf(m[r], tm);
+            const float corr = expf(m[r] - mnew);
+            float ts = 0.0f;
+            for (int i = lane; i < jn; i += 32) {
+                const float w = expf(sc[r][i] - mnew);
+                wt[r][i] = w;
+                ts += w;
+            }
+            ts = ink_warp_sum(ts);
+            if (lane == 0) {
+                sum_of[r] = sum_of[r] * corr + ts;
+                corr_of[r] = corr;
+            }
+            m[r] = mnew;
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int r = 0; r < INK_ATTEND_ROWS; ++r) {
+            if (r < nr) {
+                acc[r] *= corr_of[r];
+                const int i0 = lo[r] > int(j0) ? lo[r] - int(j0) : 0;
+                const int i1 = hi[r] - int(j0) < jn - 1 ? hi[r] - int(j0) : jn - 1;
+#pragma unroll 4
+                for (int i = i0; i <= i1; ++i) {
+                    const size_t cr = crow(int(j0) + i);
+                    const int8_t* vr = vc + cr * krow + (size_t) hkv * dim;
+                    const half* vsr = vs + cr * srow + (size_t) hkv * blocks_per_head;
+                    const float w = wt[r][i];
+                    for (int e = threadIdx.x; e < dim; e += blockDim.x)
+                        acc[r] += w * ((float) vr[e] * __half2float(vsr[e >> 5]));
+                }
+            }
+        }
+        __syncthreads();
     }
 
 #pragma unroll
@@ -505,11 +632,11 @@ void ink_situ_rows(const float* gate_up, float* out, int n, int rows, float beta
 void ink_conv(const float* x, float* state, const float* w, const float* dyn, float* out, int channels,
               int rows, int k, int n_head, void* stream) {
     if (rows <= 0) return;
-    ink_conv_kernel<<<dim3((unsigned) channels, (unsigned) rows), INK_THREADS, 0, cs(stream)>>>(x, state, w, dyn, out,
-                                                                                          channels, rows, k, n_head);
+    ink_conv_kernel<<<dim3((unsigned) grid((size_t) channels, INK_THREADS), (unsigned) rows), INK_THREADS, 0, cs(stream)>>>(
+        x, state, w, dyn, out, channels, rows, k, n_head);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("ink_conv: ") + cudaGetErrorString(e));
-    ink_conv_state_kernel<<<channels, INK_THREADS, 0, cs(stream)>>>(x, state, channels, rows, k);
+    ink_conv_state_kernel<<<grid((size_t) channels, INK_THREADS), INK_THREADS, 0, cs(stream)>>>(x, state, channels, rows, k);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("ink_conv state: ") + cudaGetErrorString(e));
 }
@@ -537,6 +664,21 @@ void ink_attend_rel(const float* q, const uint16_t* kc, const uint16_t* vc, cons
         ring);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("ink_attend_rel: ") + cudaGetErrorString(e));
+}
+
+void ink_attend_rel_q8(const float* q, const int8_t* kc, const uint16_t* ks, const int8_t* vc, const uint16_t* vs,
+                       const float* kqb, const float* tau, int64_t pos, int rows, float* out, int dim, int n_head,
+                       int kv_heads, float scale, int window, int n_keys, int ring, void* stream) {
+    if (rows <= 0) return;
+    if (dim <= 0 || dim > INK_THREADS || (dim % 32) != 0)
+        throw std::runtime_error("ink_attend_rel_q8: head dim must be a multiple of 32 in 32.." +
+                                 std::to_string(INK_THREADS));
+    ink_attend_rel_q8_kernel<<<dim3((unsigned) n_head, (unsigned) ((rows + INK_ATTEND_ROWS - 1) / INK_ATTEND_ROWS)),
+                                 INK_THREADS, 0, cs(stream)>>>(
+        q, kc, (const half*) ks, vc, (const half*) vs, kqb, tau, pos, rows, out, dim, n_head, kv_heads, scale, window,
+        n_keys, ring);
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
+        throw std::runtime_error(std::string("ink_attend_rel_q8: ") + cudaGetErrorString(e));
 }
 
 void ink_depth_mix(const float* states, const float* query, float* out, int n_embd, int n_states, int n_q,

@@ -77,9 +77,9 @@ void Inkling2::load_geometry() {
         return *v;
     };
     need(opt_.layer_split.empty(), "--layer-split (the looped core spans the split)");
-    // the relative-position attention reads fp16 caches only, as ink_attend_rel() does
-    need(opt_.kv_format != KvFmt::kQ8_0 && opt_.kv_format != KvFmt::kInt8 && opt_.kv_format != KvFmt::kInt8K,
-         "--kv q8_0 or int8 (the relative-position attention reads fp16 caches)");
+    // int8/int8k are Gemma 4's layout; inkling2_loop supports fp16 (default) and q8_0.
+    need(opt_.kv_format != KvFmt::kInt8 && opt_.kv_format != KvFmt::kInt8K,
+         "--kv int8 or int8k (use fp16 or q8_0 for inkling2_loop)");
 
     const MetaValue& hc = must("attention.head_count");
     const MetaValue& hkv = must("attention.head_count_kv");
@@ -322,16 +322,36 @@ size_t Inkling2::recurrent_floats() const {
 void Inkling2::alloc_caches() {
     ring_ = std::min(opt_.max_context, window_ + rows_);
     keep_ = std::min(window_, ring_);
-    const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
+    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
+    const size_t elems = (size_t) n_kv_ * (size_t) head_dim_;
+    const size_t scale_row = (size_t) n_kv_ * ((size_t) head_dim_ / 32) * sizeof(uint16_t);
+    const size_t f16_row = elems * sizeof(uint16_t);
     step_keys_.assign(steps_.size(), nullptr);
     step_vals_.assign(steps_.size(), nullptr);
+    step_k_codes_.assign(steps_.size(), nullptr);
+    step_k_scales_.assign(steps_.size(), nullptr);
+    step_v_codes_.assign(steps_.size(), nullptr);
+    step_v_scales_.assign(steps_.size(), nullptr);
+    if (q8) std::fprintf(stderr, "strata-poly: q8_0 KV cache: %zu bytes a row\n", elems + scale_row);
     for (size_t s = 0; s < steps_.size(); ++s) {
         if (steps_[s].swa) {
-            step_keys_[s] = (uint16_t*) seq_alloc((size_t) ring_ * row, "the attention cache");
-            step_vals_[s] = (uint16_t*) seq_alloc((size_t) ring_ * row, "the attention cache");
+            if (q8) {
+                step_k_codes_[s] = (int8_t*) seq_alloc((size_t) ring_ * elems, "the attention cache");
+                step_k_scales_[s] = (uint16_t*) seq_alloc((size_t) ring_ * scale_row, "the attention cache");
+                step_v_codes_[s] = (int8_t*) seq_alloc((size_t) ring_ * elems, "the attention cache");
+                step_v_scales_[s] = (uint16_t*) seq_alloc((size_t) ring_ * scale_row, "the attention cache");
+            } else {
+                step_keys_[s] = (uint16_t*) seq_alloc((size_t) ring_ * f16_row, "the attention cache");
+                step_vals_[s] = (uint16_t*) seq_alloc((size_t) ring_ * f16_row, "the attention cache");
+            }
+        } else if (q8) {
+            step_k_codes_[s] = (int8_t*) kv_alloc(elems, 1);
+            step_k_scales_[s] = (uint16_t*) kv_alloc(scale_row, 1);
+            step_v_codes_[s] = (int8_t*) kv_alloc(elems, 1);
+            step_v_scales_[s] = (uint16_t*) kv_alloc(scale_row, 1);
         } else {
-            step_keys_[s] = (uint16_t*) kv_alloc(row, 1);
-            step_vals_[s] = (uint16_t*) kv_alloc(row, 1);
+            step_keys_[s] = (uint16_t*) kv_alloc(f16_row, 1);
+            step_vals_[s] = (uint16_t*) kv_alloc(f16_row, 1);
         }
     }
 }
@@ -365,7 +385,10 @@ void Inkling2::assign_scratch() {
 
     // Each windowed visit's rows sit after the recurrent state, in the order the visits come.
     step_extra_at_.assign(steps_.size(), 0);
-    const size_t ring_bytes = 2 * (size_t) keep_ * (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
+    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
+    const size_t side_row = q8 ? (size_t) n_kv_ * head_dim_ + (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t)
+                               : (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
+    const size_t ring_bytes = 2 * (size_t) keep_ * side_row;
     size_t at = 0;
     for (size_t s = 0; s < steps_.size(); ++s) {
         if (!steps_[s].swa) continue;
@@ -376,23 +399,40 @@ void Inkling2::assign_scratch() {
 
 // A sequence's rows are the full-context visits': a windowed visit's are its state (save_layer()).
 size_t Inkling2::card_row_bytes() const {
+    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
+    const size_t side_row = q8 ? (size_t) n_kv_ * head_dim_ + (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t)
+                               : (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
     size_t full = 0;
     for (const Step& s : steps_)
         if (!s.swa) ++full;
-    return full * 2 * (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
+    return full * 2 * side_row;
 }
 
 void Inkling2::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
     if (first < 0 || n < 0 || first + n > opt_.max_context)
         throw std::logic_error("save_rows: the rows are outside the context");
     ck(cudaStreamSynchronize(cs(st_)), "save rows");
-    const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
-    const size_t at = (size_t) first * row, len = (size_t) n * row;
+    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
+    const size_t c_row = (size_t) n_kv_ * head_dim_ * (q8 ? size_t(1) : sizeof(uint16_t));
+    const size_t s_row = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
+    const size_t at_c = (size_t) first * c_row, n_c = (size_t) n * c_row;
+    const size_t at_s = (size_t) first * s_row, n_s = (size_t) n * s_row;
     for (size_t s = 0; s < steps_.size(); ++s) {
         if (steps_[s].swa || n == 0) continue;
+        if (q8) {
+            ck(cudaMemcpy(dst, (const uint8_t*) step_k_codes_[s] + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
+            dst += n_c;
+            ck(cudaMemcpy(dst, (const uint8_t*) step_k_scales_[s] + at_s, n_s, cudaMemcpyDeviceToHost), "save rows");
+            dst += n_s;
+            ck(cudaMemcpy(dst, (const uint8_t*) step_v_codes_[s] + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
+            dst += n_c;
+            ck(cudaMemcpy(dst, (const uint8_t*) step_v_scales_[s] + at_s, n_s, cudaMemcpyDeviceToHost), "save rows");
+            dst += n_s;
+            continue;
+        }
         for (const uint16_t* cache : {step_keys_[s], step_vals_[s]}) {
-            ck(cudaMemcpy(dst, (const uint8_t*) cache + at, len, cudaMemcpyDeviceToHost), "save rows");
-            dst += len;
+            ck(cudaMemcpy(dst, (const uint8_t*) cache + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
+            dst += n_c;
         }
     }
 }
@@ -402,14 +442,29 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
         throw std::logic_error("load_rows: the rows are outside what was saved");
     cover(first + n);
     ck(cudaStreamSynchronize(cs(st_)), "load rows");
-    const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
-    const size_t at = (size_t) first * row, len = (size_t) n * row;
-    const size_t skip = (size_t) (first - from) * row, all = (size_t) count * row;
+    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
+    const size_t c_row = (size_t) n_kv_ * head_dim_ * (q8 ? size_t(1) : sizeof(uint16_t));
+    const size_t s_row = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
+    const size_t at_c = (size_t) first * c_row, n_c = (size_t) n * c_row;
+    const size_t sk_c = (size_t) (first - from) * c_row, all_c = (size_t) count * c_row;
+    const size_t at_s = (size_t) first * s_row, n_s = (size_t) n * s_row;
+    const size_t sk_s = (size_t) (first - from) * s_row, all_s = (size_t) count * s_row;
     for (size_t s = 0; s < steps_.size(); ++s) {
         if (steps_[s].swa || n == 0) continue;
+        if (q8) {
+            ck(cudaMemcpy((uint8_t*) step_k_codes_[s] + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
+            src += all_c;
+            ck(cudaMemcpy((uint8_t*) step_k_scales_[s] + at_s, src + sk_s, n_s, cudaMemcpyHostToDevice), "load rows");
+            src += all_s;
+            ck(cudaMemcpy((uint8_t*) step_v_codes_[s] + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
+            src += all_c;
+            ck(cudaMemcpy((uint8_t*) step_v_scales_[s] + at_s, src + sk_s, n_s, cudaMemcpyHostToDevice), "load rows");
+            src += all_s;
+            continue;
+        }
         for (uint16_t* cache : {step_keys_[s], step_vals_[s]}) {
-            ck(cudaMemcpy((uint8_t*) cache + at, src + skip, len, cudaMemcpyHostToDevice), "load rows");
-            src += all;
+            ck(cudaMemcpy((uint8_t*) cache + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
+            src += all_c;
         }
     }
 }
@@ -417,10 +472,13 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
 // What a windowed visit has of the sequence: the rows the next token attends, kept at its place in the
 // recurrent state.  A full-context visit's rows are save_card_rows()'.
 size_t Inkling2::extra_bytes() const {
+    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
+    const size_t side_row = q8 ? (size_t) n_kv_ * head_dim_ + (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t)
+                               : (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
     size_t swa = 0;
     for (const Step& s : steps_)
         if (s.swa) ++swa;
-    return swa * 2 * (size_t) keep_ * (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
+    return swa * 2 * (size_t) keep_ * side_row;
 }
 
 // The last keep_ positions before `pos` as runs of a ring's rows: f(the run's place among the keep_, its first
@@ -439,31 +497,49 @@ void window_runs(int64_t pos, int64_t keep, int64_t ring, F&& f) {
 void Inkling2::save_layer(int il, int64_t pos, uint8_t* dst) {
     (void) il;
     if (!steps_[(size_t) cur_step_].swa) return;
-    const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
+    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
+    const size_t c_row = (size_t) n_kv_ * head_dim_ * (q8 ? size_t(1) : sizeof(uint16_t));
+    const size_t s_row = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
     dst += state_n_ * sizeof(float) + step_extra_at_[(size_t) cur_step_];
-    auto save_ring = [&](const uint8_t* cache) {
+    auto save_ring = [&](const uint8_t* cache, size_t row) {
         std::memset(dst, 0, (size_t) keep_ * row);   // the places of positions before the sequence's start
         window_runs(pos, keep_, ring_, [&](size_t slot, size_t at, size_t m) {
             ck(cudaMemcpy(dst + slot * row, cache + at * row, m * row, cudaMemcpyDeviceToHost), "save state");
         });
         dst += (size_t) keep_ * row;
     };
-    save_ring((const uint8_t*) step_keys_[(size_t) cur_step_]);
-    save_ring((const uint8_t*) step_vals_[(size_t) cur_step_]);
+    if (q8) {
+        save_ring((const uint8_t*) step_k_codes_[(size_t) cur_step_], c_row);
+        save_ring((const uint8_t*) step_k_scales_[(size_t) cur_step_], s_row);
+        save_ring((const uint8_t*) step_v_codes_[(size_t) cur_step_], c_row);
+        save_ring((const uint8_t*) step_v_scales_[(size_t) cur_step_], s_row);
+        return;
+    }
+    save_ring((const uint8_t*) step_keys_[(size_t) cur_step_], c_row);
+    save_ring((const uint8_t*) step_vals_[(size_t) cur_step_], c_row);
 }
 
 void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
-    const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
+    const bool q8 = opt_.kv_format == KvFmt::kQ8_0;
+    const size_t c_row = (size_t) n_kv_ * head_dim_ * (q8 ? size_t(1) : sizeof(uint16_t));
+    const size_t s_row = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
     for (size_t s = 0; s < steps_.size(); ++s) {
         if (!steps_[s].swa) continue;
-        auto load_ring = [&](uint8_t* cache) {
+        auto load_ring = [&](uint8_t* cache, size_t row) {
             window_runs(pos, keep_, ring_, [&](size_t slot, size_t at, size_t m) {
                 ck(cudaMemcpy(cache + at * row, src + slot * row, m * row, cudaMemcpyHostToDevice), "load state");
             });
             src += (size_t) keep_ * row;
         };
-        load_ring((uint8_t*) step_keys_[s]);
-        load_ring((uint8_t*) step_vals_[s]);
+        if (q8) {
+            load_ring((uint8_t*) step_k_codes_[s], c_row);
+            load_ring((uint8_t*) step_k_scales_[s], s_row);
+            load_ring((uint8_t*) step_v_codes_[s], c_row);
+            load_ring((uint8_t*) step_v_scales_[s], s_row);
+            continue;
+        }
+        load_ring((uint8_t*) step_keys_[s], c_row);
+        load_ring((uint8_t*) step_vals_[s], c_row);
     }
 }
 
@@ -511,8 +587,17 @@ void Inkling2::pass_messages(int il, int n) {
 
 // A visit's K or V into its cache: a full-context one at the position, a windowed one at its place in the ring.
 void Inkling2::store(const float* x, int s, int64_t pos, int n, bool value) {
-    uint16_t* cache = value ? step_vals_[(size_t) s] : step_keys_[(size_t) s];
     const int width = n_kv_ * head_dim_;
+    if (opt_.kv_format == KvFmt::kQ8_0) {
+        int8_t* codes = value ? step_v_codes_[(size_t) s] : step_k_codes_[(size_t) s];
+        uint16_t* scales = value ? step_v_scales_[(size_t) s] : step_k_scales_[(size_t) s];
+        if (!steps_[(size_t) s].swa) return store_q8(x, codes, scales, width, pos, n, st_);
+        const int at = (int) (pos % ring_), head = std::min(n, ring_ - at);
+        store_q8(x, codes, scales, width, at, head, st_);
+        if (head < n) store_q8(x + (size_t) head * width, codes, scales, width, 0, n - head, st_);
+        return;
+    }
+    uint16_t* cache = value ? step_vals_[(size_t) s] : step_keys_[(size_t) s];
     if (!steps_[(size_t) s].swa) return store_f16(x, cache, width, pos, n, st_);
     const int at = (int) (pos % ring_), head = std::min(n, ring_ - at);
     store_f16(x, cache, width, at, head, st_);
@@ -578,8 +663,14 @@ void Inkling2::attn(Block& B, int il, int n) {
             std::snprintf(nm, sizeof nm, "kqb_h%d", h);
             dbg(nm, il, kqb_ + (size_t) h * B.bias_keys, 3);
         }
-    ink_attend_rel(qraw_, step_keys_[(size_t) s], step_vals_[(size_t) s], kqb_, tau, pos_, n, att_, hd, nh, nkv,
-                   1.f / std::sqrt((float) hd), B.swa ? window_ : 0, B.bias_keys, B.swa ? ring_ : 0, st_);
+    if (opt_.kv_format == KvFmt::kQ8_0) {
+        ink_attend_rel_q8(qraw_, step_k_codes_[(size_t) s], step_k_scales_[(size_t) s], step_v_codes_[(size_t) s],
+                          step_v_scales_[(size_t) s], kqb_, tau, pos_, n, att_, hd, nh, nkv,
+                          1.f / std::sqrt((float) hd), B.swa ? window_ : 0, B.bias_keys, B.swa ? ring_ : 0, st_);
+    } else {
+        ink_attend_rel(qraw_, step_keys_[(size_t) s], step_vals_[(size_t) s], kqb_, tau, pos_, n, att_, hd, nh, nkv,
+                       1.f / std::sqrt((float) hd), B.swa ? window_ : 0, B.bias_keys, B.swa ? ring_ : 0, st_);
+    }
     dbg("att_raw", il, att_, n * nh * hd);
     if (cur_step_ == 0 && il == 0)
         for (int h = 0; h < 4; ++h) {
