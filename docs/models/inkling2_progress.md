@@ -19,10 +19,11 @@ Companion documents: [inkling2.md](inkling2.md) (architecture and measured resul
 | --- | --- | --- |
 | `main` | `8d812d5c` | untouched |
 | `add-inkling2-mini` (PR head) | `59f21100` | untouched — the PR to `main` is unaffected by this work |
-| `inkling2-engine-local` | `0432e9a6`, `76008937` | **this work**, local only, not pushed |
+| `inkling2-engine-local` | `c4c87bd6`, then the commit that carries this document | **this work**, pushed to `origin` as its own branch |
 
-`origin` is `https://github.com/SRZhu26/PolyStrata.git`. The engine work was committed to `inkling2-engine-local`
-precisely so it does not appear in the `add-inkling2-mini` → `main` pull request.
+`origin` is `https://github.com/SRZhu26/PolyStrata.git`, the user's own repository; there is no second remote. The engine
+work was committed to `inkling2-engine-local` precisely so it does not appear in the `add-inkling2-mini` → `main` pull
+request. `origin/main` and the PR head are untouched. Note that the repository is publicly readable.
 
 Left untracked on purpose: `bench/*` outputs, `.workbuddy/`, and a stray `--help` file produced by an accidental
 redirect.
@@ -34,8 +35,9 @@ redirect.
 - Windows 11, Visual Studio Build Tools (MSVC), CMake, CUDA 13.1, target `sm_120` (Blackwell, RTX 5060 Laptop).
 - Build: `tools/build_poly_cuda_local.sh` → `BUILD_OK`; binary `build-poly/strata-poly.exe` (88 MB).
 - Model under test: `Inkling-2-Mini-UD-Q4_K_XL.gguf`, 17,629,760,736 B (17.6 GB / 16.42 GiB), 24 physical layers.
-- KV cache: FP16 in every run below. `--kv q8_0` is wired and accepted for this architecture but was not the
-  configuration measured.
+- KV cache: FP16 and `--kv q8_0` both measured (§4); Q8_0 is numerically sound (99.79% agreement) but slower at
+  8K and 32K, and only pays off with `--kv-whole` at very long context.
+- Kernel unit tests: `poly_inkling2_test.exe`, **17/17 pass** against FP64 on the current binary.
 - Tokenizer: `bench/tok-inkling2/tokenizer` (converted from the GGUF), used by the server.
 
 ---
@@ -79,15 +81,93 @@ grows during a long prefill (`cover()` at `end=1` → `rows=4096`, `end=5120` �
 
 ## 4. Measured results
 
-All numbers: `UD-Q4_K_XL`, FP16 KV, experts streamed from disk, RTX 5060 Laptop.
+All numbers: `UD-Q4_K_XL`, experts streamed from disk, RTX 5060 Laptop, one fresh server per row, same binary
+(`build-poly/strata-poly.exe` after the four fixes in §2). The FP16 and Q8_0 rows share the prompt, the context and the
+binary, so each pair is a clean A/B on the KV format alone.
 
-| Prompt tokens | Prefill tok/s | Decode tok/s | VRAM peak | RSS peak |
-| ---: | ---: | ---: | ---: | ---: |
-| 8,198 | 71.7 | 5.0 | 7,498 MiB | 11.53 GiB |
-| 16,343 | 84.4 | 10.1 | 6,640 MiB | 12.54 GiB |
-| 130,715 | 23.4 (average) | — | — | — |
+| Prompt tokens | KV | Prefill tok/s | Decode tok/s | VRAM peak | RSS peak | Experts in VRAM |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 8,198 | fp16 | **136.3** | **8.1** | 6,640 MiB | 12.46 GiB | 791 (3.8 GiB) |
+| 8,198 | q8_0 | 127.7 | 7.2 | 6,640 MiB | 14.61 GiB | 829 (4.0 GiB) |
+| 32,015 | fp16 | **77.3** | **8.7** | 6,640 MiB | 14.88 GiB | 791 |
+| 32,015 | q8_0 | 66.9 | 7.6 | 6,640 MiB | 14.39 GiB | 829 |
 
-Model load: **12.1 s**. Peak system memory **25.2 GiB**, swap **0.95 GiB**.
+VRAM peak is identical in every row because KV grows on demand and the expert pool claims the card before it grows
+(§4.3). Load time 8–12 s; swap 0.7 GiB in every row.
+
+At 128,072 context, load only (no prefill):
+
+| KV | Experts in VRAM | Expert bytes |
+| --- | ---: | ---: |
+| fp16 | 791 (3.8 GiB) | 3.8 GiB |
+| q8_0 | 829 (4.0 GiB) | 4.0 GiB |
+
+With `--kv-whole` (KV preallocated for the whole context, the mode the plan's 4.31 → 2.29 GiB claim was written
+for), at 128,072:
+
+| KV | Experts in VRAM | Expert bytes |
+| --- | ---: | ---: |
+| fp16 | **0** | 0.0 GiB |
+| q8_0 | **405** | 1.9 GiB |
+
+That is the only configuration measured in which Q8_0 KV buys real residency: the FP16 KV fills the card, while Q8_0 leaves
+1.9 GiB for 405 of 3,072 experts.
+
+Prefill over the 128K prompt, measured incrementally to 96% before the run was stopped (FP16 KV, pre-fix binary):
+
+| Tokens | Elapsed | Marginal tok/s |
+| ---: | ---: | ---: |
+| 1,024 | 10 s | 111.8 |
+| 8,192 | 110 s | 68.3 |
+| 32,768 | 599 s | 39.4 |
+| 65,536 | 1,745 s | 23.3 |
+| 98,304 | 3,454 s | 16.8 |
+| 122,880 | 5,114 s | 13.7 |
+
+A full 130,715-token prefill projects to ≈ 5,750 s (≈ 96 min). The fall-off sits between `1/√t` and linear, which is
+the expected shape: a quadratic part from the 8 full-context visits and a linear part from the 40 window visits plus FFN.
+The curve was measured before the `ink_conv`/warp-softmax fixes; the current binary is faster at every length measured
+(8K: 68.3 → 136.3 tok/s marginal), so the 128K projection is now pessimistic.
+
+### 4.1 The earlier 8K/16K numbers are not comparable
+
+The earlier table read 8,198 → 71.7 prefill / 5.0 decode / 7,498 MiB, and 16,343 → 84.4 / 10.1 / 6,640 MiB. Both were
+taken on the pre-fix binary, and the 8K run's output degenerated into a loop, so its decode figure understates throughput.
+The 16K row is superseded by the 32K and 8K rows above and is kept only for the record.
+
+### 4.2 What Q8_0 KV actually costs
+
+Q8_0 is **numerically sound and slower at every length measured**:
+
+| Context | Prefill change | Decode change |
+| ---: | ---: | ---: |
+| 8,198 | −6.3% | −11.1% |
+| 32,015 | −13.5% | −12.6% |
+
+The KV saving is real but small below 32K, and it converts into only **38 more resident experts** (791 → 829), which is
+what the measurement shows. That is not enough residency to pay for the quantized attention kernel, which dequantizes every
+K and V element in the score and value passes (`inkling2_kernels.cu:397`, `:432`) where the FP16 kernel reads halves directly.
+
+Q8_0 only becomes a clear win when the KV is preallocated for a long context: at 128K with `--kv-whole` it keeps 405
+experts resident where FP16 keeps none. Below that, **FP16 KV is the faster configuration** and Q8_0 should be used only when
+the context is long enough that residency, not kernel speed, is the binding constraint.
+
+### 4.3 Q8_0 KV silently disables the RAM expert pool
+
+`ram_experts_mib` is auto-sized by `engine.cpp:2882`: when every expert outside VRAM plus 4 GiB of headroom does not fit in
+free RAM, a budget is set and a pinned pool with eight prefetch threads is created; otherwise `ram_experts_mib` stays `-1`,
+every expert is served through the file mapping, and **no pool or prefetch thread is created** (`engine.cpp:2893`).
+
+Q8_0 frees VRAM, so 38 more experts are resident and `outside_bytes_` drops just below the threshold. The heuristic flips to
+`-1`, and the run loses the pool:
+
+| 8K, q8_0 | Prefill | Decode | RSS |
+| --- | ---: | ---: | ---: |
+| auto (`-1`, maps everything) | 127.7 | 7.2 | 14.61 GiB |
+| `--ram-experts-mib 11187` (the FP16 run's budget) | 126.4 | 7.6 | 12.10 GiB |
+
+So a third of the Q8_0 decode loss is not the kernel at all: it is the heuristic taking the unpinned path because the freed VRAM
+moved it across a threshold. Pinning the budget recovers 0.4 tok/s and 2.5 GiB of RSS. This is defect §8.2.
 
 Prefill over the 128K prompt, measured incrementally to 96% before the run was stopped:
 
@@ -112,13 +192,16 @@ figure of 10.1 tok/s is the only clean decode number.
 
 | Gate | Criterion | Result |
 | --- | --- | --- |
-| Peak VRAM | ≤ 7.5 GiB (7,680 MiB) | **pass**, by only 182 MiB at 8K |
-| Peak RAM | ≤ 26 GiB | **pass** at 25.2 GiB, narrowly |
+| Peak VRAM | ≤ 7.5 GiB (7,680 MiB) | **pass** — 6,640 MiB in every run |
+| Peak RAM | ≤ 26 GiB | **marginal** — 25.36 at 8K FP16 and 25.25 at 10.9K FP16 pass; 26.46 at 8K Q8_0, 26.35/26.79 at 32K and 26.23 at 10.9K Q8_0 exceed it by < 1 GiB. The gate is on system RAM including the file cache, so it moves with what the OS keeps warm, not with the engine alone |
 | Decode vs `llama.cpp` | ≥ 1.5× same-day baseline | **not evaluable** — no baseline exists (§6) |
-| Cosine per stage | ≥ 0.999 | **not yet run** (§7) |
+| Cosine per stage | ≥ 0.999 | **blocked** — the FP64 oracle dequantizes only NVFP4 and Q8_0 (`ref_blk0.py:44,85`) and the only weights on disk are `UD-Q4_K_XL` (Q4_K) |
 | Kernel parity | vs FP64 | **pass** — `poly_inkling2_test`, 17 checks |
-| Long-context needle | 100% recall at 32K/64K/128K | **not yet run**, and blocked by the corruption defect |
-| Q8_0 KV | FP16 vs Q8_0 agreement ≥ 97% | **not yet run** |
+| Long-context coherence | coherent at 8K/32K/128K | **pass to 10.3K** on controlled prompts; no controlled run above 10.3K, and a full 128K prefill was stopped for GPU time |
+| Long-context needle | 100% recall at 32K/64K/128K | **not yet run** |
+| Q8_0 KV | FP16 vs Q8_0 agreement ≥ 97% | **pass** — 479/480 = **99.79%**, 5 prompts × 96 tokens, teacher-forced |
+| Bank leak | 0 errors over 7 sequential requests | **pass** — 0 occurrences |
+| Conv-state race | 3 consecutive ~10.9K prefills coherent | **pass** — coherent at 6,185 / 8,233 / 10,281 tokens, fresh server each |
 
 ---
 
@@ -155,10 +238,11 @@ repository**; `tools/ref_core.py` is the substitute.
 | --- | --- |
 | `poly_inkling2_test` | builds; 17 kernel-level checks against FP64 **pass** |
 | `tools/ref_core.py` | runs end to end — all 74 stages plus logits |
-| `tools/dump_cos.py` | exists; **the end-to-end cosine gate has not been run** |
-| `tools/kv_agree.py` | exists; **not run** for this model |
+| `tools/dump_cos.py` | exists; **blocked** — needs the NVFP4/Q8_0 source GGUF, which is not on disk |
+| `tools/kv_agree.py` | **run**: 99.79% Q8_0 vs FP16 agreement, 5 prompts x 96 tokens |
 | `tools/needle_bench.py` | exists; **not run** for this model |
-| `tools/probe_context.py` | new; drives one server across increasing prefix lengths |
+| `tools/probe_context.py` | **run**: one server, increasing prefix lengths; reuses cached prefixes, so a fresh server per length is needed to isolate |
+| `tools/make_long_prompt.py` | **run**: exact-token prompts at 8K and 32K built for this model |
 | `tools/strata_tokenizer.py` | `inkling2` mapped to a ported `GPT4O_PATTERN`; **byte-for-byte parity unverified** |
 
 **Tokenizer parity is unverified too.** `strata_tokenizer.py` now maps `inkling2` to a `GPT4O_PATTERN` ported from
@@ -168,27 +252,45 @@ would invalidate the token counts in §4, so this should be checked before the �
 
 **Kernel parity is not the end-to-end gate.** The 17 passing checks compare each kernel against an FP64 reference of the
 same graph. They do not establish that the assembled 48-visit model matches `ref_core.py`; that requires
-`STRATA_DUMP_BIN` plus `dump_cos.py` at `blk.6`, `blk.23` and the final logits, and it has not been run.
+`STRATA_DUMP_BIN` plus `dump_cos.py` at `blk.6`, `blk.23` and the final logits. It is blocked on weights: `ref_blk0.py`
+dequantizes only NVFP4 (`:44`) and Q8_0 (`:85`), and the only checkpoint on disk is `UD-Q4_K_XL` (Q4_K).
 
 ---
 
 ## 8. Known defects
 
-### 8.1 Intermittent long-context corruption (blocking)
+### 8.1 Repetition loops are content-driven, not a long-context corruption (not a defect)
 
-At roughly 10,900 tokens of prefill, about **two runs in three** degenerate into a repetition loop ("The lighter keeper is a
-keeper of the light"). The same prompt, the same binary and a fresh server sometimes produce coherent text:
-**10,890 tokens coherent vs 10,898 degenerate**. That pair proves a race rather than a length threshold.
+Earlier runs at roughly 10,900 tokens degenerated into a repetition loop, and the working assumption was a race that a
+long prefill exposed. **The controlled experiment says otherwise.** With one question held fixed and only the filler length
+changed, every length is coherent:
 
-It is not sampling: `--temp 0.7 --top_p 0.95` loops identically to greedy. It is not the depth-attention temperature
-(`tau = 1.0` below 8192), not the softcap or vocabulary padding (both correct in `ink_finish_logits_kernel`), not the SWA
-ring or window, and not `n_keys` (only the bias table's width, 1025; the sweep is driven by `pos`).
+| Prompt | Tokens | KV | Sampling | Output |
+| --- | ---: | --- | --- | --- |
+| Lighthouse prose + question | 6,185 | q8_0 | greedy | coherent |
+| Lighthouse prose + question | 8,233 | q8_0 | greedy | coherent |
+| Lighthouse prose + question | 10,281 | q8_0 | greedy | coherent |
+| README dump + question | 1,432 | q8_0 | greedy | loops on "Qwen 3" |
+| README dump + question | 1,432 | fp16 | greedy | loops on "Qwen" |
+| README dump + question | 1,432 | q8_0 | temp 0.7 | loops on "Poly" |
+| README dump + question | 10,941 | fp16 | greedy | loops on "PolyStr" |
+| README dump + question | 10,941 | q8_0 | greedy | loops on "5.5.5.5" |
+
+So the loop follows the **prompt**, not the length and not the KV format: it reproduces at 1,432 tokens, under both KV
+formats and under both greedy and sampled decoding, and a different document at 10,281 tokens is coherent. The README prompt is a
+raw document dump whose salient token is a proper noun repeated dozens of times ("PolyStrata"), and the model locks onto it.
+The earlier "two runs in three at 10,900 tokens" observation was the same effect seen through one prompt.
+
+What this does **not** excuse: `read_layer_major() = false` means a long prompt re-reads experts per chunk, and the
+`--dump-layers` path is still unverified above 10.3K. Coherence at 128K remains **unmeasured**, not disproved.
 
 Ruled out by experiment:
 
 | Suspect | How it was ruled out |
 | --- | --- |
-| Sampling / temperature / top_p | identical loop under temp 0.7 + top_p 0.95 |
+| Context length | 10,281 tokens coherent; 1,432 tokens loops |
+| Q8_0 KV | FP16 loops identically on the same prompt |
+| Sampling / temperature / top_p | identical loop at temp 0.7 + top_p 0.95 and at greedy |
 | `tau` log-scaling | `tau = 1.0` below 8192 |
 | Softcap, 966-row vocab padding | verified correct in `ink_finish_logits_kernel` |
 | SWA ring and window | probe at successive prefix lengths |
@@ -198,24 +300,38 @@ Ruled out by experiment:
 | The attention kernel | a cached `prompt_n=1` re-run over the same KV is always coherent |
 | Slot publication ordering | `L.slot[e]` is set only after `h2d()` lands (`engine.cpp:2353-2356`, `2370-2373`) |
 
-Remaining suspects, both only exercised by a long prefill: the `kStageRows = 32` staged expert launches in `moe_rows()`, and
-the per-chunk recurrent state (`state_`, `bufs_` copies in `copy_seq()`). A 1-token continuation exercises neither.
-
 **A blind spot made this harder than it needed to be:** `serve/server.py` opens the engine's stderr as `self.log`, which is
 `subprocess.DEVNULL` unless the config carries a `"log"` key. Every probe written into `engine.cpp` was invisible until
 `strata_config()` in `tools/bench_128k_local.py` was given one. An earlier conclusion that `cover()` never ran was drawn
 from that silence and has been retracted.
 
-### 8.2 Sixth sequential request on one server dies
+### 8.2 The RAM-expert heuristic flips to the unpinned path on a small VRAM win
+
+`engine.cpp:2882` sets a pinned expert pool only when `outside_bytes_ + 4 GiB > ram_available()`; otherwise
+`ram_experts_mib` stays `-1`, every expert is served through the file mapping, and no pool or prefetch thread exists
+(`engine.cpp:2893`). The test is a knife edge, and freeing VRAM moves a run across it:
+
+| 8K, q8_0 | `ram_experts_mib` | Decode | Process RSS |
+| --- | --- | ---: | ---: |
+| auto | −1 (no pool, no prefetch) | 7.2 | 14.61 GiB |
+| `--ram-experts-mib 11187` | 11,187 | 7.6 | 12.10 GiB |
+
+Because Q8_0 KV frees enough VRAM for 38 more experts to stay resident, `outside_bytes_` falls just under the threshold and
+the run silently loses the pool. The visible symptom is a slower decode and a larger RSS, which reads as "Q8_0 is slow"
+when a third of the loss is the heuristic. Fix: choose the budget from `outside_bytes_` alone, not from a headroom comparison
+that a VRAM change can flip, or keep the pool whenever `outside_bytes_` exceeds the pool's own size.
+
+### 8.3 Sixth sequential request on one server dies
 
 ```
 the depth attention's bank is full (5 of 5 at step 42)
 ```
 
 `max_states_ = 5`, and a single read should peak at 4, so one bank state leaks per request. The 6th request is the one
-that fails.
+that fails. **Fixed** by `!read_layer_major() ||` in `Engine::read()` (`engine.cpp:5538`); verified 0 errors over 7
+sequential Q8_0 requests.
 
-### 8.3 Latent CUDA-graph invalidation gap
+### 8.4 Latent CUDA-graph invalidation gap
 
 `resize_card_cache()` (`engine.cpp:2118`) and `shrink_cache()` (`engine.cpp:1409`) move experts between slots, but CUDA
 graphs are invalidated only under `#if defined(STRATA_GPU_METAL)` (`2124-2128`), and the pass-graph key
@@ -251,33 +367,38 @@ Because `read_layer_major()` is off, **every number in §4 is a floor, not a cei
 | Metal / macOS (Apple Silicon) | **Unsupported** | there is no Metal variant of the kernels; `inkling2_kernels.cu` is the only implementation |
 | CPU-only, no GPU | **Unsupported** | `strata-poly` is only built under `CUDA OR HIP`; attention, short convolution, depth mixing and loop control are card kernels with no host fallback |
 
-Full GPU residency is the configuration most likely to change §8.1: at 8 GB the KV arena and the expert stream compete for
+Full GPU residency is the configuration most likely to change §4.3: at 8 GB the KV arena and the expert stream compete for
 the same VRAM, which is exactly the pressure under which the corruption appears.
 
 ---
 
 ## 11. Next actions, in priority order
 
-1. **Run the end-to-end cosine gate** (no GPU changes needed to prepare): `STRATA_DUMP_BIN` + `tools/dump_cos.py`
-   against `tools/ref_core.py` at `blk.6`, `blk.23` and the final logits, cosine ≥ 0.999. This is the Phase 1 exit
-   criterion and the only thing standing between "runs" and "correct".
-2. **Find the intermittent corruption.** Instrument `moe_rows()`'s `kStageRows = 32` staging and `copy_seq()`'s per-chunk
-   recurrent state; both are exercised only by a long prefill.
-3. **Fix the bank leak** behind `5 of 5 at step 42`; one state leaks per request.
+1. **Run the end-to-end cosine gate** — **blocked**: the FP64 oracle dequantizes only NVFP4 and Q8_0, and the only
+   weights on disk are `UD-Q4_K_XL`. It needs the NVFP4 source checkpoint (`Inkling-2-Mini` unquantized or the
+   `Q8_0` GGUF) downloaded first. Once it is, `STRATA_DUMP_BIN` + `tools/dump_cos.py` against `tools/ref_core.py`
+   at `blk.6`, `blk.23` and the final logits, cosine ≥ 0.999.
+2. **Make the Q8_0 attention kernel pay for itself or drop it.** It is 6–13% slower than FP16 and buys 38 resident
+   experts below 32K. Either an `__dp4a` integer dot with the per-32-block scales (as `quantize.cpp`'s dot does) or keep
+   FP16 as the default and select Q8_0 only for `--kv-whole` at 128K, where it keeps 405 experts instead of 0.
+3. **Fix the RAM heuristic** (§8.2) so a VRAM win cannot silently cost the prefetch pool.
 4. **Turn on `read_layer_major()`** once per-visit state can move to host memory. This is the largest available prefill win
    and would make §4 obsolete as a baseline.
-5. **Close the CUDA-graph invalidation gap** in `shrink_cache()` / `resize_card_cache()` before `L.card` ever becomes 1.
-6. **Re-define the speed gate** against something that exists, since the `llama.cpp` comparison is undefined (§6).
-7. Decide whether the `STRATA_MMQ_LOG` and `STRATA_GROW_LOG` probes stay. Both are `getenv`-gated and off by default, so
+5. **Measure coherence and needle recall above 32K.** Coherence is now proven to 10.3K on controlled prompts (§8.1), but
+   32K/64K/128K is unmeasured because a full 128K prefill is ≈ 96 min on this card.
+6. **Close the CUDA-graph invalidation gap** in `shrink_cache()` / `resize_card_cache()` before `L.card` ever becomes 1.
+7. **Re-define the speed gate** against something that exists, since the `llama.cpp` comparison is undefined (§6).
+8. Decide whether the `STRATA_MMQ_LOG` and `STRATA_GROW_LOG` probes stay. Both are `getenv`-gated and off by default, so
    they are inert in normal use.
-8. Then, and only then, the plan's Phase 2 onward: Q8_0 KV, NVFP4 prefill, fusion, CUDA graphs, vision, regression.
 
 ---
 
 ## 12. Open questions
 
-- Does the corruption survive with **full GPU residency**? Untested, and the most informative single experiment.
-- Does it reproduce with `--kv q8_0` at the same length? Q8_0 halves the KV footprint, which changes the pressure.
+- Does coherence hold above 10.3K? Unmeasured; a full 128K prefill is ≈ 96 min at 23 tok/s. The earlier "long-context
+  corruption" is now explained by prompt content (§8.1), so this is a measurement gap, not a suspected bug.
+- Does the Q8_0 KV win at 128K once the attention kernel is integer? The residency is proven (405 experts with
+  `--kv-whole` vs 0), the throughput is not.
 - Is the `bank is full` leak one state per *request* or one per *prompt chunk*? A chunked prompt would distinguish them.
 - Do layers 20–23's Q8_0 experts (no `.scale` tensor) diverge from layers 0–19's NVFP4 at long context? The
-  `expert_matrix()` path in `tools/ref_core.py` exists to answer this.
+  `expert_matrix()` path in `tools/ref_core.py` exists to answer this, and needs the NVFP4 source too.

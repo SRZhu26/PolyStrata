@@ -23,7 +23,9 @@ Focused verification & benchmark sequence after four fixes/optimizations landed 
    `the depth attention's bank is full (5 of 5 at step 42)` when conversation marks split a read into `n_calls >= 2`.
 3. **Parallel 32-lane warp softmax** in `ink_attend_rel_kernel` (replaces 128 serial `expf()` calls on `lane == 0`).
 4. **Full `--kv q8_0` support** (`ink_attend_rel_q8` + `store_q8` + Q8_0 save/load in `src/poly/inkling2.cpp`) —
-   cuts KV VRAM by 46.88% (128K KV drops from 4.31 GiB → **2.29 GiB**, freeing ~2.0 GiB VRAM for hot experts).
+   cuts KV VRAM by 46.88% (128K KV drops from 4.31 GiB → **2.29 GiB**), but only frees it for experts when the KV is
+   preallocated (`--kv-whole`): measured, 128K `--kv-whole` leaves **405** experts resident on Q8_0 and **0** on FP16. With
+   lazy KV growth the pool claims first and Q8_0 buys 38 experts below 32K, at a 6–13% speed cost. See Step 4 results below.
 
 ### Step 1 — Rebuild & Kernel Unit Tests (~2 min)
 ```powershell
@@ -37,6 +39,10 @@ Confirm clean CUDA `sm_120` build and all 17 FP64 kernel checks pass.
    (with `--kv q8_0`) and confirm zero `bank is full` errors.
 2. **Conv-state warp-race fix (intermittent corruption at ~10,900 tokens)**: Run 3 consecutive ~10,900-token
    prefills + 256-token decodes on a fresh server and verify all 3 produce coherent text (no repetition loop).
+   **Done, with a correction:** the loop was never length-dependent. With one question held fixed and only the filler length
+   changed, 6,185 / 8,233 / 10,281 tokens are all coherent; a README dump loops at 1,432 tokens under both KV formats and
+   both greedy and sampled decoding. The loop follows the prompt's repeated proper noun, not the length. Coherence above 10.3K is
+   still unmeasured. See `inkling2_progress.md` §8.1.
 
 ### Step 3 — End-to-End Parity & Q8_0 KV Agreement (~5 min)
 ```powershell
@@ -73,10 +79,44 @@ python tools/bench_128k_local.py --out bench/q8-128k --models iq4xs=<gguf> --eng
 ```
 Record for each length: **prefill tok/s, decode tok/s, TTFT, peak VRAM (<= 7,680 MiB), peak RSS, and swap (target 0 GiB)**.
 
+### Step 4 — Results (2026-11-23), and what they change
+
+Same binary, same prompt per pair, fresh server per row, `UD-Q4_K_XL`:
+
+| Context | KV | Prefill tok/s | Decode tok/s | VRAM peak | RSS | Experts in VRAM |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 8,198 | fp16 | **136.3** | **8.1** | 6,640 MiB | 12.46 GiB | 791 (3.8 GiB) |
+| 8,198 | q8_0 | 127.7 | 7.2 | 6,640 MiB | 14.61 GiB | 829 (4.0 GiB) |
+| 32,015 | fp16 | **77.3** | **8.7** | 6,640 MiB | 14.88 GiB | 791 |
+| 32,015 | q8_0 | 66.9 | 7.6 | 6,640 MiB | 14.39 GiB | 829 |
+| 128,072 (load only) | fp16 / q8_0 | — | — | — | — | 791 / 829 |
+| 128,072, `--kv-whole` | fp16 | — | — | — | — | **0** |
+| 128,072, `--kv-whole` | q8_0 | — | — | — | — | **405 (1.9 GiB)** |
+
+**Three conclusions change this section's premise:**
+
+1. **Q8_0 KV is correct** — teacher-forced agreement with FP16 is **99.79%** (479/480, 5 prompts × 96 tokens),
+   above the 97% gate. It is a sound format.
+2. **Q8_0 KV is slower, not faster** — 6.3% at 8K and 13.5% at 32K prefill, 11.1% and 12.6% decode. The saving
+   below 32K is only 0.25–0.54 GiB, which buys 38 experts and does not pay for dequantizing K and V on every score and
+   value element (`inkling2_kernels.cu:397`, `:432`).
+3. **The 2.29 GiB / 4.31 GiB claim only holds with `--kv-whole`**, i.e. when the KV is preallocated for the whole
+   context. There, 128K FP16 leaves **0** experts resident and Q8_0 leaves **405**. With lazy KV growth the expert pool claims
+   the card first and Q8_0 buys only the 38 experts its 0.25–0.54 GiB covers.
+
+So Step 4's expected win does not exist at 8K/32K. Revised Step 4: **keep FP16 KV as the default and measure Q8_0 only
+with `--kv-whole` at ≥128K**, where residency is the binding constraint. Also pin `--ram-experts-mib` whenever Q8_0 is
+used: the auto heuristic flips to the unpinned path on the freed VRAM (see `inkling2_progress.md` §8.2), costing 0.4 tok/s
+and 2.5 GiB of RSS at 8K.
+
+A faster Q8_0 path is a kernel problem, not a format problem: an `__dp4a` integer dot over the per-32-block scales, as
+`quantize.cpp`'s vec dot does, instead of `__half2float` per element.
+
 ### Step 5 — Next High-Impact Speedups (After Step 4 Numbers)
 1. **Enable `read_layer_major()`** (move per-call depth-bank/message scratch to host): eliminates re-reading experts
    on every 1,024-token chunk (**4–10× faster 32K/128K prefill**).
-2. **Attention kernel upgrade**: MMA tensor-core prefill + split-K flash-decoding for `ink_attend_rel_q8`.
+2. **Attention kernel upgrade**: MMA tensor-core prefill + split-K flash-decoding for `ink_attend_rel_q8`, and `__dp4a` for
+   the integer dot, without which Q8_0 KV cannot beat FP16 at any length measured.
 3. **Pass-aware `tail_key()` + CUDA Graphs (`L.fixed = true`)** + kernel fusion for decode.
 
 ---
