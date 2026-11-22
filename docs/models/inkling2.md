@@ -91,8 +91,11 @@ same GGUF.
 
 - `tools/ref_prelude.py` — validated per-stage oracle, used by `tools/dump_cos.py`.
 - `tools/ref_core.py` — the full model: all 74 stages plus logits run end to end.
-- Parity: 17 checks pass at `blk.6`, `blk.23` and the final logits, comparing `strata-poly` against the oracle with
-  cosine ≥ 0.999 per stage.
+- **Kernel parity:** `poly_inkling2_test` compares the kernels against the FP64 reference of the same graph; its 17
+  checks pass.
+- **End-to-end cosine gate:** **not yet computed.** The `STRATA_DUMP_BIN` + `tools/dump_cos.py` comparison of
+  `blk.6`, `blk.23` and the final logits against `ref_core.py` has not been run, so no per-stage cosine figure exists
+  for the assembled model. Kernel-level parity is not a substitute for it.
 
 ## Measured results (RTX 5060 Laptop, `UD-Q4_K_XL` 17.6 GB, FP16 KV, streaming experts)
 
