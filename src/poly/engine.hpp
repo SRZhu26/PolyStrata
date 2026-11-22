@@ -461,6 +461,15 @@ protected:
     }
     /// The shared expert, into fo_.  It runs on the GPU while the host routes.
     virtual void moe_shared(const Layer& L, int il, int n) = 0;
+    /// Whether route() has already made the chosen experts' weights sum to one, leaving out the layer's own
+    /// expert_weights_scale because it applied it after.  The engine's moe() otherwise divides them by their
+    /// sum, which is what a route() that does not normalize needs - and that also cancels a scale it applied.
+    virtual bool weights_normalized() const { return false; }
+    /// The routed experts' activation, after their gate and up products: `gate_up` holds n_ff gate values and
+    /// then n_ff up values a row, and `out` gets n_ff.  The engine's own is SwiGLU within `limit`, or GeGLU
+    /// where gelu_ is set; an architecture whose activation is neither overrides it.
+    virtual void moe_act(const float* gate_up, float* out, int n_ff, int rows, float limit, void* stream,
+                         const ExpertScales* scales);
     /// The scores of a layer's router for n tokens, into rl_.  The engine's own: the router's matrix times the
     /// experts' input (xn_).
     virtual void router_scores(const Layer& L, int n);
@@ -503,6 +512,9 @@ protected:
     virtual bool halves_ok() const { return true; }
     /// Whether read() may process a long prompt across multiple calls layer-major (sharing experts across calls).
     virtual bool read_layer_major() const { return true; }
+    /// Whether the recurrent state is saved as a whole (a model whose layers run more than once, so a layer's
+    /// index does not name its state) rather than a layer at a time.
+    virtual bool state_whole() const { return false; }
     int cur_step_ = 0;   ///< the visit run() / step() / read() is on; read by layer_head/layer_tail/head_key/next_moe/save_layer
     /// While step() runs a head in one call: each row's sequence and position, row after row; else null.  snap: for
     /// the first of a sequence's two rows, where every recurrent layer leaves the state after it (at its place in
@@ -731,6 +743,10 @@ protected:
     void* ev_out_[2] = {};    ///< marks the card done with a call in each half
     float rms_eps_ = 0;
     bool gelu_ = false;       ///< the routed experts' activation: GELU of the gate, else SiLU within the layer's limits
+    /// The routed experts' activation is situ (Inkling 2): beta*tanh(gate/beta)*sigmoid(gate) times the up side
+    /// capped at linear_beta.  Overrides gelu_ where an architecture sets it.
+    bool situ_ = false;
+    float situ_beta_ = 4.f, situ_linear_beta_ = 25.f;
     std::vector<float> clamp_exp_, clamp_shexp_;   ///< a layer's SwiGLU limits: the routed experts', the shared one's
     /// a prompt batch's products go through guard_half_sums(): the model's activations can sum past a half's range
     /// in a block.  Off for the models whose sums stay in range: it cost LFM2.5 4% of a 30K prompt's read on a 5090.

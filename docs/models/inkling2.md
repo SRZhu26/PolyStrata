@@ -1,14 +1,15 @@
-# Inkling 2 Mini 26B-A5B (engine scaffolding)
+# Inkling 2 Mini 26B-A5B (`inkling2_loop`)
 
 Thinking Machines Lab's [Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) in
 [Unsloth's `Mainline_Support` GGUFs](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/tree/main/Mainline_Support)
-uses the `inkling2_loop` architecture (`ggml-org/llama.cpp` PR `#32694` + `#32704`).
+uses the `inkling2_loop` architecture (renamed `inkling2` from the Mainline_Support release on).
 
-> **Status:** Scaffolding only. `Inkling2::load_geometry()` and KV sizing (FP16 and Q8_0) are wired into
-> `src/poly/inkling2.cpp`, `src/poly/engine.cpp`, `CMakeLists.txt` and `setup.py`. Forward kernels are stubbed
-> until built and tested on a CUDA/HIP machine. No speeds or outputs have been measured on `strata-poly` yet.
-> For the complete tensor inventory, phased kernel implementation/fusion plan, and 4-stage verification plan, see
-> **[inkling2_plan.md](inkling2_plan.md)**.
+> **Status:** Implemented and measured on one machine — the RTX 5060 Laptop (8 GB VRAM, 32 GB RAM, Windows,
+> CUDA 13.1, `sm_120`). It loads, prefills, decodes and produces coherent text at short and medium context.
+> It is **not** production-ready: long-context output is intermittently corrupted (see
+> [Known defects](#known-defects)), and three throughput capabilities are deliberately disabled
+> (see [Disabled capability hooks](#disabled-capability-hooks)). Only the CUDA backend has ever been built.
+> For the tensor inventory and the phased plan, see **[inkling2_plan.md](inkling2_plan.md)**.
 
 ## Architecture and KV cache math
 
@@ -18,6 +19,9 @@ From `Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file` (`ea0c79b2ecd73669e77
   gates → **48 logical layer applications per token** (26.2B total, 3.4B unique active, 5.4B effective active).
 - **Attention split**: 20 physical local SWA layers (`sliding_window = 1024`) and 4 global layers (`5, 11, 17, 23`)
   → **40 local SWA + 8 global** logical KV caches per sequence (`n_head = 24`, `n_kv = 8`, `head_dim = 128`).
+- **Position**: `rope.dimension_count = 0` — there is no RoPE. Position enters only through a `relative_length = 16`
+  bias table with `relative_extent = 1024`, `log_scale_floor = 8192`, `log_scale_alpha = 0.1`, `qk_clip = 22.627`
+  and `relative_clip = 8.0`.
 - **Per-token KV size** (using `strata-poly`'s Q8_0 block layout from [Q8_KV.md](../Q8_KV.md)):
   - **FP16**: `4,096 B/tok/layer` → **32,768 B/tok** (32 KiB/tok) across 8 global layers + **320 MiB** SWA rings
     (`1024 + 1024` prompt-batch rows).
@@ -43,72 +47,107 @@ for KV + hot experts):
 | 192K | 6.31 GiB | 3.35 GiB | ~1.0 GiB |
 | 256K | 8.31 GiB | 4.42 GiB | ~0 GiB |
 
-`setup.py --family inkling2` defaults to **32K** context (128K available via `--context 131072` once measured),
-**`--kv q8_0`**, and **`UD-IQ4_XS`** (provisional default; `UD-Q3_K_XL`, `UD-IQ3_XXS`, `UD-Q4_K_XL`, and
-`UD-Q4_K_M` are also offered, with the final default chosen after Stage 4 benchmarks).
+`setup.py --family inkling2` defaults to **32K** context (128K available via `--context 131072`), **`--kv q8_0`**,
+and **`UD-IQ4_XS`** (provisional default; `UD-Q3_K_XL`, `UD-IQ3_XXS`, `UD-Q4_K_XL`, and `UD-Q4_K_M` are also
+offered, with the final default chosen after Stage 4 benchmarks).
 
-## Bringup on the RTX 5060 Laptop (Windows, 32 GB RAM, 8 GB VRAM)
+## Implementation
 
-### 1. Checkout this branch and download the GGUF
+The architecture is not reachable through the generic engine path, so it has its own implementation:
 
-```powershell
-git fetch fork
-git checkout add-inkling2-mini
-```
+| File | Lines | Contents |
+| --- | ---: | --- |
+| `src/poly/inkling2.cpp` | 758 | the `Inkling2` class: 27 hook overrides |
+| `src/poly/inkling2.hpp` | 170 | its interface and capability flags |
+| `src/poly/inkling2_kernels.cu` | 585 | 13 CUDA kernels |
+| `src/poly/inkling2_test.cu` | 485 | kernel tests against an FP64 reference |
 
-Install the model files (or pass `--gguf-dir` if you already downloaded them; rename `.gguf_file` to `.gguf`):
+Engine-side integration (`src/poly/engine.cpp`, `engine.hpp`, `kernels.hpp`, `cpu_experts.cpp/hpp`,
+`CMakeLists.txt`, `tools/strata_tokenizer.py`) adds the arch registration, the `--kv q8_0` allowance, the shared
+`gate_up` NVFP4 scale, the `situ` activation hook, and the CPU-expert `situ` path.
 
-```powershell
-python setup.py --family inkling2 --model UD-Q4_K_XL --context 32768 --kv q8_0 --vision no --yes --no-start
-```
+Kernels with no equivalent anywhere else in the engine:
 
-### 2. Build `strata-poly` from source (CUDA)
+- `ink_situ` / `ink_situ_rows` — `situ` replaces SwiGLU/GeGLU (`beta = 4.0`, `linear_beta = 25.0`).
+- `ink_rel_table` + `ink_attend_rel` — the relative-position bias table and the attention that consumes it.
+- `ink_depth_mix` / `ink_bank_states` — the depth-attention bank.
+- `ink_conv` / `ink_conv_state` — the convolutional recurrent state (`k = 4`).
+- `ink_tau` — position-dependent temperature, flat at `1.0` below `log_scale_floor = 8192`.
+- `ink_clip_l2` — the `qk_clip = 22.627` per-head L2 clip.
+- `ink_control` — the loop gate's `down`/`forget`/`gain` state update.
+- `ink_finish_logits` — softcap `30.0` and stripping the 966 rows of vocabulary padding.
 
-Requires Visual Studio Build Tools (C++), CUDA Toolkit, and CMake:
+KV caches hang off the **visits**, not the blocks, because a core layer is visited three times over the same
+weights: window layers get a `ring = min(max_context, window + rows)` ring from `seq_alloc`, full-context layers get a
+row at a time from the growing `kv_alloc` arena.
 
-```powershell
-python setup.py --family inkling2 --model UD-Q4_K_XL --build --yes --no-start
-```
+## Reference and verification
 
-Verify that `Engine::open()` recognizes `inkling2_loop` and prints the 48-layer geometry and Q8_0 KV row size
-before hitting the `Inkling2::load_layer()` bringup stub.
+**There is no `llama.cpp` baseline for this architecture.** Build `b11669` (commit `620d2225c`) refuses the file with
+`unknown model architecture: 'inkling2_loop'`, and neither `llama-server.exe` nor `llama.dll` contains the string. Mainline
+`llama.cpp` has no `inkling2` implementation, so a `llama.cpp` speed or parity comparison is not merely unmeasured — it is
+undefined. The reference is the FP64 oracle in `tools/ref_core.py`, which runs the whole model in double precision from the
+same GGUF.
 
-### 3. Reference run with `llama.cpp` (for baseline & greedy parity)
+- `tools/ref_prelude.py` — validated per-stage oracle, used by `tools/dump_cos.py`.
+- `tools/ref_core.py` — the full model: all 74 stages plus logits run end to end.
+- Parity: 17 checks pass at `blk.6`, `blk.23` and the final logits, comparing `strata-poly` against the oracle with
+  cosine ≥ 0.999 per stage.
 
-Until the remaining kernels in `src/poly/inkling2.cpp` are filled in, run Inkling-2-Mini with mainline `llama.cpp`
-pinned to PR `#32704` commit `2a28df0f9bd55c4975b6bffb35229a6020720f13` (if that commit does not load the file,
-use Unsloth's prebuilt `b12588-mix-c0c3de8`). Let `llama.cpp` fit the model to 8 GB itself (`--fit-target`, no
-`-ngl`/`-ot`, since `-ot "exps=CPU"` was measured 2–8× slower):
+## Measured results (RTX 5060 Laptop, `UD-Q4_K_XL` 17.6 GB, FP16 KV, streaming experts)
 
-```powershell
-git clone https://github.com/ggml-org/llama.cpp
-cd llama.cpp
-git fetch origin pull/32704/head:inkling2-loop-fix
-git checkout 2a28df0f9bd55c4975b6bffb35229a6020720f13
-cmake -B build -DGGML_CUDA=ON
-cmake --build build --config Release -j --target llama-cli llama-bench llama-server llama-tokenize
+| Prompt | Prefill tok/s | Decode tok/s | VRAM peak | RSS peak |
+| --- | ---: | ---: | ---: | ---: |
+| 8,198 | 71.7 | 5.0 | 7,498 MiB | 11.53 GiB |
+| 16,343 | 84.4 | 10.1 | 6,640 MiB | 12.54 GiB |
+| 130,715 | 23.4 (average) | — | — | — |
 
-# 0. Confirm the pinned build loads the file:
-.\build\bin\Release\llama-cli.exe -m ..\models\inkling2-ud-q4_k_xl\Inkling-2-Mini-UD-Q4_K_XL.gguf -n 1 -p "hi"
+Prefill curve over the 128K prompt: 111.8 tok/s at 1,024 tokens, 68.3 at 8,192, 39.4 at 32,768, 23.3 at 65,536,
+16.8 at 98,304, 13.7 at 122,880. Model load takes 12.1 s. The 8K decode figure comes from a run that degenerated
+into a loop, so it understates throughput. Peak system memory was 25.2 GiB with 0.95 GiB of swap.
 
-# 1. Speed baseline (llama.cpp auto-fits to 8 GB VRAM):
-.\build\bin\Release\llama-bench.exe -m ..\models\inkling2-ud-q4_k_xl\Inkling-2-Mini-UD-Q4_K_XL.gguf `
-  -fa 1 -ctk q8_0 -ctv q8_0 --fit-target 1024 --fit-ctx 32768 -p 2048 -n 128 -r 3
+Gates: VRAM ≤ 7.5 GiB — passes, but only by 182 MiB at 8K. RAM ≤ 26 GiB — passes at 25.2 GiB, also narrowly.
+Decode ≥ 1.5× `llama.cpp` — **cannot be evaluated**, because no `llama.cpp` result exists for this architecture.
 
-# 2. Greedy parity reference (--temp 0 --seed 42):
-.\build\bin\Release\llama-cli.exe -m ..\models\inkling2-ud-q4_k_xl\Inkling-2-Mini-UD-Q4_K_XL.gguf `
-  --jinja -c 32768 -ctk q8_0 -ctv q8_0 --temp 0 --seed 42 -n 128 -p "Explain quicksort in three sentences."
-```
+## Disabled capability hooks
 
-### 4. Remaining `src/poly/inkling2.cpp` bringup checklist
+Three hooks in `inkling2.hpp` are switched off, each marked `// until Phase N`. All three cost throughput, not
+correctness:
 
-1. `Inkling2::load_layer()`: load non-expert tensors (`attn_q/k/v/gate/output/rel/rel_bias/q_clip/rel_clip/sink_proj`,
-   `attn_{k,v,post}_conv`, `attn_k_{conv_proj,inp_norm}` on global layers, `attn_res_query`/`ffn_res_query`,
-   `loop_{q,k,v,ffn}_ctrl_{down,forget,gain}`, `loop_msg_query`) and fused `ffn_gate_up_exps.{weight,scale}` +
-   `ffn_down_exps.{weight,scale}` (keeping per-expert scales bound on all 3 core passes).
-2. `src/poly/kernels.cu`: relative-position attention (`d_rel=16`, `rel_extent=1024`, QK/rel L2 clip, log-scaling,
-   value norm without gamma, FP16 + Q8_0 KV readers), causal short conv (`k=4`), rank-64 loop gates, block-6
-   attention residuals, and situ softcapped MoE (`4.0`/`25.0`) + final logit softcap (`30.0`).
-3. Parity: compare greedy outputs (`temperature=0`) against mainline `llama.cpp` (+ `#32704`) on `UD-Q4_K_M` and
-   `UD-Q4_K_XL`, then check `tools/kv_agree.py` for FP16 vs Q8_0 KV.
-4. Before any upstream PR: build and verify both CUDA and HIP backends (`AGENTS.md`).
+| Hook | Value | Effect |
+| --- | --- | --- |
+| `read_layer_major()` | `false` | A long prompt cannot be read layer-major across calls, so experts are **re-read from disk for every chunk** instead of being shared. This is the largest prefill cost at long context. |
+| `halves_ok()` | `false` | A window's tokens cannot be pipelined through the layers in two halves. |
+| `state_whole()` | `true` | The recurrent state is saved whole rather than a layer at a time, because a core layer's index does not name its visit's state. |
+
+The measured numbers above are therefore a **lower bound** on this engine's throughput, not a ceiling.
+
+## Known defects
+
+1. **Intermittent long-context corruption.** At roughly 10,900 tokens of prefill, about two runs in three degenerate
+   into a repetition loop; the same prompt, same binary and a fresh server sometimes produce coherent text (10,890 tokens
+   coherent vs 10,898 degenerate — a race, not a length threshold). Ruled out: sampling, `tau`, softcap, vocabulary
+   padding, the SWA ring, `cover()` growth, `shrink_cache`, swap prefetch, and the attention kernel itself (re-running a
+   cached prefix over the same KV is always coherent). Remaining suspects are the `kStageRows = 32` staged expert launches
+   in `moe_rows()` and the per-chunk recurrent state copies in `copy_seq()`.
+2. **Sixth sequential request on one server dies** with `the depth attention's bank is full (5 of 5 at step 42)`.
+   `max_states_ = 5` and a single read should peak at 4, so one bank state leaks per request.
+3. **Latent CUDA-graph invalidation gap.** `resize_card_cache()` and `shrink_cache()` move experts between slots, but
+   CUDA graphs are invalidated only under `#if defined(STRATA_GPU_METAL)`, and the pass-graph key omits the cache layout.
+   Harmless today only because `L.card == 1` is false for streamed experts.
+
+## Limitations
+
+These configurations are **not supported**. They are recorded so the gap is explicit rather than discovered by a user.
+
+| Configuration | Status | Why |
+| --- | --- | --- |
+| **Full GPU residency** (all 17.6 GB in VRAM) | **Untested** | No machine with ≥ 18–20 GB of VRAM has run it. The code path should work — experts are streamed by policy, not by necessity — but it has never been executed. Treat as unverified, not as supported. |
+| **HIP / ROCm (AMD)** | **Unsupported** | `inkling2_kernels.cu` hardcodes `cudaStream_t` at line 28 with no `__HIP__` branch. Sibling `kernels.cu` does have one; these kernels do not, so an AMD build fails to compile. |
+| **Metal / macOS (Apple Silicon)** | **Unsupported** | There is no Metal variant of the kernels. `inkling2_kernels.cu` is the only implementation, and it is CUDA. |
+| **CPU-only (no GPU)** | **Unsupported** | `strata-poly` is only built under `CUDA OR HIP`. Attention, the short convolution, depth mixing and the loop control are card kernels with no host fallback. |
+| **Multi-GPU layer split** (`--layer-split`) | **Untested** | The flag exists, but per-visit KV caches plus `state_whole()` make it riskier than for other models. |
+| **CPU experts** (`--ram-experts-mib`) | **Supported** | `cpu_experts()` carries the `situ` path, so CPU experts compute the same activation as `ink_situ_rows_kernel`. |
+
+Full GPU residency is the most likely configuration to change the picture: at 8 GB the KV arena and expert streaming
+compete for the same VRAM, which is exactly the pressure under which the corruption appears.

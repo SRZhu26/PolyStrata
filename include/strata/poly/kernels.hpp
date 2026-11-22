@@ -417,4 +417,74 @@ void dsv4_attend(const float* q, const uint16_t* raw, int ring, int window, cons
 /// y[g][t] = x[t][g] for `rows` tokens of `groups` groups of n values; with back, y[t][g] = x[g][t].
 void permute_groups(const float* x, float* y, int n, int groups, int rows, bool back, void* stream);
 
+// ---- Inkling 2 Mini (src/poly/inkling2_kernels.cu).  Phase 1: exact, unfused, FP32-accumulated; the reference
+// for every one of these is llama.cpp's inkling2 graph (docs/models/reference/inkling2.cpp).
+
+/// ggml's `clip`: each of `rows * heads` vectors of `dim` values is scaled down to an L2 norm of at most
+/// `threshold`, after the optional per-channel `scale` (dim values, or null).  In place.
+void ink_clip_l2(float* x, const float* scale, int dim, int heads, int rows, float threshold, void* stream);
+
+/// situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate) * linear_beta*tanh(up/linear_beta); `out` is `n` values
+/// a row of `rows`.  A `linear_beta` of 0 leaves `up` alone.
+void ink_situ(const float* gate, const float* up, float* out, int n, int rows, float beta, float linear_beta,
+              void* stream);
+
+/// situ for rows that each hold n gate values and then n up values, as swiglu_clamp_rows' layout: `out` has n values
+/// a row, and `scales` multiplies each row's gate and up by its expert's first (the fused ffn_gate_up_exps scales).
+void ink_situ_rows(const float* gate_up, float* out, int n, int rows, float beta, float linear_beta, void* stream,
+                   const ExpertScales* scales = nullptr);
+
+/// The causal short convolution of `k` taps with a residual: out[t][c] = (x[t][c] + sum_i w[c][i] * x_ext[t+i][c]) /
+/// sqrt((dyn ? 2 : 1)*k + 1), where x_ext's first `k - 1` rows are `state` (oldest first) and the rest `x`.
+/// With `dyn`, an input-dependent tap adds sum_i x_ext[t+i][c] * dyn[t][k-1-i][c / (channels/n_head)].  `state`
+/// is advanced to the last `k - 1` rows of x_ext.
+void ink_conv(const float* x, float* state, const float* w, const float* dyn, float* out, int channels,
+              int rows, int k, int n_head, void* stream);
+
+/// The relative-position bias of a token, head and distance: kqb[token][head][d] =
+/// tau[token] * sum_r bias[r][d] * rcur[token][head][r] - sinks[token][head].  `d` is the distance to the key,
+/// min(extent, pos_token - pos_key) as llama-kv-cache's set_input_relative_pos() clamps it, and `n_keys` is the
+/// rows of the bias: the extent, or the context where that is shorter.  Row `extent` of the bias is the zero pad
+/// ggml_pad() adds, so a key further off than the extent weighs nothing.  `tau` (one a token) is null where the
+/// layer does not log-scale its positions.
+void ink_rel_table(const float* bias, int n_rel, const float* rcur, const float* sinks, const float* tau,
+                   float* kqb, int rows, int n_head, int n_keys, void* stream);
+
+/// The attention with the relative-position bias: token t attends the `window` positions up to it (all when 0), the
+/// bias kqb (n_keys a head) is added before the softmax, and a zero-logit sink takes part with no value.  The
+/// keys and values are fp16, kv_heads * dim a row, and a window layer's cache is a ring of `ring` rows (0: the
+/// key's position is its row).  `q` and `out` are n_head * dim a token.  `tau` scales the q.k term of a
+/// full-attention layer (the bias is already scaled), or null.
+void ink_attend_rel(const float* q, const uint16_t* kc, const uint16_t* vc, const float* kqb, const float* tau,
+                    int64_t pos, int rows, float* out, int dim, int n_head, int kv_heads, float scale,
+                    int window, int n_keys, int ring, void* stream);
+
+/// The states the depth attention mixes, a token at a time: the bank's `n_bank` blocks newest first and then `cur`,
+/// which the reference's concat leaves last.  `bank` holds max_bank blocks of `bank_stride` floats each, and only the
+/// rows [first, first + rows) of them are read.  `out` is `n_bank + 1` states of n_embd a token.
+void ink_bank_states(const float* bank, const float* cur, float* out, int n_embd, int n_bank, int bank_stride,
+                     long long first, int rows, void* stream);
+
+/// The log-scaled position factor of a full-attention layer, one a token:
+/// tau = 1 + alpha * log(max(1, (pos + row + 1) / floor)).
+void ink_tau(float* tau, int64_t pos, int floor, float alpha, int rows, void* stream);
+
+/// The attention over the depth: states[n_states - 1] is the layer's input and states[0..] the bank's blocks,
+/// newest first, as the reference's concat leaves them; every state is RMS-normed without a gain, and each of the
+/// `n_q` learned queries mixes the normed ones.  `states` is n_states * n_embd a token, `query` n_q * n_embd,
+/// and `out` `n_q` blocks of `rows` tokens, each block n_embd values a token.
+void ink_depth_mix(const float* states, const float* query, float* out, int n_embd, int n_states, int n_q,
+                   int rows, void* stream);
+
+/// The looped core's control, in place: x = (1 - tanh(forget . gate)) * x + tanh(gain . gate) * message, where
+/// `gate` is the rank-`rank` product of the two RMS-normed inputs.  `down` is `rank` rows of 2 * n_embd (the
+/// concatenated normed inputs), `gain` and `forget` are n_embd rows of `rank`.  `gate` is scratch of
+/// `rows * rank` + `rows * 2 * n_embd` floats.
+void ink_control(float* x, const float* message, const float* down, const float* gain, const float* forget,
+                 int n_embd, int rank, int rows, float* gate, void* stream);
+
+/// The final logits, in place: the softcap (when `cap` > 0) and then the padded vocabulary the reference
+/// drops, which becomes -inf so no sampler can pick one.  `logits` is `n_vocab` values a row.
+void ink_finish_logits(float* logits, int n_vocab, int n_unpadded, float cap, int rows, void* stream);
+
 }  // namespace strata::poly

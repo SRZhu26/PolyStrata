@@ -1192,6 +1192,9 @@ void* Engine::kv_alloc(size_t bytes, int per) {
     }
 #endif
     void* p = nullptr;
+    if (std::getenv("STRATA_GROW_LOG"))
+        std::fprintf(stderr, "strata: kv_alloc bytes=%zu per=%d all=%.1f MiB vmm=%d grow=%d\n", bytes, per,
+                     all / 1048576.0, vmm_ ? 1 : 0, (int) opt_.kv_grow);
     if (!vmm_ || !opt_.kv_grow) {
         p = dmalloc(all, "the attention cache");
     } else {
@@ -1325,6 +1328,9 @@ void Engine::cover(int64_t end) {
     }
 #endif
     kv_reach_ = std::max(kv_reach_, end);
+    if (std::getenv("STRATA_GROW_LOG"))
+        std::fprintf(stderr, "strata: cover end=%lld kv_rows=%lld nkv=%zu grow=%d vmm=%d\n",
+                     (long long) end, (long long) kv_rows_, kv_.size(), (int) opt_.kv_grow, vmm_ ? 1 : 0);
     if (kv_.empty() || end <= kv_rows_) return;
     const int64_t rows = kv_rows_for(end);
     const auto size = [rows](const Kv& k) { return (size_t) ((rows + k.per - 1) / k.per) * k.bytes; };
@@ -1334,6 +1340,10 @@ void Engine::cover(int64_t end) {
         if (want > k.mapped) more += want - k.mapped;   // trim_card_kv() leaves a piece it cuts through
         held += k.mapped;
     }
+    if (std::getenv("STRATA_GROW_LOG"))
+        std::fprintf(stderr, "strata: cover end=%lld rows=%lld more=%.1f MiB pool=%.1f MiB arena=%.1f MiB kv_rows=%lld\n",
+                     (long long) end, (long long) rows, more / 1048576.0, vpool_bytes() / 1048576.0,
+                     arena_.mapped / 1048576.0, (long long) kv_rows_);
     if (exp_ && pool_on_) {
         // What the rows need beyond what the pool holds comes out of the expert cache, which gives its pieces to the
         // pool (shrink_cache()); nothing is asked of the card.  With the cache gone and the pool still short, the
@@ -1455,6 +1465,9 @@ void Engine::shrink_cache(size_t bytes) {
         --cached_;
     }
     ck(cudaStreamSynchronize(cs(st_)), "the expert cache");
+    if (std::getenv("STRATA_GROW_LOG"))
+        std::fprintf(stderr, "strata: shrink_cache bytes=%.1f MiB cut=%.1f MiB cached=%lld -> end=%.1f MiB\n",
+                     bytes / 1048576.0, cut / 1048576.0, (long long) cached_, end / 1048576.0);
     vmm_unmap(arena_, cut);
     if (cut > kTail) zero_vram(exp_ + end, kTail);
     exp_at_ = std::min(exp_at_, end);
@@ -1654,15 +1667,18 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
     const std::string name = arch ? arch->s : std::string();
     // Clover is a qwen35moe model trained to also guess a block of tokens at once (Qwen35)
     const bool qwen35 = name == "qwen35moe" || name == "clover_moe";
+    // Inkling 2 Mini shipped as "inkling2_loop" and, from the Mainline_Support release on, as "inkling2":
+    // the same graph under two names, so both take this engine.
+    const bool inkling2 = name == "inkling2_loop" || name == "inkling2";
     if (o.kv_format == KvFmt::kQ8_0 && !qwen35 && name != "kolibri1" && name != "flint" && name != "lfm2moe" &&
-        name != "inkling2_loop")
-        throw std::runtime_error("--kv q8_0 is supported for qwen35moe, kolibri1, flint, lfm2moe and inkling2_loop "
+        !inkling2)
+        throw std::runtime_error("--kv q8_0 is supported for qwen35moe, kolibri1, flint, lfm2moe and inkling2 "
                                  "models in v1; this is a '" + name + "' model");
     // int8 and int8k are Gemma 4's: their readers are not the arithmetic q8_0's are, so a model takes one
     // family or the other rather than a choice between them.
     if (name != "gemma4" && (o.kv_format == KvFmt::kInt8 || o.kv_format == KvFmt::kInt8K))
-        throw std::runtime_error("--kv int8 and --kv int8k are Gemma 4's; for a qwen35moe or kolibri1 model use "
-                                 "--kv q8_0 (this is a '" + name + "' model)");
+        throw std::runtime_error("--kv int8 and --kv int8k are Gemma 4's; for a qwen35moe, kolibri1, flint, lfm2moe or "
+                                 "inkling2_loop model use --kv q8_0 (this is a '" + name + "' model)");
     // moe() weighs the picks as a softmax of their scores, which is how only this architecture's router does
     if (o.cache_bias > 0.f && !qwen35)
         throw std::runtime_error("--cache-bias is supported for qwen35moe models; this is a '" + name + "' model");
@@ -1674,7 +1690,7 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         if (name == "lfm2moe") return std::make_unique<Lfm2Moe>();
         if (name == "flint") return std::make_unique<Flint>();
         if (name == "kolibri1") return std::make_unique<Kolibri1>();
-        if (name == "inkling2_loop") return std::make_unique<Inkling2>();
+        if (inkling2) return std::make_unique<Inkling2>();
         throw std::runtime_error(o.model + " is a '" + name + "' model, which this engine does not run");
     };
     int cards = 1, devices = 1;
@@ -3128,6 +3144,12 @@ void Engine::alloc() {
         tiles = tiles || L.mmq;
         mixed_tiles = mixed_tiles || (L.mmq && L.mixed());
         one_expert = std::max(one_expert, L.gu_step + L.d_bytes);
+        // STRATA_MMQ_LOG=1: which of the layers' experts a prompt batch multiplies through MMQ, and of what type
+        if (std::getenv("STRATA_MMQ_LOG"))
+            std::fprintf(stderr, "strata: layer %d mmq=%d gu_type=%d d_type=%d mixed=%d (fits gu=%d d=%d)\n", il,
+                         (int) L.mmq, (int) L.gu_type, (int) L.d_type, (int) L.mixed(),
+                         (int) Mmq::fits((int) L.gu_type, L.mixed() ? n_ff_exp_ : 2 * n_ff_exp_, n_embd_),
+                         (int) Mmq::fits((int) L.d_type, n_embd_, n_ff_exp_));
     }
     if (tiles) mmq_ = std::make_unique<Mmq>();
 
@@ -3275,8 +3297,19 @@ void Engine::refreeze_experts() {
 void Engine::save_state(uint8_t* dst) {
     OnCard here(device_, split_);
     ck(cudaStreamSynchronize(cs(st_)), "save state");
-    for (int il = 0; il < (int) layers_.size(); ++il)
-        if (runs(il)) save_layer(il, pos_, dst);
+    // A model whose layers run more than once saves the state of every visit: a layer's index does not
+    // name its state, so a layer at a time would write only the first visit's.
+    if (state_whole()) {
+        for (int s = 0; s < n_steps(); ++s) {
+            const int il = step_phys(s);
+            if (!runs(il)) continue;
+            cur_step_ = s;
+            save_layer(il, pos_, dst);
+        }
+    } else {
+        for (int il = 0; il < (int) layers_.size(); ++il)
+            if (runs(il)) save_layer(il, pos_, dst);
+    }
     save_last(dst);
     if (next_) next_->save_state(dst + card_state_bytes());
 }
@@ -3557,8 +3590,22 @@ void Engine::dbg(const char* name, int il, const float* dev, int n) {
         sum += v;
         abs += std::fabs(v);
     }
-    std::fprintf(stderr, "dump pos=%lld blk=%d %-8s n=%d sum=%.6f abs=%.6f first=%.6f %.6f %.6f\n", (long long) pos_,
-                 il, name, n, sum, abs, h[0], h[1], h[2]);
+    // STRATA_DUMP_BIN: the vectors themselves beside the summary, for a cosine against the FP64 reference
+    // (tools/dump_cos.py).  Each dump's floats are appended in order, and `off` is where its own begin.
+    static FILE* bin = nullptr;
+    static long long off = 0;
+    long long at = -1;
+    if (const char* p = std::getenv("STRATA_DUMP_BIN")) {
+        if (!bin && !(bin = std::fopen(p, "wb"))) throw std::runtime_error(std::string("cannot write ") + p);
+        if (bin) {
+            at = off;
+            std::fwrite(h.data(), sizeof(float), h.size(), bin);
+            off += (long long) h.size();
+        }
+    }
+    std::fprintf(stderr,
+                 "dump pos=%lld blk=%d %-8s n=%d sum=%.6f abs=%.6f first=%.6f %.6f %.6f off=%lld\n",
+                 (long long) pos_, il, name, n, sum, abs, h[0], h[1], h[2], at);
 }
 
 // y = w x for n tokens.  xq is x already in Q8_1, when the caller has it.  rows_per_x below n_out gives each group
@@ -3620,6 +3667,15 @@ void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* 
 }
 
 void Engine::router_scores(const Layer& L, int n) { lin(L.gate_inp, xn_, rl_, n, xq_); }
+
+// The routed experts' activation.  Inkling 2's situ replaces the SwiGLU/GeGLU of every other model; nothing else
+// about the call changes, so an architecture that does not set situ_ takes the path it always did.
+void Engine::moe_act(const float* gate_up, float* out, int n_ff, int rows, float limit, void* stream,
+                      const ExpertScales* es) {
+    if (situ_) return ink_situ_rows(gate_up, out, n_ff, rows, situ_beta_, situ_linear_beta_, stream, es);
+    if (gelu_) return geglu_rows(gate_up, out, n_ff, rows, st_, es);
+    swiglu_clamp_rows(gate_up, out, n_ff, rows, limit, st_, es);
+}
 
 bool Engine::batched(const Layer& L, int n) const { return mmq_ && L.mmq && n >= kStageRows; }
 
@@ -4061,6 +4117,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
 
     const float limit = clamp_exp_[(size_t) il];
     const size_t xq_row = kernels::native_q8_1_bytes(n_embd_);
+    const bool norm_w = !weights_normalized();   // route() has not: divide by the weights' sum below
     bool any_host = false;
     // A window's tokens together: the CPU reads an expert that several of them chose once.
     for (int at = 0; at < n; at += kCpuRows) {
@@ -4095,7 +4152,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             for (int k = 0; k < n_used_; ++k) {
                 // a block of guesses routed among fewer experts than a token takes: the rest weigh nothing
                 if (block_pass_ && w[k] == 0.f) continue;
-                host_rel[n_host] = w_all > 0.f ? w[k] / w_all : 1.f;
+                host_rel[n_host] = norm_w || !(w_all > 0.f) ? w[k] : w[k] / w_all;
                 const size_t e = (size_t) ids[k];
                 // a block's guesses are not the answer's tokens: the cache is not filled by them
                 if (!block_pass_) {
@@ -4183,8 +4240,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                 }
                 ExpertScales es = expert_scales(L);
                 for (int j = 0; j < m && (es.gate || es.up); ++j) es.e[j] = cached[i0 + j].e;
-                if (gelu_) geglu_rows(g_, h_, n_ff_exp_, m, st_, &es);
-                else swiglu_clamp_rows(g_, h_, n_ff_exp_, m, limit, st_, &es);
+                moe_act(g_, h_, n_ff_exp_, m, limit, st_, &es);
                 kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_, m, st_);
                 if (!(m > 1 && kernels::native_mmvq_slots((int) L.d_type, down, m, n_ff_exp_, n_embd_, st_)))
                     for (int j = 0; j < m; ++j)
@@ -4247,7 +4303,8 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             }
         };
         cpu_experts(*workers_, host, n_host, m, (int) L.gu_type, (int) L.u_type, (int) L.d_type, n_embd_, n_ff_exp_,
-                    h_x_ + (size_t) at * e_row, limit, gelu_, cpu, meanwhile, any_late ? late : nullptr, &wait);
+                    h_x_ + (size_t) at * e_row, limit, gelu_, situ_ ? situ_beta_ : 0.f, situ_linear_beta_, cpu,
+                    meanwhile, any_late ? late : nullptr, &wait);
         pool_reads_.clear();
         stats_.cpu_ms += ms_since(t0);
     }
@@ -4304,8 +4361,7 @@ bool Engine::moe_card(Layer& L, int il, int n) {
         kernels::native_mmvq_ids((int) L.u_type, up, rr, n_embd_, n_ff_exp_, st_);
     }
     const ExpertScales es = expert_scales(L, d_ids_);
-    if (gelu_) geglu_rows(g_, h_, n_ff_exp_, rr, st_, &es);
-    else swiglu_clamp_rows(g_, h_, n_ff_exp_, rr, clamp_exp_[(size_t) il], st_, &es);
+    moe_act(g_, h_, n_ff_exp_, rr, clamp_exp_[(size_t) il], st_, &es);
     if (!L.h_s_down.empty()) expert_weights(d_wts_, fp(L.s_down), d_ids_, rr, st_);
     kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);   // the rows back to back, as one vector
     const kernels::MmvqIds down{table, d_ids_, L.gu2(), q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_,
@@ -4454,6 +4510,13 @@ void Engine::moe_rows(Layer& L, int il, int n) {
                   w + (size_t) t * n_used_, tmp);
     });
     count_.assign((size_t) n_expert_, 0);
+    if (opt_.dump && il == 0 && n == 1) {
+        std::fprintf(stderr, "route blk=%d ids=", il);
+        for (int k = 0; k < n_used_; ++k) std::fprintf(stderr, "%d,", ids_[(size_t) k]);
+        std::fprintf(stderr, " w=");
+        for (int k = 0; k < n_used_; ++k) std::fprintf(stderr, "%.6f,", w[k]);
+        std::fprintf(stderr, "\n");
+    }
     for (int i = 0; i < rr; ++i) {
         ++count_[(size_t) ids_[(size_t) i]];
         ++use_[(size_t) il * n_expert_ + (size_t) ids_[(size_t) i]];
@@ -4659,8 +4722,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             up_mul(slot_of(r.j), L.slot_bytes, r.m, d_cb + (size_t) r.c * cb_row + r.j, r.most);
         }
         if (rc > 0) {
-            if (gelu_) geglu_rows(gu_, hx_, n_ff_exp_, rc, st_, &es);
-            else swiglu_clamp_rows(gu_, hx_, n_ff_exp_, rc, limit, st_, &es);
+            moe_act(gu_, hx_, n_ff_exp_, rc, limit, st_, &es);
             if (guard) guard_half_sums(hx_, ff, n_ff_exp_, rc, hf_, st_);
             Mmq::quantize(hx_, nullptr, mq2_, dt, ff, ff, rc, st_);
         }
@@ -4711,8 +4773,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             });
             ExpertScales er = es;
             if (er.ids) er.ids += r0;
-            if (gelu_) geglu_rows(gu_ + (size_t) r0 * ff2, hx_ + (size_t) r0 * ff, n_ff_exp_, rows, st_, &er);
-            else swiglu_clamp_rows(gu_ + (size_t) r0 * ff2, hx_ + (size_t) r0 * ff, n_ff_exp_, rows, limit, st_, &er);
+            moe_act(gu_ + (size_t) r0 * ff2, hx_ + (size_t) r0 * ff, n_ff_exp_, rows, limit, st_, &er);
             if (guard) guard_half_sums(hx_ + (size_t) r0 * ff, ff, n_ff_exp_, rows, hf_ + r0, st_);
             Mmq::quantize(hx_ + (size_t) r0 * ff, nullptr, mq2_, dt, ff, ff, rows, st_);
             each_class([&](int k, int top) {
@@ -4739,7 +4800,7 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             done = Clock::now();
         });
         cpu_experts(*workers_, host_.data(), (int) host_.size(), n, gt, ut, dt, n_embd_, n_ff_exp_, h_x_, limit, gelu_,
-                    h_cpu_, nullptr);
+                    situ_ ? situ_beta_ : 0.f, situ_linear_beta_, h_cpu_, nullptr);
         const double cpu = ms_since(start);
         behind.wait();
         const double gpu = std::chrono::duration<double, std::milli>(done - start).count();

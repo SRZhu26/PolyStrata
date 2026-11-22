@@ -79,6 +79,22 @@ GLM4_PATTERN = (
     r"|\s+"
 )
 
+# The `inkling2` pre-tokenizer (Inkling 2 Mini), llama.cpp's LLAMA_VOCAB_PRE_TYPE_GPT4O: the CamelCase pattern, so a
+# capital starts a piece and the small letters after it stay with it ("FlashAttention" is two pieces).  llama.cpp also sets
+# clean_spaces = false and no BOS for this name.  Digits run in up to three, and a punctuation run keeps the newline and
+# the slash after it.
+GPT4O_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))*((?=[\p{L}\p{M}])([^A-Z]))+"
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?"
+    r"|[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))+((?=[\p{L}\p{M}])([^A-Z]))*"
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?"
+    r"|\p{N}{1,3}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+
 # The `gemma4` tokenizer (Gemma 4), from llama.cpp's LLAMA_VOCAB_PRE_TYPE_GEMMA4: a BPE over UTF-8 characters, not
 # over GPT-2's byte alphabet.  A space is written with SentencePiece's visible space before anything else, the text
 # is cut only at runs of newlines, a run that is a token as a whole is that token, the merges run over the rest,
@@ -131,7 +147,8 @@ QWEN2_PATTERN = (
 )
 
 PRE_PATTERNS = {"glm4": GLM4_PATTERN, "glm5": GLM4_PATTERN,   # every other name: QWEN35_PATTERN, as before
-                "gemma4": GEMMA4_PATTERN, "lfm2": GLM4_PATTERN, "kolibri1": QWEN2_PATTERN}
+                "gemma4": GEMMA4_PATTERN, "lfm2": GLM4_PATTERN, "kolibri1": QWEN2_PATTERN,
+                "inkling2": GPT4O_PATTERN}
 PRE_SEQUENCES = {"joyai-llm": DEEPSEEK3_SEQUENCE, "deepseek-v3": DEEPSEEK3_SEQUENCE, "flint": FLINT_SEQUENCE}
 IGNORE_MERGES = ("glm4", "glm5", "lfm2")
 RAW = ("gemma4",)                      # vocabularies of UTF-8 pieces
@@ -341,7 +358,9 @@ class Tokenizer:
         """The pre-tokenizer's pieces: one pattern's matches, or a sequence's, where each pattern splits what the
         one before left into its matches and the text between them."""
         if not self._seq:
-            return self._re.findall(text)
+            # `group()`, not `findall()`: a pattern transcribed from llama.cpp carries capture groups inside its
+            # alternatives, and `findall` would return those groups instead of the piece that matched.
+            return [m.group() for m in self._re.finditer(text)]
         pieces = [text]
         for pat in self._seq:
             out = []
@@ -598,6 +617,7 @@ def extract(gguf_path, out_dir) -> dict:
                               else "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM)"
                               if tk.pre_sequence
                               else "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)" if tk.ignore_merges
+                              else "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_GPT4O)" if tk.pre == "inkling2"
                               else "llama.cpp src/llama-vocab.cpp (LLAMA_VOCAB_PRE_TYPE_QWEN2)"
                               if tk.pre_pattern == QWEN2_PATTERN
                               else ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
