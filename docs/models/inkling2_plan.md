@@ -667,3 +667,135 @@ experts = 25.7% resident).
    (Python/C++/TS, JSON, Unicode, tabs/indent) against `transformers` or `llama-tokenize`.
 3. **Tool-call & reasoning parsing**: Add tests in `serve/test_models.py` confirming `<|content_thinking|>` maps to
    `reasoning_content` and `<|content_invoke_tool_json|>` maps cleanly to OpenAI `tool_calls`.
+
+---
+
+## 8. Detailed Next-Step Execution Plan (Step-by-Step for the RTX 5060 Laptop)
+
+Current baseline on `inkling2-engine-local` (`UD-Q4_K_XL`, `--kv q8_0 --ram-experts-mib 10240`, Split-K passing):
+- **8K**: 165.0 tok/s prefill, 10.1 tok/s decode, 6,640 MiB VRAM
+- **32K**: 94.9 tok/s prefill, 9.1 tok/s decode, 6,640 MiB VRAM
+- **130.7K**: 35.5 tok/s prefill (61.3 min TTFT), 6.7 tok/s decode, 6,640 MiB VRAM, 0.54 GiB swap
+
+### Step 1 — Commit & Push Working Split-K + 128K Results (Keep `read_layer_major() = false`)
+Do **not** hold back working Split-K behind the broken `read_layer_major()` path.
+1. Ensure `Inkling2::read_layer_major()` returns `false` (and keep any unfinished layer-major edits stashed or on a
+   separate WIP branch so `inkling2-engine-local` stays 100% green).
+2. Run `.\build-poly\poly_inkling2_test.exe` to confirm all checks (including `attend split` and `attend q8 spl`) pass.
+3. Commit and push **only** to `fork/inkling2-engine-local` (never `origin/main` or `add-inkling2-mini`):
+   ```powershell
+   git add src/poly/inkling2* include/strata/poly/kernels.hpp docs/models/inkling2_progress.md docs/models/inkling2_plan.md
+   git commit -m "poly/inkling2: add Split-K flash decoding and 8K/32K/128K Q8_0 benchmark results"
+   git push fork inkling2-engine-local
+   ```
+
+### Step 2 — Maximize Dedicated dGPU VRAM Utilization + `UD-IQ4_XS` + `--expert-profile` (Biggest Immediate Decode Win)
+**Why VRAM stopped at 6,640 / 8,151 MiB (~1,511 MiB unused):**
+On this laptop, Windows desktop/display runs on the Intel Core Ultra 9 275HX iGPU, so the RTX 5060 dGPU (8,151 MiB)
+is dedicated to compute. However, `strata-poly` reserves 512–1,024 MiB by default (`default_reserve_mib()` in
+`src/poly/engine.cpp:1888`) when `ram_tight_` is true, AND DXGI caps the process budget conservatively.
+
+**How to reclaim ~768–1,100 MiB of idle GDDR7 VRAM (+160–250 more resident experts):**
+- Pass **`--vram-reserve-mib 256`** (the engine's safe floor — leaves 256 MiB for CUDA driver, cuBLAS workspace, and
+  future CUDA graphs; do not go below 256 MiB or CUDA allocations can OOM).
+- Pass **`--vram-pool`** so KV and the expert cache share one pre-claimed VRAM pool cleanly without VMM thrashing.
+- Pass **`--ram-experts-mib 10240`** (avoids the §8.2 auto `-1` unpinned flip on Q8_0).
+- Switch from `UD-Q4_K_XL` (17.63 GB, 0.54 GiB swap) to **`UD-IQ4_XS`** (15.73 GB, KLD 0.0109, 0 non-NVFP4 scales,
+  expected 0 GiB swap, ~12–15% more experts fit in VRAM).
+- Warm-seed the VRAM cache with a coding routing profile (**`--expert-profile bench/inkling2-code.profile`** — note
+  the exact flag name in `src/poly/main.cpp:1562` is `--expert-profile`, not `--profile`).
+
+**Exact commands to run on the RTX 5060 Laptop:**
+```powershell
+# 1. Download UD-IQ4_XS (if not already on disk):
+python setup.py --family inkling2 --model UD-IQ4_XS --vision no --yes --no-start
+
+# 2. Warm-up & record a coding routing profile (run 2-3 real coding prompts on a server started with
+#    --expert-profile bench/inkling2-code.profile --vram-reserve-mib 256 --vram-pool --ram-experts-mib 10240):
+python tools/bench_128k_local.py --out bench/iq4xs-8k-prof --models iq4xs=<path-to-UD-IQ4_XS.gguf> --engines strata `
+  --prompt bench/prompt-8k.txt --context 8192 --kv q8_0 --ram-experts-mib 10240 --gen 256 `
+  --strata-args --vram-reserve-mib 256 --vram-pool --expert-profile bench/inkling2-code.profile
+
+# 3. Measure 8K, 32K, and 128K with the warm profile + reclaimed VRAM:
+python tools/bench_128k_local.py --out bench/iq4xs-32k-prof --models iq4xs=<path-to-UD-IQ4_XS.gguf> --engines strata `
+  --prompt bench/prompt-32k.txt --context 32768 --kv q8_0 --ram-experts-mib 10240 --gen 256 `
+  --strata-args --vram-reserve-mib 256 --vram-pool --expert-profile bench/inkling2-code.profile
+
+python tools/bench_128k_local.py --out bench/iq4xs-128k-prof --models iq4xs=<path-to-UD-IQ4_XS.gguf> --engines strata `
+  --prompt bench/prompt-128k.txt --context 131072 --kv q8_0 --ram-experts-mib 10240 --gen 256 `
+  --strata-args --vram-reserve-mib 256 --vram-pool --expert-profile bench/inkling2-code.profile
+```
+**Check engine logs** (`bench/.../engine-*.log`) for:
+- Resident experts count (should jump from `791` → **`~1,050–1,200+`** at 8K/32K and `405` → **`~600+`** at 128K!).
+- Peak VRAM (should climb from `6,640 MiB` → **`~7,400–7,800 MiB`** cleanly without OOM).
+- Swap peak (should drop to **`0.0 GiB`** on `UD-IQ4_XS`).
+- Decode tok/s (target **16–24 tok/s** at 8K/32K, **10–14 tok/s** at 128K).
+
+*(Optional extra decode test)*: test `--strata-args ... --skip-weight 0.03` on coding prompts to see if skipping tiny
+cold CPU experts adds +15–30% decode with no quality drop.
+
+### Step 3 — Optional (Cap at 30 min): Fixing the `blk 6` Fault in `read_layer_major()`
+Because `read_layer_major()` only measured **+9–13% prefill** (1.09–1.13×), do **not** spend more than ~30 minutes
+here — Step 4 (Tensor-Core MMA prefill) is the 5–10× prefill win. If you do fix it:
+1. **Root cause**: `blk 0..5` is clean (`0.99997`), so the fault is at `blk 6` when `n_calls >= 2` (`c = 0` at `pos 0`,
+   `c = 1` at `pos 1024`) share scalar `n_bank_` / `n_prev_bank_` and device buffers `bank_` / `prev_bank_` / `prev_out_`.
+   - At `step 6` (`blk 6`, `block_start = true`), `c = 0` increments `n_bank_` from 1→2 before `c = 1` runs, so `c = 1`
+     reads uninitialized `bank_[1]` and pushes into `bank_[2]`.
+   - At `step 17` (`blk 17` pass 0 tail), `c = 1` overwrites `prev_bank_` / `prev_out_` before `c = 0` reads them at
+     `step 18` (`blk 6` pass 1).
+2. **Exact fix**: Store `(n_bank_, n_prev_bank_, bank_, prev_bank_, prev_out_)` in a per-call host struct `call_state[c]`:
+   - Before `layer(il, call.m)` for call `c`, restore `n_bank_`, `n_prev_bank_`, and async-copy `call_state[c]` buffers
+     to device (`bank_`, `prev_bank_`, `prev_out_`).
+   - After `layer(il, call.m)` for call `c`, save `n_bank_`, `n_prev_bank_`, and async-copy modified buffers back to
+     `call_state[c]`.
+3. **Verify**: Dump `l_out` at `blk 6` (passes 0, 1, 2) and `blk 22` on a 2,048-token prompt; cosine vs call-at-a-time
+   must be **`>= 0.99999`** on both `pos 0` and `pos 1024`, and greedy text must match character-for-character.
+
+### Step 4 — Tensor-Core MMA Prefill Attention (Biggest Prefill Win: 5–10× at 32K–128K)
+Right now, `ink_attend_rel` / `ink_attend_rel_q8` uses scalar FP32 FMA for `Q·K` and `P·V`, which is why 128K prefill
+takes 61.3 minutes. Replacing it with an MMA tensor-core kernel for `rows >= 32` removes the quadratic wall:
+1. **Reference file**: Copy the warp-level MMA tile scaffolding from `src/poly/fattn_mma.cuh` (already in this repo
+   and compiled for `sm_120`).
+2. **Tile layout** (`dim = 128`, `Br = 64` query rows, `Bc = 64` key rows per tile):
+   - Load `Q` tile `[64, 128]` into FP16 shared memory once per block.
+   - For each key tile `j0` (step `Bc = 64`):
+     a. Cooperatively load & dequantize `K` tile `[64, 128]` (from FP16 or Q8_0 codes × scales) into FP16 shared memory
+        (`16 KB`).
+     b. Compute FP32 `S = Q · K^T` (`[64, 64]`) using `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`.
+     c. In registers on the `S` fragment: multiply by `scale * tau[row]`, add `kqb[(row, h, min(dist, n_keys-1))]`,
+        and mask out-of-window / future keys (`j < lo || j > hi`) to `-INFINITY`.
+     d. Run online softmax per row (starting from sink `m = 0, sum = 1`), rescale `O` accumulator, convert `P` to FP16.
+     e. Cooperatively load & dequantize `V` tile `[64, 128]` into FP16 shared memory (`16 KB`), then accumulate
+        `O += P · V` via MMA.
+   - Normalize `O /= sum` and store to `out`.
+3. **Dispatch**: Use this MMA kernel in `ink_attend_rel` / `ink_attend_rel_q8` when `rows >= 32 && dim == 128`; keep
+   Split-K / warp-level kernel for `rows < 32` (decode).
+4. **Verify**: Add an `attend mma` check in `src/poly/inkling2_test.cu` comparing against FP64 reference at `rows = 128`,
+   `pos = 2048` (`max abs diff < 2e-3`), then re-measure 32K and 128K prefill (target: 32K from 95 → **400+ tok/s**,
+   128K from 61 min → **~8–15 min**).
+
+### Step 5 — Pass-Aware CUDA Graphs (`L.fixed = true`) + Graph Invalidation (+20–30% Decode)
+1. **Close defect §8.3 first** (`src/poly/engine.cpp`):
+   - In `shrink_cache()` (`~1409`) and `resize_card_cache()` (`~2118`), invalidate CUDA graphs (destroy `cudaGraphExec_t`
+     in `passes_`, `tail_`, and every `Layer`'s `heads`, `tail`, `shared`, `card_moe`, `rows_heads` — mirroring the
+     existing Metal invalidation at `~2124-2128`) whenever expert slots move.
+2. **Add `tail_key()` virtual** (`src/poly/engine.hpp` + `src/poly/engine.cpp`):
+   - `virtual int tail_key() const { return 0; }` (default 0 leaves all other models byte-identical).
+   - Where `L.tail`, `L.shared`, and `L.card_moe` are indexed by `rec`, index by `(size_t) tail_key() * recs + rec`.
+3. **Enable on `Inkling2`** (`src/poly/inkling2.hpp` + `src/poly/inkling2.cpp`):
+   - Override `int tail_key() const override { return steps_[(size_t) cur_step_].pass; }`
+   - In `head_key(il, n)`, return `steps_[(size_t) cur_step_].pass * (max_room_key + 1) + room_key(n)` on global layers
+     (and `pass` on SWA layers).
+   - Set `L.fixed = true` in `Inkling2::load_layer()`.
+4. **Verify**: Run `tools/kv_agree.py` (with `--kv q8_0` and graphs on vs `--no-graphs`) and confirm exact match +
+   re-measure decode tok/s at 8K / 32K / 128K.
+
+### Step 6 — Agentic Coding Correctness Gates (Before Daily-Driving)
+1. **End-to-end cosine gate on `UD-Q4_K_XL`**: `UD-Q4_K_XL` has **zero `Q4_K` tensors** (only `NVFP4`, `Q8_0`, `BF16`,
+   `F32`), so `STRATA_DUMP_BIN` + `tools/dump_cos.py` vs `tools/ref_core.py` works today — run it and confirm
+   cosine `>= 0.999` at `blk.6`, `blk.23`, and final logits.
+2. **Tokenizer byte-for-byte parity**: Compare `tools/strata_tokenizer.py` on 20 mixed coding strings (Python/C++/TS,
+   JSON, tabs, Unicode) against Hugging Face `transformers` (`AutoTokenizer.from_pretrained("thinkingmachines/Inkling-2-Mini")`).
+3. **Tool-call & reasoning tests**: Add unit tests in `serve/test_models.py` verifying `<|content_thinking|>` →
+   `reasoning_content` and `<|content_invoke_tool_json|>` → OpenAI `tool_calls`.
+4. **Daily-drive server config**: Start `serve/server.py` with `--kv q8_0 --vram-reserve-mib 256 --vram-pool --ram-experts-mib 10240 --expert-profile bench/inkling2-code.profile --pinned-session` so multi-turn coding sessions reuse the cached KV prefix with 1–5 s TTFT.
