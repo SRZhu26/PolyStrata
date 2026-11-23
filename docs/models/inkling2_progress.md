@@ -169,23 +169,6 @@ Q8_0 frees VRAM, so 38 more experts are resident and `outside_bytes_` drops just
 So a third of the Q8_0 decode loss is not the kernel at all: it is the heuristic taking the unpinned path because the freed VRAM
 moved it across a threshold. Pinning the budget recovers 0.4 tok/s and 2.5 GiB of RSS. This is defect §8.2.
 
-Prefill over the 128K prompt, measured incrementally to 96% before the run was stopped:
-
-| Tokens | Elapsed | Marginal tok/s |
-| ---: | ---: | ---: |
-| 1,024 | 10 s | 111.8 |
-| 8,192 | 110 s | 68.3 |
-| 32,768 | 599 s | 39.4 |
-| 65,536 | 1,745 s | 23.3 |
-| 98,304 | 3,454 s | 16.8 |
-| 122,880 | 5,114 s | 13.7 |
-
-A full 130,715-token prefill projects to ≈ 5,750 s (≈ 96 min). The fall-off sits between `1/√t` and linear, which is
-the expected shape: a quadratic part from the 8 full-context visits and a linear part from the 40 window visits plus FFN.
-
-The 8K decode figure of 5.0 tok/s comes from a run that degenerated into a loop, so it understates throughput. The 16K
-figure of 10.1 tok/s is the only clean decode number.
-
 ---
 
 ## 5. Gates against the plan's criteria

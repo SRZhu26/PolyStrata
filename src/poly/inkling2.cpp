@@ -612,12 +612,19 @@ void Inkling2::attn(Block& B, int il, int n) {
     const int hd = head_dim_, nh = n_head_, nkv = n_kv_;
     const int chan_kv = nkv * hd;
     const int s = cur_step_;
-    const float* in[3] = {xin_, xin_ + (size_t) n * n_embd_, xin_ + (size_t) 2 * n * n_embd_};
+    const bool shared_in = B.swa && st.pass == 0;
+    const float* in[3] = {xin_, shared_in ? xin_ : xin_ + (size_t) n * n_embd_,
+                          shared_in ? xin_ : xin_ + (size_t) 2 * n * n_embd_};
 
-    lin(B.wq, in[0], qraw_, n, nullptr);
-    lin(B.wk, in[1], kraw_, n, nullptr);
-    lin(B.wv, in[2], vraw_, n, nullptr);
-    lin(B.rel, in[0], rraw_, n, nullptr);
+    // Quantize in[0] to Q8_1 once and run every in[0] projection first (wq, rel, w_gate, sink_proj) so wk/wv
+    // (which overwrite xq_ when shared_in is false) cannot clobber in[0]'s quantized buffer.
+    kernels::native_quantize_q8_1(in[0], xq_, n_embd_ * n, 1, st_);
+    lin(B.wq, in[0], qraw_, n, xq_);
+    lin(B.rel, in[0], rraw_, n, xq_);
+    lin(B.w_gate, in[0], gate_, n, xq_);
+    lin(B.sink_proj, in[0], sinks_, n, xq_);
+    lin(B.wk, in[1], kraw_, n, shared_in ? xq_ : nullptr);
+    lin(B.wv, in[2], vraw_, n, shared_in ? xq_ : nullptr);
 
     // the short convolutions of K and V, each at its own place in the visit's history
     if (B.swa) {
@@ -652,8 +659,7 @@ void Inkling2::attn(Block& B, int il, int n) {
     store(k_, s, pos_, n, false);
     store(vn_, s, pos_, n, true);
 
-    // the bias by distance, with the sink folded in, and then the attention
-    lin(B.sink_proj, in[0], sinks_, n, nullptr);
+    // the bias by distance, with the sink folded in (sinks_ computed above from in[0]), and then the attention
     ink_rel_table(fp(B.rel_bias), d_rel_, rraw_, sinks_, tau, kqb_, n, nh, B.bias_keys, st_);
     dbg("sinks", il, sinks_, n * nh);
     dbg("kqb", il, kqb_, n * nh * B.bias_keys);
@@ -679,10 +685,7 @@ void Inkling2::attn(Block& B, int il, int n) {
             dbg(nm, il, att_ + (size_t) h * hd, hd);
         }
 
-    // the gate on the attention's output, and its own short convolution.  The gate is one value per
-    // attention channel, not one per head: the reference multiplies cur [head_dim, n_head, n_tokens] by a
-    // [head_dim*n_head, n_tokens] tensor, so channel (head h, dim i) takes the gate at h*head_dim + i.
-    lin(B.w_gate, in[0], gate_, n, nullptr);
+    // the gate on the attention's output (gate_ computed above from in[0]), and its own short convolution.
     dbg("gate", il, gate_, n * nh * hd);
     mul_sigmoid(att_, gate_, hd, n * nh, hd, false, st_);
     dbg("att_gated", il, att_, n * nh * hd);
@@ -717,14 +720,15 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
 
     // The attention's input: the depth attention mixes `cur` with the earlier blocks' inputs.  A full-context
     // layer takes three mixes (Q, K, V); a window layer one, which all three of its inputs share until the
-    // messages part them.  Layer 0 has no query, so its input is `cur` itself.
+    // messages part them (on pass 0 they stay identical, so norm once into xin_ and skip the two copies).
+    const bool shared_in = B.swa && st.pass == 0;
     if (il > 0) {
         mix_depth(bank_, n_bank_, r_, fp(B.attn_res_query), n_q, mix_in_, n);
-        if (n_q == 1) {
+        if (n_q == 1 && !shared_in) {
             mix_depth_copy(mix_in_, n, mix_in_ + (size_t) n * n_embd_);
             mix_depth_copy(mix_in_, n, mix_in_ + (size_t) 2 * n * n_embd_);
         }
-    } else {
+    } else if (!shared_in) {
         for (int j = 0; j < 3; ++j) mix_depth_copy(r_, n, mix_in_ + (size_t) j * n * n_embd_);
     }
     if (st.pass > 0) {
@@ -734,7 +738,9 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
                          fp(lp.ctrl_gain[j]), fp(lp.ctrl_forget[j]), n_embd_, gate_rank_, n, ctrl_, st_);
     }
     // a window layer normed once shares the one input with all three, as the reference does
-    if (B.swa) {
+    if (shared_in) {
+        rms_norm(il > 0 ? mix_in_ : r_, fp(B.attn_norm), xin_, n_embd_, n, rms_eps_, st_);
+    } else if (B.swa) {
         for (int j = 0; j < 3; ++j)
             rms_norm(mix_in_ + (size_t) j * n * n_embd_, fp(B.attn_norm), xin_ + (size_t) j * n * n_embd_, n_embd_, n,
                       rms_eps_, st_);

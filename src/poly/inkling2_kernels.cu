@@ -208,7 +208,7 @@ __global__ void ink_attend_rel_kernel(const float* __restrict__ q, const half* _
                                      const float* __restrict__ tau, long long pos, int rows,
                                      float* __restrict__ out, int dim, int n_head, int kv_heads, float scale,
                                      int window, int n_keys, int ring) {
-    __shared__ float part[32];
+    __shared__ float qs[INK_ATTEND_ROWS][INK_THREADS];       // block's queries cached once (avoids re-reading Q per key)
     __shared__ float sc[INK_ATTEND_ROWS][INK_ATTEND_TILE];   // a tile's logits, then its weights
     __shared__ float wt[INK_ATTEND_ROWS][INK_ATTEND_TILE];
     __shared__ float corr_of[INK_ATTEND_ROWS];               // the rescale a row's running sums take this tile
@@ -222,6 +222,12 @@ __global__ void ink_attend_rel_kernel(const float* __restrict__ q, const half* _
     const size_t krow = (size_t) kv_heads * dim;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nwarps = int(blockDim.x) >> 5;
+
+    for (int r = 0; r < nr; ++r) {
+        const float* qr = q + ((size_t) (row0 + r) * n_head + h) * dim;
+        if (threadIdx.x < dim) qs[r][threadIdx.x] = qr[threadIdx.x];
+    }
+    __syncthreads();
 
     // a row's last key; the rows of a block are consecutive, so the block's keys run from the first
     // row's first key to the last row's last one, and a key outside a row's own run is masked below
@@ -269,7 +275,7 @@ __global__ void ink_attend_rel_kernel(const float* __restrict__ q, const half* _
                 continue;
             }
             const half* kr = kc + crow(j) * krow + (size_t) hkv * dim;
-            const float* qr = q + ((size_t) (row0 + r) * n_head + h) * dim;
+            const float* qr = qs[r];
             float s = 0.0f;
             for (int d = lane; d < dim; d += 32) s += qr[d] * __half2float(kr[d]);
             s = ink_warp_sum(s);
@@ -304,19 +310,18 @@ __global__ void ink_attend_rel_kernel(const float* __restrict__ q, const half* _
 
         // the values: this thread's dimension of every row's tile sum, the weights read from the tile's
         // shared run, which is one float a key rather than one a key and dimension
+        if (threadIdx.x < dim) {
 #pragma unroll
-        for (int r = 0; r < INK_ATTEND_ROWS; ++r) {
-            if (r < nr) {
-                acc[r] *= corr_of[r];
-                // the tile's keys inside this row's own run: the branch is the loop's bounds, so the
-                // loads below it pipeline rather than each key's test breaking the chain
-                const int i0 = lo[r] > int(j0) ? lo[r] - int(j0) : 0;
-                const int i1 = hi[r] - int(j0) < jn - 1 ? hi[r] - int(j0) : jn - 1;
+            for (int r = 0; r < INK_ATTEND_ROWS; ++r) {
+                if (r < nr) {
+                    acc[r] *= corr_of[r];
+                    const int i0 = lo[r] > int(j0) ? lo[r] - int(j0) : 0;
+                    const int i1 = hi[r] - int(j0) < jn - 1 ? hi[r] - int(j0) : jn - 1;
 #pragma unroll 4
-                for (int i = i0; i <= i1; ++i) {
-                    const half* vr = vc + crow(int(j0) + i) * krow + (size_t) hkv * dim;
-                    const float w = wt[r][i];
-                    for (int e = threadIdx.x; e < dim; e += blockDim.x) acc[r] += w * __half2float(vr[e]);
+                    for (int i = i0; i <= i1; ++i) {
+                        const half* vr = vc + crow(int(j0) + i) * krow + (size_t) hkv * dim;
+                        acc[r] += wt[r][i] * __half2float(vr[threadIdx.x]);
+                    }
                 }
             }
         }
@@ -339,6 +344,7 @@ __global__ void ink_attend_rel_q8_kernel(const float* __restrict__ q, const int8
                                          const float* __restrict__ tau, long long pos, int rows,
                                          float* __restrict__ out, int dim, int n_head, int kv_heads, float scale,
                                          int window, int n_keys, int ring) {
+    __shared__ float qs[INK_ATTEND_ROWS][INK_THREADS];
     __shared__ float sc[INK_ATTEND_ROWS][INK_ATTEND_TILE];
     __shared__ float wt[INK_ATTEND_ROWS][INK_ATTEND_TILE];
     __shared__ float corr_of[INK_ATTEND_ROWS];
@@ -354,6 +360,12 @@ __global__ void ink_attend_rel_q8_kernel(const float* __restrict__ q, const int8
     const size_t srow = (size_t) kv_heads * blocks_per_head;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nwarps = int(blockDim.x) >> 5;
+
+    for (int r = 0; r < nr; ++r) {
+        const float* qr = q + ((size_t) (row0 + r) * n_head + h) * dim;
+        if (threadIdx.x < dim) qs[r][threadIdx.x] = qr[threadIdx.x];
+    }
+    __syncthreads();
 
     int lo[INK_ATTEND_ROWS], hi[INK_ATTEND_ROWS];
 #pragma unroll
@@ -392,9 +404,12 @@ __global__ void ink_attend_rel_q8_kernel(const float* __restrict__ q, const int8
             const size_t cr = crow(j);
             const int8_t* kr = kc + cr * krow + (size_t) hkv * dim;
             const half* ksr = ks + cr * srow + (size_t) hkv * blocks_per_head;
-            const float* qr = q + ((size_t) (row0 + r) * n_head + h) * dim;
+            const float* qr = qs[r];
             float s = 0.0f;
-            for (int d = lane; d < dim; d += 32) s += qr[d] * ((float) kr[d] * __half2float(ksr[d >> 5]));
+            for (int b = 0; b < blocks_per_head; ++b) {
+                const int d = (b << 5) + lane;
+                s += (qr[d] * (float) kr[d]) * __half2float(ksr[b]);
+            }
             s = ink_warp_sum(s);
             if (lane == 0) {
                 const float t = tau ? tau[row0 + r] : 1.0f;
@@ -424,20 +439,21 @@ __global__ void ink_attend_rel_q8_kernel(const float* __restrict__ q, const int8
         }
         __syncthreads();
 
+        if (threadIdx.x < dim) {
+            const int b = threadIdx.x >> 5;
 #pragma unroll
-        for (int r = 0; r < INK_ATTEND_ROWS; ++r) {
-            if (r < nr) {
-                acc[r] *= corr_of[r];
-                const int i0 = lo[r] > int(j0) ? lo[r] - int(j0) : 0;
-                const int i1 = hi[r] - int(j0) < jn - 1 ? hi[r] - int(j0) : jn - 1;
+            for (int r = 0; r < INK_ATTEND_ROWS; ++r) {
+                if (r < nr) {
+                    acc[r] *= corr_of[r];
+                    const int i0 = lo[r] > int(j0) ? lo[r] - int(j0) : 0;
+                    const int i1 = hi[r] - int(j0) < jn - 1 ? hi[r] - int(j0) : jn - 1;
 #pragma unroll 4
-                for (int i = i0; i <= i1; ++i) {
-                    const size_t cr = crow(int(j0) + i);
-                    const int8_t* vr = vc + cr * krow + (size_t) hkv * dim;
-                    const half* vsr = vs + cr * srow + (size_t) hkv * blocks_per_head;
-                    const float w = wt[r][i];
-                    for (int e = threadIdx.x; e < dim; e += blockDim.x)
-                        acc[r] += w * ((float) vr[e] * __half2float(vsr[e >> 5]));
+                    for (int i = i0; i <= i1; ++i) {
+                        const size_t cr = crow(int(j0) + i);
+                        const int8_t* vr = vc + cr * krow + (size_t) hkv * dim;
+                        const half* vsr = vs + cr * srow + (size_t) hkv * blocks_per_head;
+                        acc[r] += (wt[r][i] * __half2float(vsr[b])) * (float) vr[threadIdx.x];
+                    }
                 }
             }
         }
