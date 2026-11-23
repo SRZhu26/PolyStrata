@@ -317,6 +317,31 @@ logical layers. At 10 tok/s that is ≈ 12–14 GB/s — about half of the card'
 threads compute for their share of the offloaded experts. Which of the two binds is unmeasured; either way the fixes are DSpark, more resident
 experts or a smaller quant, not a faster kernel. The plan's §4b has the full list of what has never been tried and the order of work.
 
+### 4.8 Pass-aware CUDA graphs: +4–12%, and the reason it is not more
+
+Recording a layer's launches and replaying them for the next token saves launch overhead, and it was predicted at +20–30%. It
+delivers **+4–12%**, which is a real gain but a tenth of what DSpark is expected to bring:
+
+| Context | Prompt | Prefill tok/s | Decode tok/s | Baseline decode | Δ decode |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8K | 8,213 | 417.6 | **11.2** | 10.0 | **+12%** |
+| 32K | 32,030 | 398.1 | **10.1** | 9.7 | **+4%** |
+| 128K | 130,730 | 287.3 | **6.9** | 6.3 | **+10%** |
+
+(`UD-Q4_K_XL`, `--vram-reserve-mib 256 --prompt-batch 2048 --kv q8_0 --threads 16 --ram-experts-mib 10240`, 256 generated,
+696 of 3,072 experts resident, one fresh server a row.)
+
+The recordings demonstrably fire: `--window 1 --no-draft` at 4K replays 290 recordings 18,432 times for 11.03 tok/s against
+9.72 with `--no-graphs`, and `--temp 0` output is byte-identical either way (`605b3025…`). So the small delta is not a broken
+graph, it is the size of the thing being removed: at 6–11 tok/s a token's wall time is the expert bytes coming out of the RAM
+pool, and ~1,400 launch calls are a small part of the rest.
+
+**A caveat on every server-path number above**: the server's step loop (`main.cpp:880`) feeds one token per slot per iteration
+and never takes the windowed-guess path the CLI's generate loop has (`main.cpp:509-560`); it only guesses under `--batch-mtp`.
+That is why the server's 8K figure (11.2) matches the CLI's `--window 1` (11.03) and not the CLI's default window-8 (23.78).
+Baselines and results in this report are all measured the same way, so the deltas hold, but the absolute decode ceiling is
+higher than these tables show and the gap is a serve-path gap, not a kernel gap.
+
 ---
 
 ## 5. Gates against the plan's criteria
@@ -465,12 +490,30 @@ the depth attention's bank is full (5 of 5 at step 42)
 that fails. **Fixed** by `!read_layer_major() ||` in `Engine::read()` (`engine.cpp:5538`); verified 0 errors over 7
 sequential Q8_0 requests.
 
-### 8.4 Latent CUDA-graph invalidation gap
+### 8.4 Latent CUDA-graph invalidation gap — **fixed**
 
 `resize_card_cache()` (`engine.cpp:2118`) and `shrink_cache()` (`engine.cpp:1409`) move experts between slots, but CUDA
-graphs are invalidated only under `#if defined(STRATA_GPU_METAL)` (`2124-2128`), and the pass-graph key
-(`engine.cpp:5042`) is `{n, head_key(...)}` with no cache layout in it. Harmless today only because `L.card == 1` is
-false for streamed experts, which is the configuration every number above was measured in.
+graphs were invalidated only under `#if defined(STRATA_GPU_METAL)` (`2124-2128`), and the pass-graph key
+(`engine.cpp:5042`) was `{n, head_key(...)}` with no cache layout in it. Harmless while `L.card == 1` is false for streamed
+experts — which is the configuration every number above was measured in — but it would read a stale slot the moment an expert
+landed in a `card` slot.
+
+**Fixed** by moving `Engine::invalidate_graphs()` out of the Metal guard and calling it from both `shrink_cache()` (after
+`settle_swaps()` and a stream sync, before `fill_now()`) and `resize_card_cache()`. It destroys `graphs_` and clears every
+`Layer`'s `heads` / `shared` / `tail` / `card_moe` / `rows_heads`, sets `card = -1`, clears `passes_` / `tail_`, clears each
+`Seq`'s recordings, and sets `recorded_ = false`.
+
+### 8.5 A recording froze the position, so `L.fixed` had to stay off — **fixed**
+
+The real reason layers could not be recorded was not the tail key, it was the position. A CUDA graph holds a launch's
+*arguments*, not their values, and every attention / tau / KV-store kernel took `int64_t pos` by value, so a recording replayed
+the position it was made at. The codebase already had the `_at` convention for `store_q8` / `store_f16` / `attend`; this
+sprint extended it to `ink_attend_rel{,_q8,_split,_q8_split,_mma}` and `ink_tau` (six kernels, `pos_at ? *pos_at : pos_arg`),
+dispatched on `recording_`. `L.fixed` is now `true` for Inkling 2's layers and `tail_key()` keys the looped core's tails by
+pass.
+
+Verified exact: graphs on vs `--no-graphs` at 4K / 256 tokens is byte-identical (`605b3025…`, `diff` → IDENTICAL), and
+`Stats::graphs` / `Stats::replays` show 290 recordings replaying 18,432 times.
 
 ---
 
@@ -518,23 +561,28 @@ bytes a token, and two of the earlier entries are closed.
 3. ~~**Fix the `blk 6` fault in `read_layer_major()`**~~ — **closed at 1.01×**, so it stays off (§3.1).
 4. ~~**Raise the prompt batch**~~ — **done and measured** (§4.7): `--prompt-batch 2048` is 1.17× at 8K and 1.19× at 32K with no VRAM
    cost. Put it in the daily-drive config; 4,096 is slower and 8,192 is refused.
-5. **Settle what decode's ≈ 1.2–1.4 GB a token is bound by** (§4.7): `--cpu-share 0` (everything copied) against `--cpu-share 1`
-   (everything on the CPU) on one binary says whether the PCIe copy or the 16 CPU threads set the 10 tok/s. It is the cheapest measurement
-   left and it decides whether Step 7 or Step 5 is worth more.
+5. ~~**Settle what decode's ≈ 1.2–1.4 GB a token is bound by**~~ — **done** (§4.7, plan §9 Sprint 1): `--cpu-share 0` 10.2,
+   `--cpu-share 1` 9.9, `auto` 9.7 tok/s. Neither the PCIe copy nor the CPU threads binds on their own; the wall is the bytes.
 6. **Step 7, DSpark speculative decoding** — 2–2.8× on decode, the largest win left, and the drafter is on disk and SHA-verified.
-7. **Step 5, pass-aware CUDA graphs** — +20–30% on decode, independent of the byte wall.
-8. **Grouped expert GEMM** — the 1.5–2× prefill item in plan §4b.2: a 2,048-token call gives each of a layer's 128 experts ≈ 128 rows,
+7. ~~**Step 5, pass-aware CUDA graphs**~~ — **done, and it is +4–12%, not +20–30%** (§4.8). The recordings fire (18,432 replays on
+   256 tokens) and greedy output is byte-identical, but launch overhead was not what bound decode.
+8. **Give the serve path the CLI's windowed-guess loop** (`main.cpp:880` vs `main.cpp:509-560`). The server never guesses without
+   `--batch-mtp`, which is why it measures 11.2 tok/s where the CLI's default window-8 measures 23.78 — a 2× on the table before any
+   new kernel, and the only item here that is plumbing rather than arithmetic.
+9. **Grouped expert GEMM** — the 1.5–2× prefill item in plan §4b.2: a 2,048-token call gives each of a layer's 128 experts ≈ 128 rows,
    so the call is 128 small GEMMs at ≈ 4.4 TFLOPS effective.
-9. **Make the Q8_0 attention kernel pay for itself or drop it.** It is 6–13% slower than FP16 and buys 38 resident experts below 32K.
-   `__dp4a` on the per-32-block scales (as `quantize.cpp`'s dot does) is the untried half of this.
-10. **Attention, second order** (plan §4b.3): `mma.m16n8k32.s8` for the Q8 KV path, K/V tile reuse across a kv head's three query heads,
+10. **Make the Q8_0 attention kernel pay for itself or drop it.** It is 6–13% slower than FP16 and buys 38 resident experts below 32K.
+    `__dp4a` on the per-32-block scales (as `quantize.cpp`'s dot does) is the untried half of this.
+11. **Attention, second order** (plan §4b.3): `mma.m16n8k32.s8` for the Q8 KV path, K/V tile reuse across a kv head's three query heads,
     and `Bc = 128` key tiles. Worth an estimated 1.1–1.3× at 32K and above.
-11. **Fix the RAM heuristic** (§8.2) so a VRAM win cannot silently cost the prefetch pool.
-12. **Measure coherence and needle recall above 32K.** Coherence is proven to 10.3K on controlled prompts (§8.1) and the prefill is
+12. **Fix the RAM heuristic** (§8.2) so a VRAM win cannot silently cost the prefetch pool.
+13. **Measure coherence and needle recall above 32K.** Coherence is proven to 10.3K on controlled prompts (§8.1) and the prefill is
     measured at 32K and 128K (§4), but needle recall at 32K/64K/128K is still unrun.
-13. **Close the CUDA-graph invalidation gap** in `shrink_cache()` / `resize_card_cache()` before `L.card` ever becomes 1.
-14. **Re-define the speed gate** against something that exists, since the `llama.cpp` comparison is undefined (§6).
-15. Decide whether the `STRATA_MMQ_LOG` and `STRATA_GROW_LOG` probes stay. Both are `getenv`-gated and off by default, so
+14. ~~**Close the CUDA-graph invalidation gap**~~ — **done** (§8.4), together with the position-freezing fix in §8.5.
+15. **Teach `Inkling2` the older `UD-IQ4_XS` loop-tensor names** (`loop_attn_{down,gain,forget}`, `loop_k_*`, `loop_v_*`, `loop_mlp_*`)
+    so the 15.73 GB / 0-swap quant can load at all. It is a correctness change, not a flag, and the file has no `loop_msg_query`.
+16. **Re-define the speed gate** against something that exists, since the `llama.cpp` comparison is undefined (§6).
+17. Decide whether the `STRATA_MMQ_LOG` and `STRATA_GROW_LOG` probes stay. Both are `getenv`-gated and off by default, so
     they are inert in normal use.
 
 ---

@@ -1183,6 +1183,63 @@ these four sprints in exact order:
 4. **Verify**: exact greedy match with graphs on vs `--no-graphs`, then re-measure 8K/32K/128K decode (+20–30%,
    targeting **18–25 tok/s** without DSpark).
 
+**Result — done, exact, and smaller than predicted (+4–12%).**
+
+The plan's step 3 said to set `L.fixed = true` once `tail_key()` existed. That alone was **not** sufficient, and the reason
+is the interesting part of this sprint: **CUDA graphs hold a kernel's launch arguments, not their values.** Every attention,
+tau and KV-store kernel took `int64_t pos` by value, so a recording froze the position it was made at and replayed it for
+every later token. The codebase already had the cure for two of them (`store_q8_at`, `store_f16_at`, `attend(... at ...)`);
+the attention and tau kernels did not. So the sprint added the `_at` convention to the rest of the hot path:
+
+| Kernel | `_at` variant | Reads |
+| --- | --- | --- |
+| `ink_attend_rel_kernel` | `ink_attend_rel_at` | `pos` from `at_` |
+| `ink_attend_rel_q8_kernel` | `ink_attend_rel_q8_at` | `pos` from `at_` |
+| `ink_attend_rel_split_kernel` | `ink_attend_rel_split_at` | `pos` from `at_` |
+| `ink_attend_rel_q8_split_kernel` | `ink_attend_rel_q8_split_at` | `pos` from `at_` |
+| `ink_attend_rel_mma_kernel` | (via the launch template) | `pos` from `at_` |
+| `ink_tau_kernel` | `ink_tau_at` | `pos` from `at_` |
+
+Each kernel gained `const long long* __restrict__ pos_at` and the preamble `const long long pos = pos_at ? *pos_at : pos_arg;`,
+so the existing wrappers pass `nullptr` and stay byte-identical; `Inkling2::store()` / `attn()` dispatch on `recording_`.
+`Engine::at_` is re-uploaded every call (`h_at_[2t] = pos_ + t`) and advanced by `shift_rows()`, so a replayed launch reads
+the live position.
+
+**Graph activity is counted, not inferred.** `Stats::graphs` / `Stats::replays` now count recordings and the launches they
+stood in for, and the CLI prints them. The first timing pair (23.78 vs 21.96 tok/s, 8%) was inside the plan's ±7% noise, so
+the counters were the only way to tell a working graph from an inert one:
+
+```
+--window 1 --no-draft, 4K prompt, 256 generated
+  graphs on :  290 graphs replayed 18,432 times   11.03 tok/s
+  --no-graphs:  0 graphs replayed      0 times     9.72 tok/s   (+13.5%)
+```
+
+**Exact greedy match**: graphs on vs `--no-graphs`, 4K prompt, 256 tokens, `--temp 0` — byte-identical, same sha256
+`605b30259035390d3ff12ebe33b7003d691e32aeaa64bd66b17d840a7b982526`, 1,674 bytes each, `diff` reports IDENTICAL. The CLI
+prints token ids, so this is an exact token-sequence comparison, not a text one.
+
+**Re-measurement** (`UD-Q4_K_XL`, `--vram-reserve-mib 256 --prompt-batch 2048 --kv q8_0 --threads 16 --ram-experts-mib
+10240`, 256 generated, 696 of 3,072 experts resident, one fresh server a row, prefill/decode from the same run):
+
+| Context | Prompt | Prefill tok/s | Decode tok/s | Baseline decode | Δ decode | VRAM | RSS | Swap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8K | 8,213 | 417.6 | **11.2** | 10.0 | **+12%** | 6,910 MiB | 11.27 GiB | 0.94 GiB |
+| 32K | 32,030 | 398.1 | **10.1** | 9.7 | **+4%** | 6,942 MiB | 11.34 GiB | 0.94 GiB |
+| 128K | 130,730 | 287.3 | **6.9** | 6.3 | **+10%** | 6,910 MiB | 11.39 GiB | 0.94 GiB |
+
+So the +20–30% / 18–25 tok/s prediction is **wrong, and the reason is diagnostic**: a recorded launch saves the cost of
+*launching*, and at 8–11 tok/s a token's wall time is dominated by the experts coming out of the RAM pool, not by the ~1,400
+launch calls around them. Replay count confirms the recordings are firing (18,432 launches stood in for on 256 tokens of a
+24-layer × 48-visit model); there is simply less launch overhead to remove than the plan assumed. This makes Sprint 3
+(DSpark) the only remaining lever with the size the target needs.
+
+**Note on the absolute numbers**: these are server-path figures, and the server's `step` loop (`main.cpp:880`) never takes the
+windowed-guess path the CLI's generate loop has (`main.cpp:509-560`) — it only guesses under `--batch-mtp`. That is why the
+server's 8K number (11.2) matches the CLI's `--window 1` (11.03) and not the CLI's default window-8 (23.78). The baseline in
+the table was measured the same way, so the *delta* is valid; the absolute ceiling is not what this table shows. Closing that
+gap is a separate piece of work (see §11 of the progress report).
+
 ### Sprint 3 — DSpark Block-Diffusion Drafter (Step 7 — Biggest 2.0–2.8× Decode Multiplier)
 Target file: **`dspark-Inkling-2-Mini-BF16-mainline.gguf`** (749 MB, 58 tensors, `has_markov_context = True`,
 `markov_w2 [256, 200058]`, 7 per-position `mask_embd [2304, 7]`, `joint_proj [5120, 768]`; pair with

@@ -210,9 +210,9 @@ void Inkling2::load_layer(int il) {
     B.swa = swa_pattern_[(size_t) il] != 0;
     B.block_start = il % attn_res_block_ == 0;
     L.ffn_norm = f32("ffn_norm.weight", n_embd_);
-    // The attention's launches read the position when they are recorded (a full-context layer's log-scale and a
-    // window layer's ring both do), so keep the recordings off until Phase 3 sizes them.
-    L.fixed = false;
+    // The attention's launches read the position off the card when they are recorded (at_, which a recorded launch
+    // reads as it replays), so a layer's launches can be recorded and replayed for the next ones.
+    L.fixed = true;
 
     const int64_t hq = (int64_t) n_head_ * head_dim_, hkv = (int64_t) n_kv_ * head_dim_;
     B.wq = mat("attn_q.weight", n_embd_, hq);
@@ -594,18 +594,22 @@ void Inkling2::pass_messages(int il, int n) {
 // A visit's K or V into its cache: a full-context one at the position, a windowed one at its place in the ring.
 void Inkling2::store(const float* x, int s, int64_t pos, int n, bool value) {
     const int width = n_kv_ * head_dim_;
+    const int ring = steps_[(size_t) s].swa ? ring_ : 0;
     if (opt_.kv_format == KvFmt::kQ8_0) {
         int8_t* codes = value ? step_v_codes_[(size_t) s] : step_k_codes_[(size_t) s];
         uint16_t* scales = value ? step_v_scales_[(size_t) s] : step_k_scales_[(size_t) s];
-        if (!steps_[(size_t) s].swa) return store_q8(x, codes, scales, width, pos, n, st_);
-        const int at = (int) (pos % ring_), head = std::min(n, ring_ - at);
+        // a recorded launch replays with whatever position the card holds then, so it reads at_ rather than pos
+        if (recording_) return store_q8_at(x, codes, scales, width, at_, n, ring, st_);
+        if (!ring) return store_q8(x, codes, scales, width, pos, n, st_);
+        const int at = (int) (pos % ring_), head = std::min(n, ring - at);
         store_q8(x, codes, scales, width, at, head, st_);
         if (head < n) store_q8(x + (size_t) head * width, codes, scales, width, 0, n - head, st_);
         return;
     }
     uint16_t* cache = value ? step_vals_[(size_t) s] : step_keys_[(size_t) s];
-    if (!steps_[(size_t) s].swa) return store_f16(x, cache, width, pos, n, st_);
-    const int at = (int) (pos % ring_), head = std::min(n, ring_ - at);
+    if (recording_) return store_f16_at(x, cache, width, at_, n, ring, st_);
+    if (!ring) return store_f16(x, cache, width, pos, n, st_);
+    const int at = (int) (pos % ring_), head = std::min(n, ring - at);
     store_f16(x, cache, width, at, head, st_);
     if (head < n) store_f16(x + (size_t) head * width, cache, width, 0, n - head, st_);
 }
@@ -659,7 +663,8 @@ void Inkling2::attn(Block& B, int il, int n) {
     // scales Qcur and Rcur once and the logit is then (q*tau).k and bias.(r*tau).
     const float* tau = nullptr;
     if (!B.swa) {
-        ink_tau(tau_, pos_, log_scale_floor_, log_scale_alpha_, n, st_);
+        if (recording_) ink_tau_at(tau_, at_, log_scale_floor_, log_scale_alpha_, n, st_);
+        else ink_tau(tau_, pos_, log_scale_floor_, log_scale_alpha_, n, st_);
         tau = tau_;
     }
 
@@ -683,7 +688,30 @@ void Inkling2::attn(Block& B, int il, int n) {
     // enough that the extra launches and the reduce cost more than the idle blocks do.
     const bool split = n == 1 && !B.swa && pos_ >= kAttnSplitMin;
     const float ascale = 1.f / std::sqrt((float) hd);
-    if (opt_.kv_format == KvFmt::kQ8_0) {
+    // A recorded launch replays with whatever position the card holds then, so it reads at_ rather than pos_.
+    const long long* at = recording_ ? at_ : nullptr;
+    if (at) {
+        if (opt_.kv_format == KvFmt::kQ8_0) {
+            if (split)
+                ink_attend_rel_q8_split_at(qraw_, step_k_codes_[(size_t) s], step_k_scales_[(size_t) s],
+                                           step_v_codes_[(size_t) s], step_v_scales_[(size_t) s], kqb_, tau, at,
+                                           att_, split_out_, split_ml_, hd, nh, nkv, ascale, 0, B.bias_keys, 0,
+                                           kAttnSplits, st_);
+            else
+                ink_attend_rel_q8_at(qraw_, step_k_codes_[(size_t) s], step_k_scales_[(size_t) s],
+                                     step_v_codes_[(size_t) s], step_v_scales_[(size_t) s], kqb_, tau, at, n, att_,
+                                     hd, nh, nkv, ascale, B.swa ? window_ : 0, B.bias_keys, B.swa ? ring_ : 0,
+                                     st_);
+        } else {
+            if (split)
+                ink_attend_rel_split_at(qraw_, step_keys_[(size_t) s], step_vals_[(size_t) s], kqb_, tau, at, att_,
+                                        split_out_, split_ml_, hd, nh, nkv, ascale, 0, B.bias_keys, 0, kAttnSplits,
+                                        st_);
+            else
+                ink_attend_rel_at(qraw_, step_keys_[(size_t) s], step_vals_[(size_t) s], kqb_, tau, at, n, att_, hd, nh,
+                                  nkv, ascale, B.swa ? window_ : 0, B.bias_keys, B.swa ? ring_ : 0, st_);
+        }
+    } else if (opt_.kv_format == KvFmt::kQ8_0) {
         if (split)
             ink_attend_rel_q8_split(qraw_, step_k_codes_[(size_t) s], step_k_scales_[(size_t) s],
                                      step_v_codes_[(size_t) s], step_v_scales_[(size_t) s], kqb_, tau, pos_, att_,

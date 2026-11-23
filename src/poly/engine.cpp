@@ -1005,6 +1005,23 @@ void Engine::vmm_free(Mapped& m) {
     m.base = 0;
 }
 
+// A graph owns its resources as well as its argument pointers.  Retire every recording before the allocation it
+// reads is retired; a parked sequence's recordings are the same graphs by other keys.
+void Engine::invalidate_graphs() {
+    for (void* g : graphs_) ck(cudaGraphExecDestroy((cudaGraphExec_t) g), "invalidating graphs");
+    graphs_.clear();
+    for (Layer& l : layers_) {
+        l.heads.clear(); l.shared.clear(); l.tail.clear(); l.card_moe.clear(); l.rows_heads.clear();
+        l.card = -1;
+    }
+    passes_.clear();
+    tail_ = nullptr;
+    for (Seq& q : seqs_) {
+        q.heads.clear(); q.passes.clear(); q.tail = nullptr;
+    }
+    recorded_ = false;
+}
+
 #if defined(STRATA_GPU_METAL)
 namespace {
 constexpr size_t kMetalHostReserve = size_t(4) << 30;
@@ -1032,21 +1049,11 @@ void Engine::metal_sync_memory() {
         if (s) ck(cudaStreamSynchronize(cs(s)), "moving Metal allocations");
 }
 
+#if defined(STRATA_GPU_METAL)
 void Engine::metal_invalidate_graphs() {
     // Graphs own resources as well as raw argument pointers. Clear every sequence's recordings before
     // retiring an allocation; otherwise a parked sequence can replay old pointers or keep that memory alive.
-    for (void* g : graphs_) ck(cudaGraphExecDestroy((cudaGraphExec_t) g), "invalidating Metal graphs");
-    graphs_.clear();
-    for (Layer& l : layers_) {
-        l.heads.clear(); l.shared.clear(); l.tail.clear(); l.card_moe.clear(); l.rows_heads.clear();
-        l.card = -1;
-    }
-    passes_.clear();
-    tail_ = nullptr;
-    for (Seq& q : seqs_) {
-        q.heads.clear(); q.passes.clear(); q.tail = nullptr;
-    }
-    recorded_ = false;
+    invalidate_graphs();
     // Force the next GPU-routed call to upload fresh expert addresses, including indirect dependencies.
     h_slots_.clear();
     if (d_slots_) {
@@ -1054,6 +1061,7 @@ void Engine::metal_invalidate_graphs() {
         ck(gpu::metal::register_indirect(d_slots_, &empty, 0), "clearing expert dependencies");
     }
 }
+#endif
 
 void Engine::metal_resize_cache(size_t limit) {
     if (freeze_experts_) throw std::runtime_error("balanced Metal cannot resize a frozen expert cache");
@@ -1418,6 +1426,11 @@ void Engine::shrink_cache(size_t bytes) {
     size_t cut = arena_.mapped;
     for (size_t i = arena_.pieces.size(); i > 0 && arena_.mapped - cut < bytes; --i) cut -= arena_.pieces[i - 1].second;
     settle_swaps();
+    // The slots are about to move under the recordings that read them: a replayed launch would read the expert
+    // that was in its slot when it was recorded, so every graph is retired before follow() moves one.  The stream
+    // is idle here (settle_swaps() waited for the uploads and this waits for the card), so none is in flight.
+    ck(cudaStreamSynchronize(cs(st_)), "the expert cache");
+    invalidate_graphs();
     fill_now();
     ck(cudaStreamSynchronize(cs(st_)), "the expert cache");
     const size_t ne = (size_t) n_expert_, end = cut > kTail ? cut - kTail : 0;   // kTail stays past the last slot
@@ -2127,6 +2140,11 @@ void Engine::resize_card_cache(int mib) {
     metal_invalidate_graphs();
 #endif
     ck(cudaStreamSynchronize(cs(st_)), "resize");
+#if !defined(STRATA_GPU_METAL)
+    // The cache is given up here and filled again below: a recording that reads one of its slots would read
+    // the expert that was there when it was recorded, so every graph is retired with it.
+    invalidate_graphs();
+#endif
     const auto failed = [&] {
         std::lock_guard<std::mutex> l(swap_m_);
         return !swap_error_.empty();
@@ -4857,6 +4875,7 @@ void* Engine::record(F&& work) {
     cudaGraphDestroy(g);
     ck(made, "cudaGraphInstantiate");
     graphs_.push_back(exec);
+    ++stats_.graphs;
     return exec;
 }
 
@@ -4909,6 +4928,7 @@ void Engine::run(const int32_t* tokens, int n) {
         if (made.size() <= key) made.resize(key + 1, nullptr);
         if (!made[key]) made[key] = record(work);
         ck(cudaGraphLaunch((cudaGraphExec_t) made[key], cs(st_)), "layer graph");
+        ++stats_.replays;
     };
     if (replay) {   // a pair a token: a window's tokens may go one by one, each from its own
         for (int t = 0; t < n; ++t) {
@@ -4929,13 +4949,13 @@ void Engine::run(const int32_t* tokens, int n) {
         else layer_head(L, il, m);
         if (!L.moe || batched(L, m)) return;
         ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
-        if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, m); });
+        if (replay) replayed(L.shared, (size_t) tail_key() * recs + rec, [&] { moe_shared(L, il, m); });
         else moe_shared(L, il, m);
     };
     const auto tail = [&](int il, int m, size_t rec) {
         Layer& L = layers_[(size_t) il];
         dbg("ffn", il, fo_, n_embd_);
-        if (replay && L.fixed) replayed(L.tail, rec, [&] { layer_tail(L, il, m); });
+        if (replay && L.fixed) replayed(L.tail, (size_t) tail_key() * recs + rec, [&] { layer_tail(L, il, m); });
         else layer_tail(L, il, m);
     };
 
@@ -5028,7 +5048,7 @@ void Engine::run(const int32_t* tokens, int n) {
     const auto on_card = [&](int il, int m, size_t rec) {
         Layer& L = layers_[(size_t) il];
         if (!card) return false;
-        if (replay && L.card == 1) replayed(L.card_moe, rec, [&] { moe_card(L, il, m); });
+        if (replay && L.card == 1) replayed(L.card_moe, (size_t) tail_key() * recs + rec, [&] { moe_card(L, il, m); });
         else if (!moe_card(L, il, m)) return false;
         stats_.gpu_experts += m * n_used_;
         return true;
@@ -5065,6 +5085,7 @@ void Engine::run(const int32_t* tokens, int n) {
                 }
             });
         ck(cudaGraphLaunch((cudaGraphExec_t) pass, cs(st_)), "layer graph");
+        ++stats_.replays;
         for (int s = 0; s < n_steps(); ++s) {
             cur_step_ = s;
             stats_.gpu_experts += layers_[(size_t) step_phys(s)].moe ? n * n_used_ : 0;
@@ -5156,6 +5177,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         if (made.size() <= key) made.resize(key + 1, nullptr);
         if (!made[key]) made[key] = record(work);
         ck(cudaGraphLaunch((cudaGraphExec_t) made[key], cs(st_)), "layer graph");
+        ++stats_.replays;
     };
     const bool card = R < kStageRows && card_moe(R);
     // an architecture that takes the rows in one head: their sequences and positions while it does
@@ -5187,6 +5209,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
                 void*& made = L.rows_heads[key];
                 if (!made) made = record([&] { layer_head(L, il, R); });
                 ck(cudaGraphLaunch((cudaGraphExec_t) made, cs(st_)), "layer graph");
+                ++stats_.replays;
             } else {
                 layer_head(L, il, R);
             }
@@ -5208,10 +5231,10 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
             moe_rows(L, il, R);
         } else {
             ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
-            if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, R); });
+            if (replay) replayed(L.shared, (size_t) tail_key() * recs + rec, [&] { moe_shared(L, il, R); });
             else moe_shared(L, il, R);
             if (card && L.card == 1 && replay) {
-                replayed(L.card_moe, rec, [&] { moe_card(L, il, R); });
+                replayed(L.card_moe, (size_t) tail_key() * recs + rec, [&] { moe_card(L, il, R); });
                 stats_.gpu_experts += R * n_used_;
             } else if (card && moe_card(L, il, R)) {
                 stats_.gpu_experts += R * n_used_;
@@ -5219,7 +5242,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
                 moe_add(R);
             }
         }
-        if (replay && L.fixed) replayed(L.tail, rec, [&] { layer_tail(L, il, R); });
+        if (replay && L.fixed) replayed(L.tail, (size_t) tail_key() * recs + rec, [&] { layer_tail(L, il, R); });
         else layer_tail(L, il, R);
     }
 

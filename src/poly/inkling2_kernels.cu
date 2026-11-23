@@ -216,9 +216,11 @@ __global__ void ink_rel_table_kernel(const float* __restrict__ bias, int n_rel, 
 // q.k term of a full-attention layer (the bias is already tau-scaled).
 __global__ void ink_attend_rel_kernel(const float* __restrict__ q, const half* __restrict__ kc,
                                      const half* __restrict__ vc, const float* __restrict__ kqb,
-                                     const float* __restrict__ tau, long long pos, int rows,
+                                     const float* __restrict__ tau, long long pos_arg, int rows,
                                      float* __restrict__ out, int dim, int n_head, int kv_heads, float scale,
-                                     int window, int n_keys, int ring) {
+                                     int window, int n_keys, int ring, const long long* __restrict__ pos_at) {
+    // a recorded launch replays with whatever position the card holds then, so it reads it rather than the argument
+    const long long pos = pos_at ? *pos_at : pos_arg;
     __shared__ float qs[INK_ATTEND_ROWS][INK_THREADS];       // block's queries cached once (avoids re-reading Q per key)
     __shared__ float sc[INK_ATTEND_ROWS][INK_ATTEND_TILE];   // a tile's logits, then its weights
     __shared__ float wt[INK_ATTEND_ROWS][INK_ATTEND_TILE];
@@ -354,9 +356,10 @@ __global__ void ink_attend_rel_kernel(const float* __restrict__ q, const half* _
 __global__ void ink_attend_rel_q8_kernel(const float* __restrict__ q, const int8_t* __restrict__ kc,
                                          const half* __restrict__ ks, const int8_t* __restrict__ vc,
                                          const half* __restrict__ vs, const float* __restrict__ kqb,
-                                         const float* __restrict__ tau, long long pos, int rows,
+                                         const float* __restrict__ tau, long long pos_arg, int rows,
                                          float* __restrict__ out, int dim, int n_head, int kv_heads, float scale,
-                                         int window, int n_keys, int ring) {
+                                         int window, int n_keys, int ring, const long long* __restrict__ pos_at) {
+    const long long pos = pos_at ? *pos_at : pos_arg;
     __shared__ int qq4[INK_ATTEND_ROWS][INK_THREADS / 4];
     __shared__ float qscale[INK_ATTEND_ROWS][INK_THREADS / 32];
     __shared__ float sc[INK_ATTEND_ROWS][INK_ATTEND_TILE];
@@ -505,9 +508,11 @@ __global__ void ink_attend_rel_q8_kernel(const float* __restrict__ q, const int8
 // the reduce's rescale rather than adding a phantom sink to every head.
 __global__ void ink_attend_rel_split_kernel(const float* __restrict__ q, const half* __restrict__ kc,
                                            const half* __restrict__ vc, const float* __restrict__ kqb,
-                                           const float* __restrict__ tau, long long pos, int splits,
+                                           const float* __restrict__ tau, long long pos_arg, int splits,
                                            float* __restrict__ part_out, float* __restrict__ part_ml, int dim,
-                                           int n_head, int kv_heads, float scale, int n_keys, int ring) {
+                                           int n_head, int kv_heads, float scale, int n_keys, int ring,
+                                           const long long* __restrict__ pos_at) {
+    const long long pos = pos_at ? *pos_at : pos_arg;
     __shared__ float qs[INK_THREADS];
     __shared__ float sc[INK_ATTEND_TILE];
     __shared__ float wt[INK_ATTEND_TILE];
@@ -607,9 +612,11 @@ __global__ void ink_attend_rel_split_kernel(const float* __restrict__ q, const h
 __global__ void ink_attend_rel_q8_split_kernel(const float* __restrict__ q, const int8_t* __restrict__ kc,
                                               const half* __restrict__ ks, const int8_t* __restrict__ vc,
                                               const half* __restrict__ vs, const float* __restrict__ kqb,
-                                              const float* __restrict__ tau, long long pos, int splits,
+                                              const float* __restrict__ tau, long long pos_arg, int splits,
                                               float* __restrict__ part_out, float* __restrict__ part_ml, int dim,
-                                              int n_head, int kv_heads, float scale, int n_keys, int ring) {
+                                              int n_head, int kv_heads, float scale, int n_keys, int ring,
+                                              const long long* __restrict__ pos_at) {
+    const long long pos = pos_at ? *pos_at : pos_arg;
     __shared__ int qq4[INK_THREADS / 4];
     __shared__ float qscale[INK_THREADS / 32];
     __shared__ float sc[INK_ATTEND_TILE];
@@ -823,7 +830,9 @@ __global__ void ink_bank_states_kernel(const float* __restrict__ bank, const flo
 
 // The log-scaled position factor of a full-context layer: 1 + alpha*log(max(1, (pos + 1)/floor)), which
 // multiplies both the queries and the relative projection (the reference's `tau`).
-__global__ void ink_tau_kernel(float* __restrict__ tau, long long pos, int floor, float alpha, int rows) {
+__global__ void ink_tau_kernel(float* __restrict__ tau, long long pos_arg, int floor, float alpha, int rows,
+                              const long long* __restrict__ pos_at) {
+    const long long pos = pos_at ? *pos_at : pos_arg;
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= rows) return;
     const float p = (float) (pos + row + 1);
@@ -1042,8 +1051,10 @@ __global__ void __launch_bounds__(INK_MMA_THREADS)
 ink_attend_rel_mma_kernel(const float* __restrict__ q, const void* __restrict__ kc,
                           const uint16_t* __restrict__ ks, const void* __restrict__ vc,
                           const uint16_t* __restrict__ vs, const float* __restrict__ kqb,
-                          const float* __restrict__ tau, long long pos, int rows, float* __restrict__ out,
-                          int n_head, int kv_heads, float scale, int window, int n_keys, int ring) {
+                          const float* __restrict__ tau, long long pos_arg, int rows, float* __restrict__ out,
+                          int n_head, int kv_heads, float scale, int window, int n_keys, int ring,
+                          const long long* __restrict__ pos_at) {
+    const long long pos = pos_at ? *pos_at : pos_arg;
 #if INK_MMA
     constexpr int DIM = INK_MMA_DIM, KEYS = INK_MMA_KEYS, ROW = INK_MMA_ROW;
     extern __shared__ __align__(16) half sm[];
@@ -1188,7 +1199,7 @@ template <bool Q8>
 void ink_attend_rel_mma_launch(const float* q, const void* kc, const uint16_t* ks, const void* vc,
                                const uint16_t* vs, const float* kqb, const float* tau, int64_t pos, int rows,
                                float* out, int n_head, int kv_heads, float scale, int window, int n_keys, int ring,
-                               void* stream) {
+                               const long long* pos_at, void* stream) {
     if (rows <= 0) return;
 #if INK_MMA
     static bool room = false;
@@ -1199,13 +1210,13 @@ void ink_attend_rel_mma_launch(const float* q, const void* kc, const uint16_t* k
     }
     const unsigned blocks = (unsigned) ((rows + INK_MMA_ROWS - 1) / INK_MMA_ROWS);
     ink_attend_rel_mma_kernel<Q8><<<dim3((unsigned) n_head, blocks), INK_MMA_THREADS, INK_MMA_SMEM, cs(stream)>>>(
-        q, kc, ks, vc, vs, kqb, tau, pos, rows, out, n_head, kv_heads, scale, window, n_keys, ring);
+        q, kc, ks, vc, vs, kqb, tau, pos, rows, out, n_head, kv_heads, scale, window, n_keys, ring, pos_at);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("ink_attend_rel mma: ") + cudaGetErrorString(e));
 #else
     (void) q, (void) kc, (void) ks, (void) vc, (void) vs, (void) kqb, (void) tau, (void) pos, (void) rows,
         (void) out, (void) n_head, (void) kv_heads, (void) scale, (void) window, (void) n_keys, (void) ring,
-        (void) stream;   // a card without the tensor cores' steps never launches it
+        (void) pos_at, (void) stream;   // a card without the tensor cores' steps never launches it
 #endif
 }
 
@@ -1226,7 +1237,7 @@ void ink_attend_rel(const float* q, const uint16_t* kc, const uint16_t* vc, cons
     // A prompt's rows are many: the tensor cores carry both products, and the scalar kernel the rest.
     if (dim == INK_MMA_DIM && rows >= INK_MMA_MIN && ink_mma_on()) {
         ink_attend_rel_mma_launch<false>(q, kc, nullptr, vc, nullptr, kqb, tau, pos, rows, out, n_head, kv_heads,
-                                          scale, window, n_keys, ring, stream);
+                                          scale, window, n_keys, ring, nullptr, stream);
         return;
     }
     // one accumulator a thread holds its dimension of the running sum in, so a dimension takes a thread
@@ -1235,9 +1246,28 @@ void ink_attend_rel(const float* q, const uint16_t* kc, const uint16_t* vc, cons
     ink_attend_rel_kernel<<<dim3((unsigned) n_head, (unsigned) ((rows + INK_ATTEND_ROWS - 1) / INK_ATTEND_ROWS)),
                               INK_THREADS, 0, cs(stream)>>>(
         q, (const half*) kc, (const half*) vc, kqb, tau, pos, rows, out, dim, n_head, kv_heads, scale, window, n_keys,
-        ring);
+        ring, nullptr);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("ink_attend_rel: ") + cudaGetErrorString(e));
+}
+
+void ink_attend_rel_at(const float* q, const uint16_t* kc, const uint16_t* vc, const float* kqb, const float* tau,
+                        const long long* pos_at, int rows, float* out, int dim, int n_head, int kv_heads, float scale,
+                        int window, int n_keys, int ring, void* stream) {
+    if (rows <= 0) return;
+    if (dim == INK_MMA_DIM && rows >= INK_MMA_MIN && ink_mma_on()) {
+        ink_attend_rel_mma_launch<false>(q, kc, nullptr, vc, nullptr, kqb, tau, 0, rows, out, n_head, kv_heads,
+                                          scale, window, n_keys, ring, pos_at, stream);
+        return;
+    }
+    if (dim <= 0 || dim > INK_THREADS)
+        throw std::runtime_error("ink_attend_rel_at: the head dim must be 1 to " + std::to_string(INK_THREADS));
+    ink_attend_rel_kernel<<<dim3((unsigned) n_head, (unsigned) ((rows + INK_ATTEND_ROWS - 1) / INK_ATTEND_ROWS)),
+                              INK_THREADS, 0, cs(stream)>>>(
+        q, (const half*) kc, (const half*) vc, kqb, tau, 0, rows, out, dim, n_head, kv_heads, scale, window, n_keys,
+        ring, pos_at);
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
+        throw std::runtime_error(std::string("ink_attend_rel_at: ") + cudaGetErrorString(e));
 }
 
 void ink_attend_rel_q8(const float* q, const int8_t* kc, const uint16_t* ks, const int8_t* vc, const uint16_t* vs,
@@ -1246,7 +1276,7 @@ void ink_attend_rel_q8(const float* q, const int8_t* kc, const uint16_t* ks, con
     if (rows <= 0) return;
     if (dim == INK_MMA_DIM && rows >= INK_MMA_MIN && ink_mma_on()) {
         ink_attend_rel_mma_launch<true>(q, kc, ks, vc, vs, kqb, tau, pos, rows, out, n_head, kv_heads, scale,
-                                         window, n_keys, ring, stream);
+                                         window, n_keys, ring, nullptr, stream);
         return;
     }
     if (dim <= 0 || dim > INK_THREADS || (dim % 32) != 0)
@@ -1255,9 +1285,30 @@ void ink_attend_rel_q8(const float* q, const int8_t* kc, const uint16_t* ks, con
     ink_attend_rel_q8_kernel<<<dim3((unsigned) n_head, (unsigned) ((rows + INK_ATTEND_ROWS - 1) / INK_ATTEND_ROWS)),
                                  INK_THREADS, 0, cs(stream)>>>(
         q, kc, (const half*) ks, vc, (const half*) vs, kqb, tau, pos, rows, out, dim, n_head, kv_heads, scale, window,
-        n_keys, ring);
+        n_keys, ring, nullptr);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("ink_attend_rel_q8: ") + cudaGetErrorString(e));
+}
+
+void ink_attend_rel_q8_at(const float* q, const int8_t* kc, const uint16_t* ks, const int8_t* vc,
+                           const uint16_t* vs, const float* kqb, const float* tau, const long long* pos_at, int rows,
+                           float* out, int dim, int n_head, int kv_heads, float scale, int window, int n_keys,
+                           int ring, void* stream) {
+    if (rows <= 0) return;
+    if (dim == INK_MMA_DIM && rows >= INK_MMA_MIN && ink_mma_on()) {
+        ink_attend_rel_mma_launch<true>(q, kc, ks, vc, vs, kqb, tau, 0, rows, out, n_head, kv_heads, scale,
+                                         window, n_keys, ring, pos_at, stream);
+        return;
+    }
+    if (dim <= 0 || dim > INK_THREADS || (dim % 32) != 0)
+        throw std::runtime_error("ink_attend_rel_q8_at: head dim must be a multiple of 32 in 32.." +
+                                 std::to_string(INK_THREADS));
+    ink_attend_rel_q8_kernel<<<dim3((unsigned) n_head, (unsigned) ((rows + INK_ATTEND_ROWS - 1) / INK_ATTEND_ROWS)),
+                                 INK_THREADS, 0, cs(stream)>>>(
+        q, kc, (const half*) ks, vc, (const half*) vs, kqb, tau, 0, rows, out, dim, n_head, kv_heads, scale, window,
+        n_keys, ring, pos_at);
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
+        throw std::runtime_error(std::string("ink_attend_rel_q8_at: ") + cudaGetErrorString(e));
 }
 
 void ink_attend_rel_split(const float* q, const uint16_t* kc, const uint16_t* vc, const float* kqb, const float* tau,
@@ -1267,11 +1318,27 @@ void ink_attend_rel_split(const float* q, const uint16_t* kc, const uint16_t* vc
     if (splits <= 0) throw std::runtime_error("ink_attend_rel_split: splits must be positive");
     ink_attend_rel_split_kernel<<<dim3((unsigned) n_head, (unsigned) splits), INK_THREADS, 0, cs(stream)>>>(
         q, (const half*) kc, (const half*) vc, kqb, tau, pos, splits, part_out, part_ml, dim, n_head, kv_heads, scale,
-        n_keys, ring);
+        n_keys, ring, nullptr);
     ink_attend_split_reduce_kernel<<<dim3((unsigned) n_head, 1u), 128, 0, cs(stream)>>>(part_out, part_ml, out, dim,
                                                                                      n_head, splits);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("ink_attend_rel_split: ") + cudaGetErrorString(e));
+}
+
+void ink_attend_rel_split_at(const float* q, const uint16_t* kc, const uint16_t* vc, const float* kqb,
+                              const float* tau, const long long* pos_at, float* out, float* part_out,
+                              float* part_ml, int dim, int n_head, int kv_heads, float scale, int window,
+                              int n_keys, int ring, int splits, void* stream) {
+    if (dim <= 0 || dim > INK_THREADS)
+        throw std::runtime_error("ink_attend_rel_split_at: the head dim must be 1 to 256");
+    if (splits <= 0) throw std::runtime_error("ink_attend_rel_split_at: splits must be positive");
+    ink_attend_rel_split_kernel<<<dim3((unsigned) n_head, (unsigned) splits), INK_THREADS, 0, cs(stream)>>>(
+        q, (const half*) kc, (const half*) vc, kqb, tau, 0, splits, part_out, part_ml, dim, n_head, kv_heads, scale,
+        n_keys, ring, pos_at);
+    ink_attend_split_reduce_kernel<<<dim3((unsigned) n_head, 1u), 128, 0, cs(stream)>>>(part_out, part_ml, out, dim,
+                                                                                     n_head, splits);
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
+        throw std::runtime_error(std::string("ink_attend_rel_split_at: ") + cudaGetErrorString(e));
 }
 
 void ink_attend_rel_q8_split(const float* q, const int8_t* kc, const uint16_t* ks, const int8_t* vc,
@@ -1283,11 +1350,28 @@ void ink_attend_rel_q8_split(const float* q, const int8_t* kc, const uint16_t* k
     if (splits <= 0) throw std::runtime_error("ink_attend_rel_q8_split: splits must be positive");
     ink_attend_rel_q8_split_kernel<<<dim3((unsigned) n_head, (unsigned) splits), INK_THREADS, 0, cs(stream)>>>(
         q, kc, (const half*) ks, vc, (const half*) vs, kqb, tau, pos, splits, part_out, part_ml, dim, n_head, kv_heads,
-        scale, n_keys, ring);
+        scale, n_keys, ring, nullptr);
     ink_attend_split_reduce_kernel<<<dim3((unsigned) n_head, 1u), 128, 0, cs(stream)>>>(part_out, part_ml, out, dim,
                                                                                      n_head, splits);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("ink_attend_rel_q8_split: ") + cudaGetErrorString(e));
+}
+
+void ink_attend_rel_q8_split_at(const float* q, const int8_t* kc, const uint16_t* ks, const int8_t* vc,
+                                 const uint16_t* vs, const float* kqb, const float* tau,
+                                 const long long* pos_at, float* out, float* part_out, float* part_ml, int dim,
+                                 int n_head, int kv_heads, float scale, int window, int n_keys, int ring,
+                                 int splits, void* stream) {
+    if (dim <= 0 || dim > INK_THREADS || (dim % 32) != 0)
+        throw std::runtime_error("ink_attend_rel_q8_split_at: head dim must be a multiple of 32 in 32..256");
+    if (splits <= 0) throw std::runtime_error("ink_attend_rel_q8_split_at: splits must be positive");
+    ink_attend_rel_q8_split_kernel<<<dim3((unsigned) n_head, (unsigned) splits), INK_THREADS, 0, cs(stream)>>>(
+        q, kc, (const half*) ks, vc, (const half*) vs, kqb, tau, 0, splits, part_out, part_ml, dim, n_head, kv_heads,
+        scale, n_keys, ring, pos_at);
+    ink_attend_split_reduce_kernel<<<dim3((unsigned) n_head, 1u), 128, 0, cs(stream)>>>(part_out, part_ml, out, dim,
+                                                                                     n_head, splits);
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
+        throw std::runtime_error(std::string("ink_attend_rel_q8_split_at: ") + cudaGetErrorString(e));
 }
 
 
@@ -1321,9 +1405,18 @@ void ink_bank_states(const float* bank, const float* cur, float* out, int n_embd
 
 void ink_tau(float* tau, int64_t pos, int floor, float alpha, int rows, void* stream) {
     if (rows <= 0) return;
-    ink_tau_kernel<<<grid((size_t) rows, INK_THREADS), INK_THREADS, 0, cs(stream)>>>(tau, pos, floor, alpha, rows);
+    ink_tau_kernel<<<grid((size_t) rows, INK_THREADS), INK_THREADS, 0, cs(stream)>>>(tau, pos, floor, alpha, rows,
+                                                                                 nullptr);
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("ink_tau: ") + cudaGetErrorString(e));
+}
+
+void ink_tau_at(float* tau, const long long* pos_at, int floor, float alpha, int rows, void* stream) {
+    if (rows <= 0) return;
+    ink_tau_kernel<<<grid((size_t) rows, INK_THREADS), INK_THREADS, 0, cs(stream)>>>(tau, 0, floor, alpha, rows,
+                                                                                 pos_at);
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
+        throw std::runtime_error(std::string("ink_tau_at: ") + cudaGetErrorString(e));
 }
 
 void ink_finish_logits(float* logits, int n_vocab, int n_unpadded, float cap, int rows, void* stream) {

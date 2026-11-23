@@ -1285,12 +1285,13 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
     std::fprintf(stderr,
                  "prompt %lld tokens %.1f tok/s, generated %lld tokens %.2f tok/s (%s); experts from VRAM %.1f%%, "
                  "CPU experts %.1f ms/token, router wait %.1f ms/token, %lld experts swapped into VRAM, "
-                 "%lld left out, %lld of %lld guessed tokens right\n",
+                 "%lld left out, %lld of %lld guessed tokens right, %lld graphs replayed %lld times\n",
                  (long long) r.read, r.prompt_ms > 0 ? 1000.0 * (double) r.read / r.prompt_ms : 0.0,
                  (long long) r.produced, r.decode_ms > 0 ? 1000.0 * (double) (r.produced - 1) / r.decode_ms : 0.0,
                  r.finish, 100.0 * (double) st.gpu_experts / experts, st.cpu_ms / (double) std::max<int64_t>(st.tokens, 1),
                  st.route_wait_ms / (double) std::max<int64_t>(st.tokens, 1), (long long) st.swapped_experts,
-                 (long long) st.tail_experts, (long long) r.guessed_right, (long long) r.guessed);
+                 (long long) st.tail_experts, (long long) r.guessed_right, (long long) r.guessed,
+                 (long long) st.graphs, (long long) st.replays);
     return 0;
 }
 

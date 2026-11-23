@@ -458,10 +458,21 @@ void ink_rel_table(const float* bias, int n_rel, const float* rcur, const float*
 void ink_attend_rel(const float* q, const uint16_t* kc, const uint16_t* vc, const float* kqb, const float* tau,
                     int64_t pos, int rows, float* out, int dim, int n_head, int kv_heads, float scale,
                     int window, int n_keys, int ring, void* stream);
+/// Same as ink_attend_rel(), reading the positions off the card: `pos_at` holds the first row's position when the
+/// launch runs and the rows count on from it, so a recorded launch replays at whatever position the call is at then.
+/// A graph holds its arguments, not their values (kernels.cu's attend() has the same pointer).
+void ink_attend_rel_at(const float* q, const uint16_t* kc, const uint16_t* vc, const float* kqb, const float* tau,
+                        const long long* pos_at, int rows, float* out, int dim, int n_head, int kv_heads, float scale,
+                        int window, int n_keys, int ring, void* stream);
 /// Same as ink_attend_rel(), reading Q8_0 K/V caches (32 int8 codes + 1 fp16 scale per 32-value block).
 void ink_attend_rel_q8(const float* q, const int8_t* kc, const uint16_t* ks, const int8_t* vc, const uint16_t* vs,
                        const float* kqb, const float* tau, int64_t pos, int rows, float* out, int dim, int n_head,
                        int kv_heads, float scale, int window, int n_keys, int ring, void* stream);
+/// Same as ink_attend_rel_q8(), with the positions read off the card, as ink_attend_rel_at().
+void ink_attend_rel_q8_at(const float* q, const int8_t* kc, const uint16_t* ks, const int8_t* vc, const uint16_t* vs,
+                           const float* kqb, const float* tau, const long long* pos_at, int rows, float* out,
+                           int dim, int n_head, int kv_heads, float scale, int window, int n_keys, int ring,
+                           void* stream);
 
 /// Flash-decoding's split of one row's keys: only the [0, pos] range is cut, so this is the full-attention
 /// (window 0) case, one row, at `pos`.  The keys are cut into `splits` chunks and a block a (head, split) scans
@@ -471,11 +482,22 @@ void ink_attend_rel_q8(const float* q, const int8_t* kc, const uint16_t* ks, con
 void ink_attend_rel_split(const float* q, const uint16_t* kc, const uint16_t* vc, const float* kqb, const float* tau,
                            int64_t pos, float* out, float* part_out, float* part_ml, int dim, int n_head,
                            int kv_heads, float scale, int window, int n_keys, int ring, int splits, void* stream);
+/// Same as ink_attend_rel_split(), with the position read off the card, as ink_attend_rel_at().
+void ink_attend_rel_split_at(const float* q, const uint16_t* kc, const uint16_t* vc, const float* kqb, const float* tau,
+                             const long long* pos_at, float* out, float* part_out, float* part_ml, int dim,
+                             int n_head, int kv_heads, float scale, int window, int n_keys, int ring, int splits,
+                             void* stream);
 /// Same as ink_attend_rel_split(), over Q8_0 K/V caches.
 void ink_attend_rel_q8_split(const float* q, const int8_t* kc, const uint16_t* ks, const int8_t* vc,
                              const uint16_t* vs, const float* kqb, const float* tau, int64_t pos, float* out,
                              float* part_out, float* part_ml, int dim, int n_head, int kv_heads, float scale,
                              int window, int n_keys, int ring, int splits, void* stream);
+/// Same as ink_attend_rel_q8_split(), with the position read off the card, as ink_attend_rel_at().
+void ink_attend_rel_q8_split_at(const float* q, const int8_t* kc, const uint16_t* ks, const int8_t* vc,
+                                 const uint16_t* vs, const float* kqb, const float* tau,
+                                 const long long* pos_at, float* out, float* part_out, float* part_ml, int dim,
+                                 int n_head, int kv_heads, float scale, int window, int n_keys, int ring,
+                                 int splits, void* stream);
 
 
 /// The states the depth attention mixes, a token at a time: the bank's `n_bank` blocks newest first and then `cur`,
@@ -487,6 +509,8 @@ void ink_bank_states(const float* bank, const float* cur, float* out, int n_embd
 /// The log-scaled position factor of a full-attention layer, one a token:
 /// tau = 1 + alpha * log(max(1, (pos + row + 1) / floor)).
 void ink_tau(float* tau, int64_t pos, int floor, float alpha, int rows, void* stream);
+/// Same as ink_tau(), with the position read off the card, as ink_attend_rel_at().
+void ink_tau_at(float* tau, const long long* pos_at, int floor, float alpha, int rows, void* stream);
 
 /// The attention over the depth: states[n_states - 1] is the layer's input and states[0..] the bank's blocks,
 /// newest first, as the reference's concat leaves them; every state is RMS-normed without a gain, and each of the

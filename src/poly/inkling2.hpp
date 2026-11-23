@@ -55,7 +55,14 @@ protected:
     size_t extra_bytes() const override;
     void save_layer(int il, int64_t pos, uint8_t* dst) override;
     void load_extra(const uint8_t* src, int64_t pos) override;
-    int head_key(int il, int n) const override { (void) il; return room_key(n); }
+    int head_key(int il, int n) const override {
+        (void) il;
+        return room_key(n) * loop_count_ + steps_[(size_t) cur_step_].pass;
+    }
+    /// The looped core visits the same weights three times with different work after the experts (its own depth
+    /// attention bank, its own pass messages, its own controllers), so a physical layer's tail is recorded once for each
+    /// pass and not once for each number of tokens alone.
+    int tail_key() const override { return steps_[(size_t) cur_step_].pass; }
 
 private:
     /// One logical execution step: the prelude, then the core three times, then the epilogue.

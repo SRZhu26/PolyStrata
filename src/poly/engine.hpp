@@ -189,6 +189,8 @@ struct Stats {
     int64_t tokens = 0, gpu_experts = 0, cpu_experts = 0, batch_cached = 0, batch_staged = 0;
     int64_t swapped_experts = 0;   ///< experts that took a cached one's slot (follow())
     int64_t tail_experts = 0;      ///< a token's experts left out by Options::tail_skip
+    int64_t graphs = 0;            ///< recordings made (record()), a layer's launches or a whole pass's
+    int64_t replays = 0;           ///< launches a recording stood in for
     double cpu_ms = 0, route_wait_ms = 0;
 };
 
@@ -493,6 +495,10 @@ protected:
     /// Which recording of a layer's head fits n tokens from pos().  Launches that are sized by the rows they read
     /// are recorded once for each size (room()), and the architecture numbers the sizes from 0.
     virtual int head_key(int il, int n) const { (void) il, (void) n; return 0; }
+    /// Which recording of a layer's launches after its routed experts fits the visit under way.  An architecture
+    /// whose layers run more than once (a looped core) visits the same weights with different work after the experts,
+    /// so a layer's tail is recorded once for each visit (tail_key()) and not once for each number of tokens alone.
+    virtual int tail_key() const { return 0; }
     /// layer_head() takes step()'s rows in one call: the products for every row at once, and each row's recurrent
     /// state and attention rows from its own sequence (rows_of_, seq_state(), seq_buf()), its position from at_.
     /// Otherwise step() runs the head a row at a time, with the row's sequence bound.
@@ -664,6 +670,10 @@ protected:
     int64_t kv_rows_for(int64_t end) const;   ///< the rows cover() maps for `end`
     void held_is_budget();
     void settle_swaps();
+    /// The recordings a cache change makes stale.  Every graph holds raw pointers into the expert cache and
+    /// the sequences' rows, so a slot that moves under one must retire it: a replayed launch would read the
+    /// expert that was there when it was recorded.
+    void invalidate_graphs();
 #if defined(STRATA_GPU_METAL)
     virtual std::optional<uint64_t> metal_host_available() const;
     size_t metal_host_headroom();
