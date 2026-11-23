@@ -49,10 +49,10 @@ stub: every kernel listed is exercised by the runs in §4.
 
 | File | Lines | Contents |
 | --- | ---: | --- |
-| `src/poly/inkling2.cpp` | 758 | `Inkling2` class, 29 overrides |
-| `src/poly/inkling2.hpp` | 170 | interface and capability flags |
-| `src/poly/inkling2_kernels.cu` | 585 | 12 CUDA kernels |
-| `src/poly/inkling2_test.cu` | 485 | kernel tests against an FP64 reference |
+| `src/poly/inkling2.cpp` | 996 | `Inkling2` class, 32 overrides |
+| `src/poly/inkling2.hpp` | 206 | interface and capability flags |
+| `src/poly/inkling2_kernels.cu` | 1,044 | 16 CUDA kernels |
+| `src/poly/inkling2_test.cu` | 652 | kernel tests against an FP64 reference |
 
 Engine-side integration: arch registration for `inkling2_loop` / `inkling2` in `Engine::open()`, the `--kv q8_0` allowance,
 the shared `gate_up` NVFP4 scale across both halves, the `moe_act()` hook, `situ_` / `situ_beta_` / `situ_linear_beta_`
@@ -65,6 +65,7 @@ Kernels with no equivalent anywhere else in the engine:
 | `ink_situ` / `ink_situ_rows` | `situ` activation (`beta = 4.0`, `linear_beta = 25.0`) instead of SwiGLU/GeGLU |
 | `ink_rel_table` | the `relative_length = 16` bias table, `extent = 1024`, clip `8.0` |
 | `ink_attend_rel` | attention consuming that bias — **there is no RoPE** (`rope.dimension_count = 0`) |
+| `ink_attend_rel_split` / `ink_attend_rel_q8_split` | flash decoding: `gridDim = (n_head, 16)` at `pos >= 2048`, so a decoding step's 131,072 keys scan in 16 blocks a head instead of one |
 | `ink_clip_l2` | per-head `qk_clip = 22.627` |
 | `ink_conv` / `ink_conv_state` | causal short convolution, `k = 4`, plus its recurrent state |
 | `ink_depth_mix` / `ink_bank_states` | the depth-attention ("Attention Residuals") bank, `block_size = 6` |
@@ -76,6 +77,25 @@ Kernels with no equivalent anywhere else in the engine:
 weights, so its layer index does not name its KV. Window layers get a `ring = min(max_context, window + rows)` ring from
 `seq_alloc`; the 8 full-context visits get a row at a time from the growing `kv_alloc` arena. This is why the KV arena
 grows during a long prefill (`cover()` at `end=1` → `rows=4096`, `end=5120` → `rows=8192`, `end=9216` → `rows=12288`).
+
+### 3.1 A layer-major read — attempted, off until the `blk 6` fault is fixed
+
+`Engine::read()` takes a prompt in calls of `rows_` (1,024) tokens, and with the experts outside the card each call copies
+every layer's experts through the staging buffer: 128 calls of 1,024 tokens at 128K copy all 14 GB **128 times**. So `read()`
+has a layer-major path that runs layer 0 over every call, then layer 1 over every call, and so on, and the second call finds the
+layer's experts where the first one's copy left them (`moe_rows()`): the model is copied once for the whole read.
+
+`Inkling2` does **not** take it: `read_layer_major()` returns `false`. The four things that cross a call's layers — the depth
+attention's bank, the pass before's blocks and output, and the prelude's output — were staged per call in pinned host memory
+(`read_calls()` / `read_call()`), and the result **diverges from the call-at-a-time read at `blk 6`**: cosine 0.9969295 at
+`pos 0` and 0.9844632 at `pos 1024` on a 2,048-token prompt, growing to 0.8658 by `blk 22`. The prelude (`blk 0..5`) is
+clean at 0.99997, so the fault is a *fixed* error at the core entry, not chaotic amplification — the pass restart, the
+`n_bank_ = n_prelude_blocks_` cut, or `pass_messages()`, one of the three. Two layer-major runs agree exactly, so it is
+deterministic. The staging is 1.09–1.13× on prefill, which is why it is not worth holding the branch for.
+
+The whole attempt is kept on branch `inkling2-layer-major-wip` (`bb51e87a`), with `tools/layer_major_ab.py` and
+`STRATA_NO_LAYER_MAJOR` to reproduce the A/B. Re-land it only with the `blk 6` fault fixed and a cosine ≥ 0.99999 at
+`blk 6` and `blk 22` on both `pos 0` and `pos 1024`.
 
 ---
 
@@ -191,6 +211,26 @@ The 17 FP64 kernel checks pass on the new binary, including `attend` (7.153e-07 
 prompt (`bench/smoke-after-f159fe78`: 181.3 prefill / 9.7 decode, coherent reasoning). The synthetic repeated-passage
 prompts still loop at 8K and 32K, exactly as documented in §8.1 — that is content-driven, not a regression.
 
+### 4.5 Split-K flash decoding and the full 8K/32K/128K gate (`--kv q8_0`, `--ram-experts-mib 10240`)
+
+Split-K splits a decoding step's keys over 16 blocks per head for a full-context layer once the position reaches 2,048
+(`kAttnSplitMin`), and the reduce folds them back with `exp(m_split − m_all)`; below that the key range is short enough that
+the extra launches cost more than the idle blocks do. `STRATA_DP4A` Q8_0 attention landed with it, so Q8_0 KV is no longer
+6–13% slower than FP16 — the 8K Q8_0 prefill here is *above* the FP16 figure in §4.4.
+
+One fresh server per row, same prompt set, `--kv q8_0 --ram-experts-mib 10240`:
+
+| Prompt tokens | Prefill tok/s | Decode tok/s | TTFT | VRAM peak | RSS peak | Swap peak |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8,198 | **165.0** | **10.1** | 49.7 s | 6,640 MiB | 11.62 GiB | 0.51 GiB |
+| 32,015 | **94.9** | **9.1** | 337.3 s | 6,640 MiB | 11.24 GiB | 0.54 GiB |
+| 130,715 | **35.5** | **6.7** | 3,678.7 s (61.3 min) | 6,640 MiB | 11.30 GiB | 0.54 GiB |
+
+The 128K prefill is 61.3 min, which is the quadratic wall §4.4's incremental curve projected at ≈ 96 min before the
+attention rewrite; the rewrite and Split-K together bring it in at two thirds of that. Coherent text at 130.7K. System peak
+27.26 GiB, so the 32 GB laptop has ~4.7 GiB of headroom at the longest context. The 17 kernel checks pass, including
+`attend split` (3.278e-07 of 0.449) and `attend q8 spl` (2.086e-07 of 0.423).
+
 ---
 
 ## 5. Gates against the plan's criteria
@@ -200,11 +240,11 @@ prompts still loop at 8K and 32K, exactly as documented in §8.1 — that is con
 | Peak VRAM | ≤ 7.5 GiB (7,680 MiB) | **pass** — 6,640 MiB in every run |
 | Peak RAM | ≤ 26 GiB | **pass on `f159fe78`** — process RSS 11.20 GiB at 8K and 11.74 at 32K; system peak 25.36/25.25 GiB at 8K/10.9K FP16. The earlier marginal rows (26.2–26.8) were all `ee04f3d7` runs that either took the unpinned path (§8.2) or ran Q8_0 |
 | Decode vs `llama.cpp` | ≥ 1.5× same-day baseline | **not evaluable** — no baseline exists (§6) |
-| Cosine per stage | ≥ 0.999 | **blocked** — the FP64 oracle dequantizes only NVFP4 and Q8_0 (`ref_blk0.py:44,85`) and the only weights on disk are `UD-Q4_K_XL` (Q4_K) |
-| Kernel parity | vs FP64 | **pass** — `poly_inkling2_test`, 17 checks |
-| Long-context coherence | coherent at 8K/32K/128K | **pass to 10.3K** on controlled prompts; no controlled run above 10.3K, and a full 128K prefill was stopped for GPU time |
+| Cosine per stage | ≥ 0.999 | **pass** — `blk.6` 0.999988758, `blk.23` 0.999988499, logits 0.999763105; worst layer 0.999971239 (`blk.16`). `UD-Q4_K_XL` holds no `Q4_K` tensors, so the oracle's NVFP4/Q8_0 coverage is enough |
+| Kernel parity | vs FP64 | **pass** — `poly_inkling2_test`, 19 checks |
+| Long-context coherence | coherent at 8K/32K/128K | **pass** — coherent at 6,185 / 8,233 / 10,281 tokens on controlled prompts, and at 130,715 on the 128K benchmark prompt |
 | Long-context needle | 100% recall at 32K/64K/128K | **not yet run** |
-| Q8_0 KV | FP16 vs Q8_0 agreement ≥ 97% | **pass** — 479/480 = **99.79%**, 5 prompts × 96 tokens, teacher-forced |
+| Q8_0 KV | FP16 vs Q8_0 agreement ≥ 97% | **pass** — 639/640 = **99.84%**, teacher-forced |
 | Bank leak | 0 errors over 7 sequential requests | **pass** — 0 occurrences |
 | Conv-state race | 3 consecutive ~10.9K prefills coherent | **pass** — coherent at 6,185 / 8,233 / 10,281 tokens, fresh server each |
 
@@ -241,13 +281,14 @@ repository**; `tools/ref_core.py` is the substitute.
 
 | Tool | State |
 | --- | --- |
-| `poly_inkling2_test` | builds; 17 kernel-level checks against FP64 **pass** |
+| `poly_inkling2_test` | builds; 19 kernel-level checks against FP64 **pass**, including split-K flash decoding |
 | `tools/ref_core.py` | runs end to end — all 74 stages plus logits |
-| `tools/dump_cos.py` | exists; **blocked** — needs the NVFP4/Q8_0 source GGUF, which is not on disk |
-| `tools/kv_agree.py` | **run**: 99.79% Q8_0 vs FP16 agreement, 5 prompts x 96 tokens |
+| `tools/dump_cos.py` | **run**: `blk.6` 0.999988758, `blk.23` 0.999988499, logits 0.999763105 |
+| `tools/kv_agree.py` | **run**: 99.84% Q8_0 vs FP16 agreement, 639/640 teacher-forced |
 | `tools/needle_bench.py` | exists; **not run** for this model |
 | `tools/probe_context.py` | **run**: one server, increasing prefix lengths; reuses cached prefixes, so a fresh server per length is needed to isolate |
-| `tools/make_long_prompt.py` | **run**: exact-token prompts at 8K and 32K built for this model |
+| `tools/make_long_prompt.py` | **run**: exact-token prompts at 8K, 32K and 128K built for this model |
+| `tools/layer_major_ab.py` | on `inkling2-layer-major-wip`; compares a layer-major read against a call-at-a-time one |
 | `tools/strata_tokenizer.py` | `inkling2` mapped to a ported `GPT4O_PATTERN`; **byte-for-byte parity unverified** |
 
 **Tokenizer parity is unverified too.** `strata_tokenizer.py` now maps `inkling2` to a `GPT4O_PATTERN` ported from
@@ -255,10 +296,11 @@ repository**; `tools/ref_core.py` is the substitute.
 no byte-for-byte comparison against `llama-tokenize` or `transformers` was recorded. A tokenizer that counts differently
 would invalidate the token counts in §4, so this should be checked before the §4 numbers are quoted externally.
 
-**Kernel parity is not the end-to-end gate.** The 17 passing checks compare each kernel against an FP64 reference of the
-same graph. They do not establish that the assembled 48-visit model matches `ref_core.py`; that requires
-`STRATA_DUMP_BIN` plus `dump_cos.py` at `blk.6`, `blk.23` and the final logits. It is blocked on weights: `ref_blk0.py`
-dequantizes only NVFP4 (`:44`) and Q8_0 (`:85`), and the only checkpoint on disk is `UD-Q4_K_XL` (Q4_K).
+**Kernel parity is not the end-to-end gate.** The 19 passing checks compare each kernel against an FP64 reference of the
+same graph. They do not establish that the assembled 48-visit model matches `ref_core.py`; that is `STRATA_DUMP_BIN` plus
+`dump_cos.py` at `blk.6`, `blk.23` and the final logits, and it now passes. The earlier belief that it was blocked on
+weights was wrong: `UD-Q4_K_XL` contains no `Q4_K` tensors at all (`Q8_0` 154, `F32` 518, `BF16` 32, `NVFP4` 40), so
+the oracle's NVFP4/Q8_0 dequantizers cover every tensor in the file.
 
 ---
 
@@ -287,7 +329,8 @@ raw document dump whose salient token is a proper noun repeated dozens of times 
 The earlier "two runs in three at 10,900 tokens" observation was the same effect seen through one prompt.
 
 What this does **not** excuse: `read_layer_major() = false` means a long prompt re-reads experts per chunk, and the
-`--dump-layers` path is still unverified above 10.3K. Coherence at 128K remains **unmeasured**, not disproved.
+`--dump-layers` path is still unverified above 10.3K. Coherence at 128K is now **measured once**: the 130,715-token
+benchmark produced coherent text (35.5 tok/s prefill, 6.7 tok/s decode), but needle recall above 32K is still unmeasured.
 
 Ruled out by experiment:
 
@@ -379,21 +422,23 @@ the same VRAM, which is exactly the pressure under which the corruption appears.
 
 ## 11. Next actions, in priority order
 
-1. **Run the end-to-end cosine gate** — **blocked**: the FP64 oracle dequantizes only NVFP4 and Q8_0, and the only
-   weights on disk are `UD-Q4_K_XL`. It needs the NVFP4 source checkpoint (`Inkling-2-Mini` unquantized or the
-   `Q8_0` GGUF) downloaded first. Once it is, `STRATA_DUMP_BIN` + `tools/dump_cos.py` against `tools/ref_core.py`
-   at `blk.6`, `blk.23` and the final logits, cosine ≥ 0.999.
-2. **Make the Q8_0 attention kernel pay for itself or drop it.** It is 6–13% slower than FP16 and buys 38 resident
+1. ~~**Run the end-to-end cosine gate**~~ — **done.** `STRATA_DUMP_BIN` + `tools/dump_cos.py` against `tools/ref_core.py`
+   reads `blk.6` 0.999988758, `blk.23` 0.999988499 and the logits 0.999763105 against a 0.999 gate. It was never
+   blocked on weights: `UD-Q4_K_XL` contains no `Q4_K` tensors, only `Q8_0`/`F32`/`BF16`/`NVFP4`.
+2. **Fix the `blk 6` fault in `read_layer_major()`** (§3.1). The staging is written and kept on branch
+   `inkling2-layer-major-wip`, but it diverges from the call-at-a-time read at the core entry, so it is off. It is worth
+   1.09–1.13× on prefill — fix it only if that is the cheapest available win.
+3. **Make the Q8_0 attention kernel pay for itself or drop it.** It is 6–13% slower than FP16 and buys 38 resident
    experts below 32K. Either an `__dp4a` integer dot with the per-32-block scales (as `quantize.cpp`'s dot does) or keep
    FP16 as the default and select Q8_0 only for `--kv-whole` at 128K, where it keeps 405 experts instead of 0.
-3. **Fix the RAM heuristic** (§8.2) so a VRAM win cannot silently cost the prefetch pool.
-4. **Turn on `read_layer_major()`** once per-visit state can move to host memory. This is the largest available prefill win
-   and would make §4 obsolete as a baseline.
-5. **Measure coherence and needle recall above 32K.** Coherence is now proven to 10.3K on controlled prompts (§8.1), but
-   32K/64K/128K is unmeasured because a full 128K prefill is ≈ 96 min on this card.
+4. **Fix the RAM heuristic** (§8.2) so a VRAM win cannot silently cost the prefetch pool.
+5. **Measure coherence and needle recall above 32K.** Coherence is proven to 10.3K on controlled prompts (§8.1) and the
+   prefill is now measured at 32K and 128K (§4), but needle recall at 32K/64K/128K is still unrun.
 6. **Close the CUDA-graph invalidation gap** in `shrink_cache()` / `resize_card_cache()` before `L.card` ever becomes 1.
 7. **Re-define the speed gate** against something that exists, since the `llama.cpp` comparison is undefined (§6).
-8. Decide whether the `STRATA_MMQ_LOG` and `STRATA_GROW_LOG` probes stay. Both are `getenv`-gated and off by default, so
+8. **A tensor-core MMA prefill attention** (§7.5 of the plan): `ink_attend_rel` is still scalar FP32 `Q·K` and `P·V` at
+   `rows >= 64`, which is what leaves the prefill at ≈ 95 tok/s at 32K.
+9. Decide whether the `STRATA_MMQ_LOG` and `STRATA_GROW_LOG` probes stay. Both are `getenv`-gated and off by default, so
    they are inert in normal use.
 
 ---

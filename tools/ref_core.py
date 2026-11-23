@@ -63,15 +63,17 @@ def run_layer(g, il, cur, bank, prev, W, V, pos=0):
     in_core = CORE_START <= il < CORE_END
 
     inpSA = cur
-    # pass_messages(): the bank is cut to the prelude's blocks, then rebuilt from the pass before
-    if in_core and il == CORE_START and prev is not None:
-        del bank[N_PRELUDE_BLOCKS:]
+    # pass_messages(): the bank is cut to the prelude's blocks at the pass's first core layer, and
+    # every core layer then asks the bank its own message (its own `loop_msg_query`), as the C++
+    # reference's `build_layer(..., mix(bank, bank_out, loop.msg_query), &loop)` does per `ip`
+    msg = None
+    if in_core and prev is not None:
+        if il == CORE_START:
+            del bank[N_PRELUDE_BLOCKS:]
         prev_bank, prev_out = prev
         states = list(reversed(prev_bank)) + [prev_out]
         q = V(p + "loop_msg_query.weight").reshape(N_CTRL, N_EMBD)
         msg = mix_q(states, q)
-    else:
-        msg = None
 
     inputs = [cur.copy(), cur.copy(), cur.copy()]
     if il > 0:                                          # a block's first layer has no query
@@ -87,7 +89,11 @@ def run_layer(g, il, cur, bank, prev, W, V, pos=0):
             forget = W(p + f"loop_{['q', 'k', 'v'][j]}_ctrl_forget.weight")
             inputs[j] = ink_control(inputs[j], msg[j], down, gain, forget, gain.shape[0])
 
-    if swa:
+    # A window layer normed once shares the one input with all three - but a pass with messages has already
+    # parted them, and the reference norms each of the three on its own there (`is_swa && messages`)
+    if swa and msg is not None:
+        inputs = [rms(inputs[j]) * V(p + "attn_norm.weight") for j in range(3)]
+    elif swa:
         n = rms(inputs[0]) * V(p + "attn_norm.weight")
         inputs = [n.copy(), n.copy(), n.copy()]
     else:
@@ -101,8 +107,8 @@ def run_layer(g, il, cur, bank, prev, W, V, pos=0):
     Rraw = W(p + "attn_rel.weight") @ inputs[0]
 
     zero = np.zeros((K - 1, N_KV * HEAD_DIM))
-    kdyn = None if swa else (W(p + "attn_k_conv_proj.weight") @ inputs[1]).reshape(K, N_KV)
-    vdyn = None if swa else (W(p + "attn_v_conv_proj.weight") @ inputs[2]).reshape(K, N_KV)
+    kdyn = None if swa else (W(p + "attn_k_conv_proj.weight") @ inputs[1]).reshape(N_KV, K)
+    vdyn = None if swa else (W(p + "attn_v_conv_proj.weight") @ inputs[2]).reshape(N_KV, K)
     k = conv_dyn(Kraw.reshape(1, -1), zero, W(p + "attn_k_conv.weight"), kdyn)[0]
     v = conv_dyn(Vraw.reshape(1, -1), zero, W(p + "attn_v_conv.weight"), vdyn)[0]
 
@@ -141,12 +147,14 @@ def run_layer(g, il, cur, bank, prev, W, V, pos=0):
     ffn_inp = cur.copy()
 
     m = mix_q(bank + [cur], V(p + "ffn_res_query.weight").reshape(1, N_EMBD))
-    xn = rms(m[0]) * V(p + "ffn_norm.weight")
-    # the FFN's own control tap, the fourth
+    # the FFN's own control tap, the fourth: it reads the mix before the norm, as the C++ reference's
+    # graph does (control(cur, ...) then build_norm(cur, ffn_norm)), and the norm follows it
+    xn = m[0].copy()
     if msg is not None:
         xn = ink_control(xn, msg[3], W(p + "loop_ffn_ctrl_down.weight"),
                          W(p + "loop_ffn_ctrl_gain.weight"), W(p + "loop_ffn_ctrl_forget.weight"),
                          W(p + "loop_ffn_ctrl_gain.weight").shape[0])
+    xn = rms(xn) * V(p + "ffn_norm.weight")
 
     logits = W(p + "ffn_gate_inp.weight") @ xn
     probs = 1.0 / (1.0 + np.exp(-logits))
@@ -202,25 +210,35 @@ def main():
     emit("blk  0 l_out", r)
 
     bank, prev = [], None
+    prelude = None
     for p in range(LOOP_COUNT):
         # the prelude runs once, the core three times, and each pass's last core layer hands the next its
         # blocks after the first and its output
-        layers = list(range(N_PRELUDE)) + list(range(CORE_START, CORE_END)) if p == 0 \
-            else list(range(CORE_START, CORE_END))
+        if p == 0:
+            layers = list(range(N_PRELUDE)) + list(range(CORE_START, CORE_END))
+        else:
+            # every pass after the first starts from the prelude's output, not from the pass before's:
+            # docs/models/reference/inkling2-loop.cpp sets `cur = prelude` and `blocks = prelude_blocks`
+            layers = list(range(CORE_START, CORE_END))
+            r = prelude
         for il in layers:
             r = run_layer(g, il, r, bank, prev, W, V, pos=0)
             emit(f"blk {il:2d} l_out", r)
+            if p == 0 and il == N_PRELUDE - 1:
+                prelude = r.copy()
             if p < LOOP_COUNT - 1 and il == CORE_END - 1:
                 prev = (bank[N_PRELUDE_BLOCKS + 1:], r)
     for il in range(CORE_END, N_LAYER):
         r = run_layer(g, il, r, bank, prev, W, V, pos=0)
         emit(f"blk {il:2d} l_out", r)
 
-    # the output: the last mix of the bank, then the output norm and the matrix
+    # the output: the last mix of the bank, then the output norm and the matrix.  The matrix has
+    # 966 pad rows past the vocabulary (output.weight is [2304, 201024], the tokenizer 200,058), and
+    # the engine's softcapped logits stop at the vocabulary, so the reference drops the pad too.
     states = bank + [r]
     m = mix_q(states, V("output_res_query.weight").reshape(1, N_EMBD))
     h = rms(m[0]) * V("output_norm.weight")
-    logits = W("output.weight") @ h
+    logits = (W("output.weight") @ h)[:N_VOCAB]
     emit("logits", logits)
     if bin_out is not None:
         bin_out.close()

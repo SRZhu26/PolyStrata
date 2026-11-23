@@ -609,6 +609,9 @@ protected:
     void follow_loop();
     void embed(int32_t token, float* dst) const;
     void dbg(const char* name, int il, const float* dev, int n);
+    /// A dump is a copy on the stream, which a capture cannot hold, so a dump file turns the dumps on
+    /// and the replay of a recorded graph off.  --dump-layers does both too, but it narrows the rows.
+    bool dumping() const { return opt_.dump || std::getenv("STRATA_DUMP_BIN") != nullptr; }
     float* fbuf(size_t n);
     int room(int n) const;
     int room_key(int n) const;

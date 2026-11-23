@@ -1,0 +1,21 @@
+[
+ {
+  "engine": "strata",
+  "model": "Inkling-2-Mini-UD-Q4_K_XL.gguf",
+  "status": "ok",
+  "load_s": 13.7,
+  "wall_s": 62.39,
+  "prompt_n": 8198,
+  "prompt_ms": 49678.9,
+  "prompt_tps": 165.0,
+  "pred_n": 128,
+  "pred_ms": 12653.0,
+  "pred_tps": 10.1,
+  "text": "<|message_model|><|content_thinking|>The user has pasted a long repeated passage about a lighthouse keeper. It repeats the same text many times. There's no explicit question. Likely they want me to do something with it \u2014 but no instruction. The text is a repeated passage, possibly a test of repetition. I should respond helpfully: note the repetition, summarize the passage, maybe offer to continue/edit/analyze. I shouldn't just blindly continue generating endless repetition. Best: acknowledge the text appears repeated, summarize its themes, and ask what they'd like done (e.g., edit, continue,",
+  "vram_peak_mib": 6640,
+  "rss_peak_gib": 11.62,
+  "sys_used_peak_gib": 27.17,
+  "swap_peak_gib": 0.51,
+  "name": "inkling2"
+ }
+]

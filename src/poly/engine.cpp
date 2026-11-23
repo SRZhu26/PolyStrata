@@ -3581,7 +3581,13 @@ bool Engine::input(int32_t token, int64_t row, float* dst) const {
 }
 
 void Engine::dbg(const char* name, int il, const float* dev, int n) {
-    if (!opt_.dump) return;
+    // --dump-layers narrows rows_ to one, which no read of several calls can use; a dump file alone
+    // turns the dumps on and leaves the read its rows, so a call-at-a-time read and a layer-at-a-time
+    // one can be compared where they differ
+    if (!dumping()) return;
+    // a dump of one stage alone: the whole set is 28 GB of a 2,048-token read
+    static const char* only = std::getenv("STRATA_DUMP_ONLY");
+    if (only && std::strcmp(only, name) != 0) return;
     std::vector<float> h((size_t) n);
     ck(cudaStreamSynchronize(cs(st_)), "dump");
     ck(cudaMemcpy(h.data(), dev, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost), "dump");
@@ -4897,7 +4903,7 @@ void Engine::run(const int32_t* tokens, int n) {
     // What a launch needs of the position it reads at at_; an attention over the rows so far is recorded again
     // when the rows outgrow what it was sized for (head_key()).  A prompt's few tokens are not a window: they
     // leave no snapshots of the recurrent state, so their launches are others.
-    bool replay = opt_.graphs && n <= opt_.window && (windowed_ || block_pass_ || n == 1) && !opt_.dump;
+    bool replay = opt_.graphs && n <= opt_.window && (windowed_ || block_pass_ || n == 1) && !dumping();
     for (int t = 0; t < n && replay; ++t) replay = !image_at(pos_ + t);
     const auto replayed = [&](std::vector<void*>& made, size_t key, auto&& work) {
         if (made.size() <= key) made.resize(key + 1, nullptr);
@@ -5145,7 +5151,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
     copy2(h_at_, at_, R * 2 * (int) (sizeof(long long) / 4), nullptr, nullptr, 0, st_);
 
     const size_t wn = (size_t) opt_.window, recs = 3 * wn + (size_t) opt_.batch + 1, rec = (size_t) R - 1;
-    const bool replay = opt_.graphs && !opt_.dump;
+    const bool replay = opt_.graphs && !dumping();
     const auto replayed = [&](std::vector<void*>& made, size_t key, auto&& work) {
         if (made.size() <= key) made.resize(key + 1, nullptr);
         if (!made[key]) made[key] = record(work);
@@ -5446,7 +5452,7 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
     }
     // The model's output: the last token's for the logits, and every token's for the draft block.
     if (want_logits || draft_) {
-        const bool replay = opt_.graphs && n == 1 && want_logits && !opt_.dump;
+        const bool replay = opt_.graphs && n == 1 && want_logits && !dumping();
         const int m = draft_ ? n : 1;
         float* h = draft_ ? hn_ + n_embd_ : xn_;
         const auto tail = [&] {

@@ -32,7 +32,10 @@ protected:
     int step_phys(int s) const override { return steps_[(size_t) s].phys; }
     int next_moe(int il) const override;
     bool halves_ok() const override { return false; }          // until Phase 3
-    bool read_layer_major() const override { return false; }    // until per-visit state can move to host memory
+    /// Not yet: a layer-major read runs every layer over every call, and the depth attention's bank and the
+    /// pass before's output cross a call's layers, so they would have to be staged per call.  The staging
+    /// diverges at blk 6 (see branch inkling2-layer-major-wip), so this stays a call at a time.
+    bool read_layer_major() const override { return false; }
     bool state_whole() const override { return true; }           // a layer's index does not name its visit's state
     size_t recurrent_floats() const override;
     void alloc_caches() override;
@@ -133,10 +136,12 @@ private:
     Dev tok_norm_, out_res_query_;
 
     /// The block inputs of the pass under way, and of the pass before it (its core blocks after the first,
-    /// and its output).
+    /// and its output).  The prelude's output is kept beside them: every pass after the first starts from it,
+    /// not from the pass before's output (docs/models/reference/inkling2-loop.cpp: `cur = prelude`).
     float* bank_ = nullptr;
     float* prev_bank_ = nullptr;
     float* prev_out_ = nullptr;
+    float* pass_in_ = nullptr;
     int n_bank_ = 0, n_prev_bank_ = 0;
     int max_states_ = 0;
     /// The place each visit's windowed rows take in the extra state: 0 for a full-context visit.
@@ -168,6 +173,14 @@ private:
     float* msg_ = nullptr;    ///< the looped core's four messages, 4 * n_embd a token
     float* ctrl_ = nullptr;   ///< the controllers' scratch, gate_rank_ + 2 * n_embd a token
     float* states_ = nullptr;  ///< the depth attention's stacked states, max_states_ * n_embd a token
+    /// Flash-decoding's split of one row's keys, for a full-context layer at kSplitMin or beyond: the splits'
+    /// unnormalized value sums (kAttnSplits * n_head * head_dim) and their (largest logit, denominator) pairs.
+    float* split_out_ = nullptr;
+    float* split_ml_ = nullptr;
+    /// Splits a decoding step's keys into, when the one-block kernel's n_head blocks would leave the card idle.
+    static constexpr int kAttnSplits = 16;
+    /// The position a split starts at: below it the key range is too short for the reduce to pay for itself.
+    static constexpr int kAttnSplitMin = 2048;
 };
 
 }  // namespace strata::poly

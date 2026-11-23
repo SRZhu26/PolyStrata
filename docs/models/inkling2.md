@@ -91,11 +91,12 @@ same GGUF.
 
 - `tools/ref_prelude.py` — validated per-stage oracle, used by `tools/dump_cos.py`.
 - `tools/ref_core.py` — the full model: all 74 stages plus logits run end to end.
-- **Kernel parity:** `poly_inkling2_test` compares the kernels against the FP64 reference of the same graph; its 17
-  checks pass.
-- **End-to-end cosine gate:** **not yet computed.** The `STRATA_DUMP_BIN` + `tools/dump_cos.py` comparison of
-  `blk.6`, `blk.23` and the final logits against `ref_core.py` has not been run, so no per-stage cosine figure exists
-  for the assembled model. Kernel-level parity is not a substitute for it.
+- **Kernel parity:** `poly_inkling2_test` compares the kernels against the FP64 reference of the same graph; its 19
+  checks pass, including the split-K flash-decoding paths (`attend split` 3.3e-07 of 0.449, `attend q8 spl` 2.1e-07 of 0.423).
+- **End-to-end cosine gate:** **passes.** The `STRATA_DUMP_BIN` + `tools/dump_cos.py` comparison against `ref_core.py` on
+  `UD-Q4_K_XL` reads `blk.6` 0.999988758, `blk.23` 0.999988499 and the logits 0.999763105, against a 0.999 gate; all 24
+  layers are at or above 0.99997 (`blk.0` 0.999978682 … `blk.16` 0.999971239). `UD-Q4_K_XL` holds no `Q4_K` tensors
+  (`Q8_0` 154, `F32` 518, `BF16` 32, `NVFP4` 40), so the gate never needed the NVFP4 source checkpoint.
 
 ## Measured results (RTX 5060 Laptop, `UD-Q4_K_XL` 17.6 GB, FP16 KV, streaming experts)
 

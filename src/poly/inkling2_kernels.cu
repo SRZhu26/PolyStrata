@@ -485,6 +485,259 @@ __global__ void ink_attend_rel_q8_kernel(const float* __restrict__ q, const int8
     }
 }
 
+// Flash-decoding's split of one row's keys across blocks.  Decoding launches one block a head, which is
+// 24 blocks for this model: a fraction of the card's SMs, each scanning the whole key range serially.  A
+// full-context layer at 128K has 131,072 keys, so most of the card sits idle while each head walks them.
+//
+// Block (h, sp) scans keys [j_begin, j_end] of head h and leaves its unnormalized value sum in `part_out`
+// and its (largest logit, denominator) in `part_ml`.  Only the first split carries the sink, whose logit is
+// zero and whose weight is one; the others start at -inf and zero, so a split that saw no key is dropped by
+// the reduce's rescale rather than adding a phantom sink to every head.
+__global__ void ink_attend_rel_split_kernel(const float* __restrict__ q, const half* __restrict__ kc,
+                                           const half* __restrict__ vc, const float* __restrict__ kqb,
+                                           const float* __restrict__ tau, long long pos, int splits,
+                                           float* __restrict__ part_out, float* __restrict__ part_ml, int dim,
+                                           int n_head, int kv_heads, float scale, int n_keys, int ring) {
+    __shared__ float qs[INK_THREADS];
+    __shared__ float sc[INK_ATTEND_TILE];
+    __shared__ float wt[INK_ATTEND_TILE];
+    __shared__ float corr_s;
+    const int h = blockIdx.x, sp = blockIdx.y;
+    const int per = n_head / kv_heads;
+    const int hkv = h / per;
+    const size_t krow = (size_t) kv_heads * dim;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nwarps = int(blockDim.x) >> 5;
+    float* acc = part_out + ((size_t) sp * n_head + h) * dim;
+
+    // this split's keys: the [0, pos] range cut into `splits` chunks, and empty past the end
+    const int last = int(pos);
+    const int chunk = (last + 1 + splits - 1) / splits;
+    const int j_begin = sp * chunk;
+    const int j_end = (sp + 1) * chunk - 1 < last ? (sp + 1) * chunk - 1 : last;
+
+    for (int e = threadIdx.x; e < dim; e += blockDim.x) {
+        qs[e] = q[(size_t) h * dim + e];
+        acc[e] = 0.0f;
+    }
+    float m = sp == 0 ? 0.0f : -INFINITY;   // the sink's logit, in the first split only
+    float sum = sp == 0 ? 1.0f : 0.0f;     // the sink's weight, in the first split only
+    if (j_begin > j_end) {
+        if (threadIdx.x == 0) {
+            part_ml[((size_t) sp * n_head + h) * 2] = m;
+            part_ml[((size_t) sp * n_head + h) * 2 + 1] = sum;
+        }
+        return;
+    }
+    __syncthreads();
+
+    auto crow = [&](int j) { return (size_t) (ring > 0 ? j % ring : j); };
+    auto bias_of = [&](int j) {
+        const int d = int(pos) - j;
+        return kqb[(size_t) h * n_keys + (size_t) (d < n_keys ? d : n_keys - 1)];
+    };
+
+    float accv = 0.0f;
+    for (int j0 = j_begin; j0 <= j_end; j0 += INK_ATTEND_TILE) {
+        const int jn = j_end + 1 - j0 < INK_ATTEND_TILE ? j_end + 1 - j0 : INK_ATTEND_TILE;
+
+        for (int e = warp; e < jn; e += nwarps) {
+            const int k = e, j = j0 + k;
+            const half* kr = kc + crow(j) * krow + (size_t) hkv * dim;
+            float s = 0.0f;
+            for (int d = lane; d < dim; d += 32) s += qs[d] * __half2float(kr[d]);
+            s = ink_warp_sum(s);
+            if (lane == 0) sc[k] = s * scale * (tau ? tau[0] : 1.0f) + bias_of(j);
+        }
+        __syncthreads();
+
+        // one row, so its largest logit and its weights are warp 0's; the others wait at the barrier
+        if (warp == 0) {
+            float tm = -INFINITY;
+            for (int i = lane; i < jn; i += 32) tm = fmaxf(tm, sc[i]);
+            tm = ink_warp_max(tm);
+            const float mnew = fmaxf(m, tm);
+            // a split with no key yet takes the whole tile: expf(-inf - mnew) is zero anyway, but
+            // -inf - -inf would be a NaN, and this keeps the first tile of every split clean
+            const float corr = m == -INFINITY ? 0.0f : expf(m - mnew);
+            float ts = 0.0f;
+            for (int i = lane; i < jn; i += 32) {
+                const float w = expf(sc[i] - mnew);
+                wt[i] = w;
+                ts += w;
+            }
+            ts = ink_warp_sum(ts);
+            if (lane == 0) {
+                sum = sum * corr + ts;
+                corr_s = corr;
+            }
+            m = mnew;
+        }
+        __syncthreads();
+
+        if (threadIdx.x < dim) {
+            accv *= corr_s;
+            for (int i = 0; i < jn; ++i) {
+                const half* vr = vc + crow(j0 + i) * krow + (size_t) hkv * dim;
+                accv += wt[i] * __half2float(vr[threadIdx.x]);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x < dim) acc[threadIdx.x] = accv;
+    if (threadIdx.x == 0) {
+        part_ml[((size_t) sp * n_head + h) * 2] = m;
+        part_ml[((size_t) sp * n_head + h) * 2 + 1] = sum;
+    }
+}
+
+// The same split of one row's keys over Q8_0 K/V caches: the query's 32-element blocks are quantized
+// once, and the Q.K sweep is STRATA_DP4A's, as the one-block kernel's is.
+__global__ void ink_attend_rel_q8_split_kernel(const float* __restrict__ q, const int8_t* __restrict__ kc,
+                                              const half* __restrict__ ks, const int8_t* __restrict__ vc,
+                                              const half* __restrict__ vs, const float* __restrict__ kqb,
+                                              const float* __restrict__ tau, long long pos, int splits,
+                                              float* __restrict__ part_out, float* __restrict__ part_ml, int dim,
+                                              int n_head, int kv_heads, float scale, int n_keys, int ring) {
+    __shared__ int qq4[INK_THREADS / 4];
+    __shared__ float qscale[INK_THREADS / 32];
+    __shared__ float sc[INK_ATTEND_TILE];
+    __shared__ float wt[INK_ATTEND_TILE];
+    __shared__ float corr_s;
+    const int h = blockIdx.x, sp = blockIdx.y;
+    const int per = n_head / kv_heads;
+    const int hkv = h / per;
+    const int blocks_per_head = dim >> 5;
+    const size_t krow = (size_t) kv_heads * dim;
+    const size_t srow = (size_t) kv_heads * blocks_per_head;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int nwarps = int(blockDim.x) >> 5;
+    float* acc = part_out + ((size_t) sp * n_head + h) * dim;
+
+    const int last = int(pos);
+    const int chunk = (last + 1 + splits - 1) / splits;
+    const int j_begin = sp * chunk;
+    const int j_end = (sp + 1) * chunk - 1 < last ? (sp + 1) * chunk - 1 : last;
+
+    // one 32-element block a warp quantizes, as the one-block kernel does
+    if (warp < blocks_per_head) {
+        const int b = warp, d = (b << 5) + lane;
+        const float v = q[(size_t) h * dim + d];
+        const float amax = ink_warp_max(fabsf(v));
+        const float qsc = amax > 0.0f ? amax / 127.0f : 0.0f;
+        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        int qv = __float2int_rn(v * inv);
+        qv = qv > 127 ? 127 : (qv < -127 ? -127 : qv);
+        ((int8_t*) qq4)[d] = (int8_t) qv;
+        if (lane == 0) qscale[b] = qsc;
+    }
+    for (int e = threadIdx.x; e < dim; e += blockDim.x) acc[e] = 0.0f;
+    float m = sp == 0 ? 0.0f : -INFINITY;
+    float sum = sp == 0 ? 1.0f : 0.0f;
+    if (j_begin > j_end) {
+        if (threadIdx.x == 0) {
+            part_ml[((size_t) sp * n_head + h) * 2] = m;
+            part_ml[((size_t) sp * n_head + h) * 2 + 1] = sum;
+        }
+        return;
+    }
+    __syncthreads();
+
+    auto crow = [&](int j) { return (size_t) (ring > 0 ? j % ring : j); };
+    auto bias_of = [&](int j) {
+        const int d = int(pos) - j;
+        return kqb[(size_t) h * n_keys + (size_t) (d < n_keys ? d : n_keys - 1)];
+    };
+
+    const int words_per_head = dim >> 2;
+    float accv = 0.0f;
+    for (int j0 = j_begin; j0 <= j_end; j0 += INK_ATTEND_TILE) {
+        const int jn = j_end + 1 - j0 < INK_ATTEND_TILE ? j_end + 1 - j0 : INK_ATTEND_TILE;
+
+        for (int e = warp; e < jn; e += nwarps) {
+            const int k = e, j = j0 + k;
+            const size_t cr = crow(j);
+            const int* kr4 = (const int*) (kc + cr * krow + (size_t) hkv * dim);
+            const half* ksr = ks + cr * srow + (size_t) hkv * blocks_per_head;
+            float s = 0.0f;
+            for (int w = lane; w < words_per_head; w += 32) {
+                const int b = w >> 3;
+                const int dp = STRATA_DP4A(qq4[w], kr4[w], 0);
+                s += (float) dp * (qscale[b] * __half2float(ksr[b]));
+            }
+            s = ink_warp_sum(s);
+            if (lane == 0) sc[k] = s * scale * (tau ? tau[0] : 1.0f) + bias_of(j);
+        }
+        __syncthreads();
+
+        if (warp == 0) {
+            float tm = -INFINITY;
+            for (int i = lane; i < jn; i += 32) tm = fmaxf(tm, sc[i]);
+            tm = ink_warp_max(tm);
+            const float mnew = fmaxf(m, tm);
+            const float corr = m == -INFINITY ? 0.0f : expf(m - mnew);
+            float ts = 0.0f;
+            for (int i = lane; i < jn; i += 32) {
+                const float w = expf(sc[i] - mnew);
+                wt[i] = w;
+                ts += w;
+            }
+            ts = ink_warp_sum(ts);
+            if (lane == 0) {
+                sum = sum * corr + ts;
+                corr_s = corr;
+            }
+            m = mnew;
+        }
+        __syncthreads();
+
+        if (threadIdx.x < dim) {
+            const int b = threadIdx.x >> 5;
+            accv *= corr_s;
+            for (int i = 0; i < jn; ++i) {
+                const size_t cr = crow(j0 + i);
+                const int8_t* vr = vc + cr * krow + (size_t) hkv * dim;
+                const half* vsr = vs + cr * srow + (size_t) hkv * blocks_per_head;
+                accv += (wt[i] * __half2float(vsr[b])) * (float) vr[threadIdx.x];
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x < dim) acc[threadIdx.x] = accv;
+    if (threadIdx.x == 0) {
+        part_ml[((size_t) sp * n_head + h) * 2] = m;
+        part_ml[((size_t) sp * n_head + h) * 2 + 1] = sum;
+    }
+}
+
+// The reduce over a head's splits: the largest of their logits is the row's, and each split's value sum
+// and denominator are rescaled by their distance from it before they are added, so the result is the one the
+// unsplit kernel's online softmax reaches over the same keys.
+__global__ void ink_attend_split_reduce_kernel(const float* __restrict__ part_out,
+                                              const float* __restrict__ part_ml, float* __restrict__ out, int dim,
+                                              int n_head, int splits) {
+    const int h = blockIdx.x;
+    float mall = -INFINITY;
+    for (int sp = 0; sp < splits; ++sp) {
+        const float ms = part_ml[((size_t) sp * n_head + h) * 2];
+        if (ms > mall) mall = ms;
+    }
+    for (int d = threadIdx.x; d < dim; d += blockDim.x) {
+        float a = 0.0f, s = 0.0f;
+        for (int sp = 0; sp < splits; ++sp) {
+            const float ms = part_ml[((size_t) sp * n_head + h) * 2];
+            const float ss = part_ml[((size_t) sp * n_head + h) * 2 + 1];
+            if (ss == 0.0f) continue;   // a split that saw no key carries no value and no weight
+            const float w = expf(ms - mall);
+            a += w * part_out[((size_t) sp * n_head + h) * dim + d];
+            s += w * ss;
+        }
+        out[(size_t) h * dim + d] = a / s;
+    }
+}
+
 // The attention over the depth (`mix()`): states[n_states - 1] is `cur` and states[0..] the bank's blocks,
 // newest first, as the reference's concat leaves them; every state is RMS-normed without a gain first, and each
 // of the n_q learned queries mixes the normed ones.
@@ -712,6 +965,38 @@ void ink_attend_rel_q8(const float* q, const int8_t* kc, const uint16_t* ks, con
     if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
         throw std::runtime_error(std::string("ink_attend_rel_q8: ") + cudaGetErrorString(e));
 }
+
+void ink_attend_rel_split(const float* q, const uint16_t* kc, const uint16_t* vc, const float* kqb, const float* tau,
+                          int64_t pos, float* out, float* part_out, float* part_ml, int dim, int n_head, int kv_heads,
+                          float scale, int window, int n_keys, int ring, int splits, void* stream) {
+    if (dim <= 0 || dim > INK_THREADS) throw std::runtime_error("ink_attend_rel_split: the head dim must be 1 to 256");
+    if (splits <= 0) throw std::runtime_error("ink_attend_rel_split: splits must be positive");
+    ink_attend_rel_split_kernel<<<dim3((unsigned) n_head, (unsigned) splits), INK_THREADS, 0, cs(stream)>>>(
+        q, (const half*) kc, (const half*) vc, kqb, tau, pos, splits, part_out, part_ml, dim, n_head, kv_heads, scale,
+        n_keys, ring);
+    ink_attend_split_reduce_kernel<<<dim3((unsigned) n_head, 1u), 128, 0, cs(stream)>>>(part_out, part_ml, out, dim,
+                                                                                     n_head, splits);
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
+        throw std::runtime_error(std::string("ink_attend_rel_split: ") + cudaGetErrorString(e));
+}
+
+void ink_attend_rel_q8_split(const float* q, const int8_t* kc, const uint16_t* ks, const int8_t* vc,
+                             const uint16_t* vs, const float* kqb, const float* tau, int64_t pos, float* out,
+                             float* part_out, float* part_ml, int dim, int n_head, int kv_heads, float scale,
+                             int window, int n_keys, int ring, int splits, void* stream) {
+    if (dim <= 0 || dim > INK_THREADS || (dim % 32) != 0)
+        throw std::runtime_error("ink_attend_rel_q8_split: head dim must be a multiple of 32 in 32..256");
+    if (splits <= 0) throw std::runtime_error("ink_attend_rel_q8_split: splits must be positive");
+    ink_attend_rel_q8_split_kernel<<<dim3((unsigned) n_head, (unsigned) splits), INK_THREADS, 0, cs(stream)>>>(
+        q, kc, (const half*) ks, vc, (const half*) vs, kqb, tau, pos, splits, part_out, part_ml, dim, n_head, kv_heads,
+        scale, n_keys, ring);
+    ink_attend_split_reduce_kernel<<<dim3((unsigned) n_head, 1u), 128, 0, cs(stream)>>>(part_out, part_ml, out, dim,
+                                                                                     n_head, splits);
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
+        throw std::runtime_error(std::string("ink_attend_rel_q8_split: ") + cudaGetErrorString(e));
+}
+
+
 
 void ink_depth_mix(const float* states, const float* query, float* out, int n_embd, int n_states, int n_q,
                    int rows, void* stream) {

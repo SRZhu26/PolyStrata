@@ -463,6 +463,21 @@ void ink_attend_rel_q8(const float* q, const int8_t* kc, const uint16_t* ks, con
                        const float* kqb, const float* tau, int64_t pos, int rows, float* out, int dim, int n_head,
                        int kv_heads, float scale, int window, int n_keys, int ring, void* stream);
 
+/// Flash-decoding's split of one row's keys: only the [0, pos] range is cut, so this is the full-attention
+/// (window 0) case, one row, at `pos`.  The keys are cut into `splits` chunks and a block a (head, split) scans
+/// one, leaving its unnormalized value sum in `part_out` (splits * n_head * dim floats) and its largest logit and
+/// denominator in `part_ml` (splits * n_head * 2 floats); a reduce over the splits then writes `out`.  The sink
+/// belongs to the first split alone.  Same arguments as ink_attend_rel() otherwise.
+void ink_attend_rel_split(const float* q, const uint16_t* kc, const uint16_t* vc, const float* kqb, const float* tau,
+                           int64_t pos, float* out, float* part_out, float* part_ml, int dim, int n_head,
+                           int kv_heads, float scale, int window, int n_keys, int ring, int splits, void* stream);
+/// Same as ink_attend_rel_split(), over Q8_0 K/V caches.
+void ink_attend_rel_q8_split(const float* q, const int8_t* kc, const uint16_t* ks, const int8_t* vc,
+                             const uint16_t* vs, const float* kqb, const float* tau, int64_t pos, float* out,
+                             float* part_out, float* part_ml, int dim, int n_head, int kv_heads, float scale,
+                             int window, int n_keys, int ring, int splits, void* stream);
+
+
 /// The states the depth attention mixes, a token at a time: the bank's `n_bank` blocks newest first and then `cur`,
 /// which the reference's concat leaves last.  `bank` holds max_bank blocks of `bank_stride` floats each, and only the
 /// rows [first, first + rows) of them are read.  `out` is `n_bank + 1` states of n_embd a token.

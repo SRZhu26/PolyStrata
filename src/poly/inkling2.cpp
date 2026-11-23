@@ -382,6 +382,11 @@ void Inkling2::assign_scratch() {
     bank_ = fbuf((size_t) max_states_ * n_embd_ * n);
     prev_bank_ = fbuf((size_t) max_states_ * n_embd_ * n);
     prev_out_ = fbuf(n * n_embd_);
+    pass_in_ = fbuf(n * n_embd_);
+    // flash-decoding's splits of a decoding step's keys (see ink_attend_rel_split); the reduce is cheap
+    // enough that this is always resident rather than allocated on demand
+    split_out_ = fbuf((size_t) kAttnSplits * n_head_ * head_dim_);
+    split_ml_ = fbuf((size_t) kAttnSplits * n_head_ * 2);
 
     // Each windowed visit's rows sit after the recurrent state, in the order the visits come.
     step_extra_at_.assign(steps_.size(), 0);
@@ -583,6 +588,7 @@ void Inkling2::pass_messages(int il, int n) {
     const Loop& lp = loops_[(size_t) (il - core_start_)];
     ink_bank_states(prev_bank_, prev_out_, states_, n_embd_, n_prev_bank_, rows_ * n_embd_, 0, n, st_);
     ink_depth_mix(states_, fp(lp.msg_query), msg_, n_embd_, n_prev_bank_ + 1, kCtrl, n, st_);
+    dbg("msg", il, msg_, n * n_embd_ * kCtrl);
 }
 
 // A visit's K or V into its cache: a full-context one at the position, a windowed one at its place in the ring.
@@ -643,6 +649,8 @@ void Inkling2::attn(Block& B, int il, int n) {
     rms_norm(v_, nullptr, vn_, hd, n * nkv, rms_eps_, st_);
     ink_clip_l2(rraw_, fp(B.rel_clip), d_rel_, nh, n, rel_clip_, st_);
     dbg("q_clip", il, qraw_, n * nh * hd);
+    dbg("kraw", il, kraw_, n * nkv * hd);
+    dbg("vraw", il, vraw_, n * nkv * hd);
     dbg("k_conv", il, k_, n * nkv * hd);
     dbg("vn", il, vn_, n * nkv * hd);
     dbg("r_clip", il, rraw_, n * nh * d_rel_);
@@ -669,13 +677,28 @@ void Inkling2::attn(Block& B, int il, int n) {
             std::snprintf(nm, sizeof nm, "kqb_h%d", h);
             dbg(nm, il, kqb_ + (size_t) h * B.bias_keys, 3);
         }
+    // A decoding step over a full-context layer's long key range: the one-block kernel launches a block a
+    // head, 24 blocks, and each walks the whole range serially, so the keys are split across kAttnSplits
+    // more and the reduce folds the splits back (flash decoding).  Below kAttnSplitMin the range is short
+    // enough that the extra launches and the reduce cost more than the idle blocks do.
+    const bool split = n == 1 && !B.swa && pos_ >= kAttnSplitMin;
+    const float ascale = 1.f / std::sqrt((float) hd);
     if (opt_.kv_format == KvFmt::kQ8_0) {
-        ink_attend_rel_q8(qraw_, step_k_codes_[(size_t) s], step_k_scales_[(size_t) s], step_v_codes_[(size_t) s],
-                          step_v_scales_[(size_t) s], kqb_, tau, pos_, n, att_, hd, nh, nkv,
-                          1.f / std::sqrt((float) hd), B.swa ? window_ : 0, B.bias_keys, B.swa ? ring_ : 0, st_);
+        if (split)
+            ink_attend_rel_q8_split(qraw_, step_k_codes_[(size_t) s], step_k_scales_[(size_t) s],
+                                     step_v_codes_[(size_t) s], step_v_scales_[(size_t) s], kqb_, tau, pos_, att_,
+                                     split_out_, split_ml_, hd, nh, nkv, ascale, 0, B.bias_keys, 0, kAttnSplits, st_);
+        else
+            ink_attend_rel_q8(qraw_, step_k_codes_[(size_t) s], step_k_scales_[(size_t) s],
+                              step_v_codes_[(size_t) s], step_v_scales_[(size_t) s], kqb_, tau, pos_, n, att_, hd, nh,
+                              nkv, ascale, B.swa ? window_ : 0, B.bias_keys, B.swa ? ring_ : 0, st_);
     } else {
-        ink_attend_rel(qraw_, step_keys_[(size_t) s], step_vals_[(size_t) s], kqb_, tau, pos_, n, att_, hd, nh, nkv,
-                       1.f / std::sqrt((float) hd), B.swa ? window_ : 0, B.bias_keys, B.swa ? ring_ : 0, st_);
+        if (split)
+            ink_attend_rel_split(qraw_, step_keys_[(size_t) s], step_vals_[(size_t) s], kqb_, tau, pos_, att_, split_out_,
+                                  split_ml_, hd, nh, nkv, ascale, 0, B.bias_keys, 0, kAttnSplits, st_);
+        else
+            ink_attend_rel(qraw_, step_keys_[(size_t) s], step_vals_[(size_t) s], kqb_, tau, pos_, n, att_, hd, nh, nkv,
+                            ascale, B.swa ? window_ : 0, B.bias_keys, B.swa ? ring_ : 0, st_);
     }
     dbg("att_raw", il, att_, n * nh * hd);
     if (cur_step_ == 0 && il == 0)
@@ -714,7 +737,13 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     // every pass starts from the prelude's output, and each of its core layers reads the pass before's
     // blocks through its own message query
     if (st.pass > 0 && il >= core_start_ && il < core_end_) {
-        if (il == core_start_) n_bank_ = n_prelude_blocks_;
+        if (il == core_start_) {
+            n_bank_ = n_prelude_blocks_;
+            // Every pass after the first starts from the prelude's output, not from the pass before's:
+            // docs/models/reference/inkling2-loop.cpp sets `cur = prelude` and `blocks = prelude_blocks`.
+            ck(cudaMemcpyAsync(r_, pass_in_, (size_t) n * n_embd_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
+               "pass");
+        }
         pass_messages(il, n);
     }
 
@@ -752,6 +781,8 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
                   rms_eps_, st_);
     }
     dbg("attn_in", il, xin_, n * n_embd_);
+    dbg("attn_in1", il, xin_ + (size_t) n * n_embd_, n * n_embd_);
+    dbg("attn_in2", il, xin_ + (size_t) 2 * n * n_embd_, n * n_embd_);
 
     attn(B, il, n);
     dbg("attn", il, ao_, n * n_embd_);
@@ -788,6 +819,11 @@ void Inkling2::layer_tail(Layer& L, int il, int n) {
               sconv_len_, 1, st_);
     axpy(conv_, 1.f, r_, n * n_embd_, true, st_);
     dbg("l_out", il, r_, n * n_embd_);
+
+    // the last prelude layer's output: every pass after the first starts from it
+    if (st.phys == core_start_ - 1)
+        ck(cudaMemcpyAsync(pass_in_, r_, (size_t) n * n_embd_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
+           "pass");
 
     // the last core layer of a pass: the next pass's messages read this one's blocks and output
     if (st.pass < loop_count_ - 1 && st.phys == core_end_ - 1) {
@@ -850,6 +886,9 @@ void Inkling2::moe_shared(const Layer&, int, int n) {
 // The final softcap, and the padded vocabulary the reference drops.
 void Inkling2::finish_logits(float* logits, int rows) {
     ink_finish_logits(logits, n_vocab_, n_vocab_unpadded_, final_softcap_, rows, st_);
+    // --dump-layers: the logits themselves, past the pad, for the cosine gate's third point.  Only the
+    // one row a dump runs has them here; the kernel leaves the pad untouched, so n is the unpadded size.
+    if (rows == 1) dbg("logits", n_layer_, logits, n_vocab_unpadded_);
 }
 
 }  // namespace strata::poly

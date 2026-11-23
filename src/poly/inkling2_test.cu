@@ -184,6 +184,171 @@ void check_rel_table() {
     cudaFree((void*) db), cudaFree((void*) dr), cudaFree((void*) dk), cudaFree((void*) dt), cudaFree(dq);
 }
 
+// Flash-decoding's split of one row's keys against the same FP64 reference, at a position long enough
+// that decoding takes the split path: the reduce over the splits must reach the online softmax's result.
+void check_attend_split() {
+    std::mt19937 rng(23);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    const int nh = kHead, hd = kDim, nkv = kKv, chan = nkv * hd;
+    const long long pos = 4096;
+    const int n_keys = int(pos) + 1, splits = 8;
+    std::vector<float> q(size_t(nh) * hd), kqb(size_t(nh) * n_keys), tau(1);
+    for (float& v : q) v = 2.f * nd(rng);
+    for (float& v : kqb) v = 0.3f * nd(rng);
+    tau[0] = 1.f + 0.1f * std::fabs(nd(rng));
+    std::vector<float> k(size_t(pos + 1) * chan), v(size_t(pos + 1) * chan);
+    for (float& x : k) x = nd(rng);
+    for (float& x : v) x = nd(rng);
+    const std::vector<uint16_t> kh = halves(k), vh = halves(v);
+    for (size_t i = 0; i < k.size(); ++i) {
+        k[i] = __half2float(__ushort_as_half(kh[i]));
+        v[i] = __half2float(__ushort_as_half(vh[i]));
+    }
+    const float scale = 1.f / std::sqrt((float) hd);
+    // one row, every key, the sink's zero logit folded into the denominator
+    std::vector<float> want(size_t(nh) * hd);
+    for (int h = 0; h < nh; ++h) {
+        const int hkv = h / (nh / nkv);
+        std::vector<double> logit;
+        for (long long j = 0; j <= pos; ++j) {
+            double s = 0;
+            for (int e = 0; e < hd; ++e)
+                s += (double) q[(size_t) h * hd + e] * k[size_t(j) * chan + size_t(hkv) * hd + e];
+            const long long d = pos - j;
+            logit.push_back(s * scale * tau[0] + kqb[(size_t) h * n_keys + size_t(d < n_keys ? d : n_keys - 1)]);
+        }
+        double best = 0.0;   // the sink's own logit is zero
+        for (double s : logit) best = std::max(best, s);
+        double sum = std::exp(-best);
+        for (double s : logit) sum += std::exp(s - best);
+        for (int e = 0; e < hd; ++e) {
+            double acc = 0;
+            for (size_t j = 0; j < logit.size(); ++j)
+                acc += std::exp(logit[j] - best) / sum * v[j * chan + size_t(hkv) * hd + e];
+            want[(size_t) h * hd + e] = (float) acc;
+        }
+    }
+    const float* dq = upload(q);
+    const uint16_t* dk = upload(kh);
+    const uint16_t* dv = upload(vh);
+    const float* db = upload(kqb);
+    const float* dt = upload(tau);
+    float* do_ = nullptr, *part_out = nullptr, *part_ml = nullptr;
+    cudaMalloc(&do_, want.size() * sizeof(float));
+    cudaMalloc(&part_out, size_t(splits) * nh * hd * sizeof(float));
+    cudaMalloc(&part_ml, size_t(splits) * nh * 2 * sizeof(float));
+    ink_attend_rel_split(dq, dk, dv, db, dt, pos, do_, part_out, part_ml, hd, nh, nkv, scale, 0, n_keys, 0, splits,
+                          nullptr);
+    report("attend split", download(do_, want.size()), want);
+    cudaFree((void*) dq), cudaFree((void*) dk), cudaFree((void*) dv), cudaFree((void*) db), cudaFree((void*) dt),
+        cudaFree(do_), cudaFree(part_out), cudaFree(part_ml);
+}
+
+// ggml's Q8_0: a 32-element block keeps a half delta and 32 int8 codes, code = round(x / delta).
+void q8_quantize(const float* x, int n, int8_t* codes, uint16_t* deltas) {
+    for (int b = 0; b < n / 32; ++b) {
+        float amax = 0.f;
+        for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[b * 32 + i]));
+        const float inv = amax > 0.f ? 127.f / amax : 0.f;
+        for (int i = 0; i < 32; ++i) {
+            int q = (int) lrintf(x[b * 32 + i] * inv);
+            q = q > 127 ? 127 : (q < -127 ? -127 : q);
+            codes[b * 32 + i] = (int8_t) q;
+        }
+        deltas[b] = __half_as_ushort(__float2half(amax / 127.f));
+    }
+}
+
+// The same split over a Q8_0 cache: the block quantizes the query to int8 and dot-products it with the
+// keys' codes, so the reference reproduces that integer sum exactly and only the softmax and the reduce can
+// differ.  `--kv q8_0` is what the benchmarks run, so this is the path they exercise.
+void check_attend_q8_split() {
+    std::mt19937 rng(29);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    const int nh = kHead, hd = kDim, nkv = kKv, chan = nkv * hd, nblk = hd / 32;
+    const long long pos = 4096;
+    const int n_keys = int(pos) + 1, splits = 8, nrow = int(pos) + 1;
+    std::vector<float> q(size_t(nh) * hd), kqb(size_t(nh) * n_keys), tau(1);
+    for (float& v : q) v = 2.f * nd(rng);
+    for (float& v : kqb) v = 0.3f * nd(rng);
+    tau[0] = 1.f + 0.1f * std::fabs(nd(rng));
+    std::vector<float> k(size_t(nrow) * chan), v(size_t(nrow) * chan);
+    for (float& x : k) x = nd(rng);
+    for (float& x : v) x = nd(rng);
+    // the cache's own layout: a row of `chan` int8 codes and `nkv * nblk` deltas
+    std::vector<int8_t> kc(k.size()), vc(v.size());
+    std::vector<uint16_t> ks(size_t(nrow) * nkv * nblk), vs(size_t(nrow) * nkv * nblk);
+    for (int j = 0; j < nrow; ++j) {
+        q8_quantize(&k[size_t(j) * chan], chan, &kc[size_t(j) * chan], &ks[size_t(j) * nkv * nblk]);
+        q8_quantize(&v[size_t(j) * chan], chan, &vc[size_t(j) * chan], &vs[size_t(j) * nkv * nblk]);
+    }
+    // the query's int8 blocks, one a head, and their scales: the block keeps this one in fp32, not a half
+    std::vector<int8_t> qc(q.size());
+    std::vector<float> qsc(size_t(nh) * nblk);
+    for (int h = 0; h < nh; ++h)
+        for (int b = 0; b < nblk; ++b) {
+            float amax = 0.f;
+            for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(q[size_t(h) * hd + b * 32 + i]));
+            const float inv = amax > 0.f ? 127.f / amax : 0.f;
+            qsc[size_t(h) * nblk + b] = amax > 0.f ? amax / 127.f : 0.f;
+            for (int i = 0; i < 32; ++i) {
+                int qv = (int) lrintf(q[size_t(h) * hd + b * 32 + i] * inv);
+                qv = qv > 127 ? 127 : (qv < -127 ? -127 : qv);
+                qc[size_t(h) * hd + b * 32 + i] = (int8_t) qv;
+            }
+        }
+    const float scale = 1.f / std::sqrt((float) hd);
+    std::vector<float> want(size_t(nh) * hd);
+    for (int h = 0; h < nh; ++h) {
+        const int hkv = h / (nh / nkv);
+        std::vector<double> logit;
+        for (long long j = 0; j <= pos; ++j) {
+            double s = 0;
+            for (int b = 0; b < nblk; ++b) {
+                int dp = 0;
+                for (int i = 0; i < 32; ++i)
+                    dp += (int) qc[(size_t(h) * hd) + b * 32 + i] * (int) kc[size_t(j) * chan + size_t(hkv) * hd + b * 32 + i];
+                s += (double) dp * ((double) qsc[size_t(h) * nblk + b] *
+                                    (double) __half2float(__ushort_as_half(ks[(size_t(j) * nkv + hkv) * nblk + b])));
+            }
+            const long long d = pos - j;
+            logit.push_back(s * scale * tau[0] + kqb[(size_t) h * n_keys + size_t(d < n_keys ? d : n_keys - 1)]);
+        }
+        double best = 0.0;   // the sink's own logit is zero
+        for (double s : logit) best = std::max(best, s);
+        double sum = std::exp(-best);
+        for (double s : logit) sum += std::exp(s - best);
+        for (int e = 0; e < hd; ++e) {
+            double acc = 0;
+            for (size_t j = 0; j < logit.size(); ++j) {
+                const size_t at = j * chan + size_t(hkv) * hd + e;
+                const int b = e >> 5;
+                const double dv = (double) vc[at] *
+                                  (double) __half2float(__ushort_as_half(vs[(j * nkv + size_t(hkv)) * nblk + b]));
+                acc += std::exp(logit[j] - best) / sum * dv;
+            }
+            want[(size_t) h * hd + e] = (float) acc;
+        }
+    }
+    const float* dq = upload(q);
+    const int8_t* dkc = upload(kc);
+    const uint16_t* dks = upload(ks);
+    const int8_t* dvc = upload(vc);
+    const uint16_t* dvs = upload(vs);
+    const float* db = upload(kqb);
+    const float* dt = upload(tau);
+    float* do_ = nullptr, *part_out = nullptr, *part_ml = nullptr;
+    cudaMalloc(&do_, want.size() * sizeof(float));
+    cudaMalloc(&part_out, size_t(splits) * nh * hd * sizeof(float));
+    cudaMalloc(&part_ml, size_t(splits) * nh * 2 * sizeof(float));
+    ink_attend_rel_q8_split(dq, dkc, dks, dvc, dvs, db, dt, pos, do_, part_out, part_ml, hd, nh, nkv, scale, 0, n_keys,
+                            0, splits, nullptr);
+    report("attend q8 spl", download(do_, want.size()), want);
+    cudaFree((void*) dq), cudaFree((void*) dkc), cudaFree((void*) dks), cudaFree((void*) dvc), cudaFree((void*) dvs),
+        cudaFree((void*) db), cudaFree((void*) dt), cudaFree(do_), cudaFree(part_out), cudaFree(part_ml);
+}
+
+
 // The attention the bias feeds, over a full cache and over a window layer's ring
 void check_attend(bool ring) {
     std::mt19937 rng(19);
@@ -470,6 +635,8 @@ int main() {
     check_rel_table();
     check_attend(false);
     check_attend(true);
+    check_attend_split();
+    check_attend_q8_split();
     check_depth_mix(kStates, 1);
     check_depth_mix(kStates, 3);
     check_bank_states();

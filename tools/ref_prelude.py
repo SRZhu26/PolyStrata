@@ -50,7 +50,7 @@ def conv_dyn(x, state, w, dyn=None):
     ext = np.concatenate([state, x], axis=0)          # [k - 1 + n_tok, ch]
     out = np.empty_like(x)
     scale = 1.0 / np.sqrt((2.0 if dyn is not None else 1.0) * K + 1.0)
-    per = ch // (dyn.shape[0] // K) if dyn is not None else 0
+    per = ch // dyn.shape[0] if dyn is not None else 0
     for t in range(x.shape[0]):
         for c in range(ch):
             acc = 0.0
@@ -92,8 +92,8 @@ def run_layer(g, il, cur, blocks, W, V, pos=0):
     Rraw = W(p + "attn_rel.weight") @ inputs[0]
 
     zero = np.zeros((K - 1, N_KV * HEAD_DIM))
-    kdyn = None if swa else (W(p + "attn_k_conv_proj.weight") @ inputs[1]).reshape(K, N_KV)
-    vdyn = None if swa else (W(p + "attn_v_conv_proj.weight") @ inputs[2]).reshape(K, N_KV)
+    kdyn = None if swa else (W(p + "attn_k_conv_proj.weight") @ inputs[1]).reshape(N_KV, K)
+    vdyn = None if swa else (W(p + "attn_v_conv_proj.weight") @ inputs[2]).reshape(N_KV, K)
     k = conv_dyn(Kraw.reshape(1, -1), zero, W(p + "attn_k_conv.weight"), kdyn)[0]
     v = conv_dyn(Vraw.reshape(1, -1), zero, W(p + "attn_v_conv.weight"), vdyn)[0]
 
