@@ -934,8 +934,9 @@ Recovered from `ggml-org/llama.cpp` master `src/models/dspark.cpp`, `common/spec
 **one non-causal pass** (`dflash.attention.causal = False`), then the verifier checks up to `n_max` of them:
 - slot 0 is the anchor (the last committed token, `dp.id_last`); slots 1..7 are `mask_token_id` (0);
 - `dflash.sample_from_anchor = False` here, so slot 0 is a bonus token and **7** tokens are drafted (`i_draft_beg = 1`);
-- `dflash.has_confidence_head = False`, so there is no `p_min` truncation; `dflash.has_markov_context` is **absent**,
-  which selects `nextn_masked = true` and the simple `n_block_tokens = n_draft + 1` path;
+- `dflash.has_confidence_head = False`, so there is no `p_min` truncation. `dflash.has_markov_context` is **absent** in the
+  `Q8_0` file (which selects `nextn_masked = true` and the simple `n_block_tokens = n_draft + 1` path) but **`True`**
+  in the mainline BF16 one — see the variant table below;
 - per position the graph is fed an **injected state vector of width `n_embd` (2304)**, not a token embedding:
   slot 0 gets the target's hidden state for the committed token, the others get `mask_embd` (greedy) or
   `[u, 1/temp, 0…]` (probabilistic). There is **no `token_embd` table** in this GGUF at all — confirmed: 54 tensors,
@@ -973,24 +974,54 @@ for i in 1..7:
 ```
 `markov_w1` in the GGUF is already **folded**: `conversion/inkling2.py::_fold_markov_chunk` computes
 `unembed[rows] @ dspark_hidden_out.weight`, so `markov_w1 [256, 201024]` is `(unembed ∘ hidden_out)` and needs no
-separate 2304-wide head. `markov_w2` is `[256, n_vocab_draft]` in llama.cpp but this GGUF has only
-`dspark_hidden_out` + `dspark_norm`, so the `w2` bias term is the unfolded path here.
+separate 2304-wide head. `markov_w2` is `[256, n_vocab_draft]` in llama.cpp; the `Q8_0` file has only
+`dspark_hidden_out` + `dspark_norm` and no `w2` at all, while the mainline BF16 one does carry
+`markov_w2 [256, 200058]` and its `[200058]` bias, so the two files implement different Markov heads.
 
-**The `joint_proj` width, resolved from the file's own tensor list.** llama.cpp declares
-`dspark_joint_proj = {n_embd + 2*rank, 3*rank}` = `[2816, 768]`, and its `joint` is
-`concat(concat(state, w1_prev), hidden)` = `256 + 256 + 2304`. This drafter's is **`[5120, 768]`**, and
-`5120 = 2304 + 2304 + 512 = 2·n_embd + 2·rank`. So the Inkling 2 variant conditions the joint projection on
-**two** 2304-wide vectors plus the 512-wide Markov state, which the DSV4/Mistral code does not do. The output is
-`768 = 3·rank` = (gate 256, cand 256, Markov-in 256), exactly as llama.cpp's `build_dspark_markov_head` splits it.
+**`joint_proj` is `[hidden | ctx | state]`, and both published drafters agree on it.** llama.cpp declares
+`dspark_joint_proj = {n_embd + 2*rank, 3*rank}` = `[2816, 768]`, with `joint = concat(concat(state, w1_prev), hidden)` =
+`256 + 256 + 2304`: one hidden vector, no target context. Both of this repo's drafters have **`[5120, 768]`**, and
+`5120 = 2304 + 2304 + 512 = 2·n_embd + 2·rank`. So the joint vector is `[hidden (2304) | ctx (2304) | state (512)]`,
+and the output `768 = 3·rank` splits into (gate 256, cand 256, Markov-in 256) exactly as
+`build_dspark_markov_head` does. The second 2304 is the **fused context of the four tapped target layers**
+(`target_layers = [5, 23, 41, 48]`) — the `dspark_fuse` / `ctx_mix` tensors below name it, which settles what the
+earlier note could only infer from arithmetic.
 
-The full inventory (54 tensors, 402,278,560 B, `dflash` arch, `Q8_0` blocks + `F32` norms + `BF16` linears) is what
-resolves it — this drafter is **not** the variant `src/models/dspark.cpp` implements, and it carries five tensors that file
-neither loads nor names:
+**Two published drafters, and they are not the same variant.** Both are on disk and both were checked tensor by tensor;
+the `dspark/` folder's own README says it ships `Q8_0` at the repo root and `BF16` in `dspark/`, and the
+`-mainline` file is a third, structurally newer conversion:
+
+| | `dspark-Inkling-2-Mini-Q8_0.gguf` (root) | `dspark-Inkling-2-Mini-BF16-mainline.gguf` (`dspark/`) |
+| --- | --- | --- |
+| size / tensors | 402,278,560 B, **54** | 749,371,936 B, **58** |
+| `has_markov_context` | absent | **`True`** |
+| fused context | `dspark_fuse [4,4]` once, `blk.N.dflare_norm` per block | `blk.N.ctx_mix [4]` + `blk.N.ctx_norm [2304]` per block |
+| Markov chain | `dspark_hidden_out` + `dspark_norm`, no `w2` | `markov_ctx_mix [4]` + `markov_ctx_norm`, plus `markov_w2 [256, 200058]` + bias |
+| mask slots | `mask_embd [2304]`, one shared vector | `mask_embd [2304, 7]`, **one per drafted position** |
+| embedding | borrowed, no norm | borrowed, plus `token_embd_norm [2304]` |
+| vocab | 201,024 (padded) | **200,058** (unpadded) |
+| sliding window | 1,024 | 1,025 |
+
+So the `Q8_0` file is the older variant (`dspark_fuse` + `dflare_norm`, one mask vector, one-layer Markov
+input) and the mainline BF16 one is the newer (`ctx_mix`/`ctx_norm` per block, a real two-layer Markov head with
+`markov_w2` and its vocab bias, seven per-position masks). Upstream `src/models/dspark.cpp` matches **neither**: it
+implements the `has_markov_context` branch, but its `joint_proj` is `[2816, 768]` — `[hidden | state]` with no context
+vector at all — so the context term is this variant's addition and the joint width is the one constant to build from.
+
+**Step 7 therefore targets the mainline variant**, for three reasons: it is the layout this engine reads, it is the newer
+of the two, and `has_markov_context = True` is the branch current llama.cpp carries. The bit-exact BF16 reference is
+`~/models/inkling2-mainline/dspark-Inkling-2-Mini-BF16-mainline.gguf` (SHA-256 `dba3d73c…`, verified against the
+repo's LFS hash), whose 27 attention and MLP projections are BF16 byte for byte; the `Q8_0` file stores the same 27 as
+`Q8_0` at a worst relative RMSE of 0.62% and is otherwise identical, so either can serve as the reference and the BF16
+one removes quantisation from the comparison entirely.
+
+The `Q8_0` inventory (54 tensors, `Q8_0` blocks + `F32` norms + `BF16` linears) is what first showed that this drafter
+is not the variant `src/models/dspark.cpp` implements — it carries tensors that file neither loads nor names:
 
 | Tensor | Shape | What it is |
 | --- | --- | --- |
 | `dspark_fuse.weight` | `[4, 4]` | the learned fusion of the four tapped target layers' hidden states |
-| `joint_proj.{weight,bias}` | `[5120, 768]`, `[768]` | the joint projection: **5120 = 2·2304 + 2·256** in, `3·256` out |
+| `joint_proj.{weight,bias}` | `[5120, 768]`, `[768]` | the joint projection: `[hidden | ctx | state]` in, `3·rank` out |
 | `markov_w1.weight` | `[256, 201024]` | `(unembed ∘ hidden_out)`, the folded Markov input |
 | `markov_w1` / `dspark_hidden_out` / `dspark_norm` | `[256,2304]`, `[2304]`, `[2304]` | the folded head and its norm |
 | `mask_embd.weight` | `[2304]` | the masked-token embedding (there is no `token_embd` table) |
@@ -1003,14 +1034,11 @@ neither loads nor names:
 | `blk.N.ffn_{gate,up,down}` | `[2304,9216]` ×2, `[9216,2304]` | SwiGLU, `intermediate_size` 9216 |
 
 `dspark.attention.causal = False` and `sliding_window_pattern = [True, False, True]` confirm block diffusion: layer 1 is
-global, layers 0 and 2 are windowed at 1,024, and a block's 8 positions attend each other. `final_logit_softcapping = 30.0`
+global, layers 0 and 2 are windowed, and a block's 8 positions attend each other. `final_logit_softcapping = 30.0`
 must be applied to the drafter's logits, and `sample_from_anchor = False` with `has_confidence_head = False` means the
-7 non-anchor positions are sampled from the head rather than accepted on a confidence score.
-
-**So Step 7 is a port of a variant this repo has no reference for.** The two candidate routes are (a) find the
-Inkling-2-Mini DSpark reference upstream, or (b) validate the `joint_proj` split empirically first, since it is the only
-inference left: force `joint`'s second 2304 to the target state, its third block to the `dflare_norm` output, and compare the
-drafter's logits at two positions against the BF16 reference drafter.
+7 non-anchor positions are sampled from the head rather than accepted on a confidence score. `block_size = 8` is what
+`--spec-draft-n-max` clamps to, and the drafter borrows the target's embeddings and LM head, so it carries neither and
+must live on the same devices as the target.
 
 **Integration points that already exist** (so the port is the forward pass, not the plumbing): `opt_.draft_model` /
 `dg_` (`engine.cpp:2678`), `drafts()`, `guesses_at_once()` (`engine.hpp:313-315`, the block-at-once path DSpark wants),
