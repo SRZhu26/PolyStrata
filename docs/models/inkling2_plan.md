@@ -799,3 +799,31 @@ takes 61.3 minutes. Replacing it with an MMA tensor-core kernel for `rows >= 32`
 3. **Tool-call & reasoning tests**: Add unit tests in `serve/test_models.py` verifying `<|content_thinking|>` →
    `reasoning_content` and `<|content_invoke_tool_json|>` → OpenAI `tool_calls`.
 4. **Daily-drive server config**: Start `serve/server.py` with `--kv q8_0 --vram-reserve-mib 256 --vram-pool --ram-experts-mib 10240 --expert-profile bench/inkling2-code.profile --pinned-session` so multi-turn coding sessions reuse the cached KV prefix with 1–5 s TTFT.
+
+### Step 7 — DSpark Speculative Decoding (Biggest Decode Multiplier: ~2.0–2.8×)
+Currently `Inkling2` runs with `drafts() == false` (1 token per 48-layer pass). Because Inkling 2 Mini is an offloaded
+MoE, speculative verification (`Engine::window(tokens, t)` with `t = 4`) coalesces expert reads across all 4 tokens
+(`engine.cpp:4066`) and amortizes all non-expert + KV reads across 4 tokens at once.
+
+- **Pinned drafter files** (`unsloth/Inkling-2-Mini-GGUF` @ `ea0c79b2ecd73669e774c8519b79bfabfddbc027`):
+  - `dspark-Inkling-2-Mini-Q8_0.gguf` — **402,278,560 bytes (402 MB)**, SHA-256
+    `2ec78510da837e8fc3be54a14757a0c5fbd2d8d9e85a0d92853fafdf674f3773` (fits 100% in VRAM; ~2–3 ms/draft; losing ~85
+    cached experts costs ~5% per pass while gaining +100–180% effective decode tok/s).
+  - `dspark/dspark-Inkling-2-Mini-BF16.gguf` — 648 MB (lossless reference).
+- **Architecture (`mtp_config` from `thinkingmachines/Inkling-2-Mini/config.json`)**:
+  - 3 dense RoPE + SwiGLU layers (`hidden_size = 2304`, `intermediate_size = 9216`, `num_attention_heads = 24`,
+    `num_key_value_heads = 8`, `head_dim = 128`, `rope_theta = 1000000.0`, `rms_norm_eps = 1e-6`).
+  - Attention split: `local_layer_ids = [0, 2]` (`sliding_window_size = 1024`), layer `1` is global.
+  - Markov/RNN head: `block_size = 8`, `markov_rank = 256`, `markov_head_type = "rnn_hidden"`, tapping target hidden
+    states at logical steps **`target_layer_ids = [5, 23, 41, 48]`**.
+- **How to wire into `strata-poly`** (reference `ggml-org/llama.cpp#32218` for exact DSpark tensor names & math):
+  1. Inspect `dspark-Inkling-2-Mini-Q8_0.gguf` headers with `tools/gguf_reader.py` to confirm all tensor names.
+  2. Pass `--draft-model <path-to-dspark-Inkling-2-Mini-Q8_0.gguf>` (already parsed into `opt_.draft_model` / `dg_` in
+     `Engine::load()`, `src/poly/engine.cpp:2678`).
+  3. In `Inkling2`: capture the 4 target hidden states at logical steps `[5, 23, 41, 48]` into a small scratch buffer
+     (`4 × rows_ × 2304` floats) during the main pass.
+  4. Load the 3 dense layers + Markov head from `dg_` into VRAM and override `Inkling2::draft_step(int32_t token, int i)`
+     (`src/poly/engine.hpp:418`) to produce draft `logits_` (`Engine::draft()`, `window()`, `keep()`, and `snap_`
+     recurrent-state rollback handle the rest automatically).
+  5. **Verify**: Run greedy decoding (`--temp 0`) with `--draft-model` (`--window 4`) vs `--no-draft` and confirm
+     **byte-identical token output**, then measure acceptance rate and effective decode tok/s at 8K / 32K / 128K.
