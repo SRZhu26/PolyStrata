@@ -34,6 +34,28 @@ bash tools/build_poly_cuda_local.sh
 ```
 Confirm clean CUDA `sm_120` build and all 17 FP64 kernel checks pass.
 
+> **Windows build environment note (`reg.exe` blocked / empty `INCLUDE` & `LIB`)**:
+> `vcvars64.bat` (`winsdk.bat`) invokes `reg.exe` to locate the Windows SDK. In an agent shell where `reg.exe` is
+> blacklisted, `INCLUDE` and `LIB` stay empty and `cl.exe` fails (passing `-ccbin` alone does not populate them).
+> - **Preferred (if `nvcc.exe` itself also invokes `reg.exe`)**: run the fast incremental rebuild directly in
+>   **"x64 Native Tools Command Prompt for VS"** on the laptop:
+>   ```powershell
+>   git pull --ff-only fork inkling2-engine-local
+>   cmake --build build-poly --config Release --target strata-poly poly_inkling2_test -j
+>   .\build-poly\poly_inkling2_test.exe
+>   ```
+>   Once `build-poly\strata-poly.exe` is built, the agent can run all Python tests/benchmarks without `cl.exe`/`nvcc`.
+> - **Alternative (skip `vcvars64.bat`, set `INCLUDE`/`LIB`/`PATH` from disk)**:
+>   ```powershell
+>   $msvc = (Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\*\VC\Tools\MSVC\*" | Sort-Object Name -Descending | Select-Object -First 1).FullName
+>   $sdk  = "C:\Program Files (x86)\Windows Kits\10"
+>   $ver  = (Get-ChildItem "$sdk\Include" | Sort-Object Name -Descending | Select-Object -First 1).Name
+>   $env:INCLUDE = "$msvc\include;$sdk\Include\$ver\ucrt;$sdk\Include\$ver\shared;$sdk\Include\$ver\um"
+>   $env:LIB     = "$msvc\lib\x64;$sdk\Lib\$ver\ucrt\x64;$sdk\Lib\$ver\um\x64"
+>   $env:PATH    = "$msvc\bin\Hostx64\x64;C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.1\bin;$env:PATH"
+>   cmake --build build-poly --config Release --target strata-poly poly_inkling2_test -j
+>   ```
+
 ### Step 2 — Verify the Two Bug Fixes (~3 min)
 1. **Bank-leak fix (`5 of 5 at step 42`)**: Run 6+ sequential requests on one server via `tools/probe_context.py`
    (with `--kv q8_0`) and confirm zero `bank is full` errors.
