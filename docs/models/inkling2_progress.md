@@ -19,7 +19,7 @@ Companion documents: [inkling2.md](inkling2.md) (architecture and measured resul
 | --- | --- | --- |
 | `main` | `8d812d5c` | untouched |
 | `add-inkling2-mini` (PR head) | `59f21100` | untouched — the PR to `main` is unaffected by this work |
-| `inkling2-engine-local` | `d5a21a41` (merge), engine `122cc988` | **this work**, pushed to `origin` as its own branch |
+| `inkling2-engine-local` | `d5a21a41` (merge), engine `122cc988`; then the tensor-core attention (§4.6) | **this work**, pushed to `origin` as its own branch |
 | `inkling2-layer-major-wip` | `4a39c701` | the layer-major read, solved at 1.01× and off (§3.1) |
 
 `origin` is `https://github.com/SRZhu26/PolyStrata.git`, the user's own repository; there is no second remote. The engine
@@ -38,7 +38,8 @@ redirect.
 - Model under test: `Inkling-2-Mini-UD-Q4_K_XL.gguf`, 17,629,760,736 B (17.6 GB / 16.42 GiB), 24 physical layers.
 - KV cache: FP16 and `--kv q8_0` both measured (§4); Q8_0 is numerically sound (99.79% agreement) but slower at
   8K and 32K, and only pays off with `--kv-whole` at very long context.
-- Kernel unit tests: `poly_inkling2_test.exe`, **19/19 pass** against FP64 on the current binary (incl. `attend split`, `attend q8 spl`).
+- Kernel unit tests: `poly_inkling2_test.exe`, **23/23 pass** against FP64 on the current binary (incl. `attend split`,
+  `attend q8 spl`, `attend mma`, `attend q8 mma`, and `attend ab` / `attend q8 ab` at the engine's own shape).
 - Tokenizer: `bench/tok-inkling2/tokenizer` (converted from the GGUF), used by the server.
 
 ---
@@ -109,7 +110,9 @@ path stays off; the complete attempt, `tools/layer_major_ab.py` and `tools/dump_
 
 All numbers: `UD-Q4_K_XL`, experts streamed from disk, RTX 5060 Laptop, one fresh server per row. The FP16 and Q8_0 rows
 share the prompt, the context and the binary, so each pair is a clean A/B on the KV format alone. The tables in §4 and §4.3
-were measured on `ee04f3d7`; §4.4 re-measures the current binary (`f159fe78`) and supersedes them for speed.
+were measured on `ee04f3d7`; §4.4 re-measures the current binary (`f159fe78`) and supersedes them for speed, §4.5
+adds the `--kv q8_0` gate with Split-K flash decoding, and §4.6 supersedes all of them for prefill speed with the
+tensor-core attention.
 
 | Prompt tokens | KV | Prefill tok/s | Decode tok/s | VRAM peak | RSS peak | Experts in VRAM |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: |
@@ -234,8 +237,56 @@ One fresh server per row, same prompt set, `--kv q8_0 --ram-experts-mib 10240`:
 
 The 128K prefill is 61.3 min, which is the quadratic wall §4.4's incremental curve projected at ≈ 96 min before the
 attention rewrite; the rewrite and Split-K together bring it in at two thirds of that. Coherent text at 130.7K. System peak
-27.26 GiB, so the 32 GB laptop has ~4.7 GiB of headroom at the longest context. The 17 kernel checks pass, including
+27.26 GiB, so the 32 GB laptop has ~4.7 GiB of headroom at the longest context. The 19 kernel checks then pass, including
 `attend split` (3.278e-07 of 0.449) and `attend q8 spl` (2.086e-07 of 0.423).
+
+### 4.6 Tensor-core prefill attention (`e5b1f0a3`)
+
+The scalar attention spent a full FMA per (row, key, dimension) of both `Q·K` and `P·V`, which is where a long prompt's
+quadratic wall was. `ink_attend_rel_mma_kernel<Q8>` in `src/poly/inkling2_kernels.cu` runs both products on
+`mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`: a block takes one head and 64 consecutive rows of it, a warp 16 of
+those rows, and walks the keys 64 at a time with the online softmax in registers in log2 units. Everything else is exactly
+`ink_attend_rel_kernel`'s: the sink as `m = 0, l = 1`, `scale · tau[r]` folded into the query, the bias by distance added in
+log2 units, `exp2f` for the weights, and the same window/future mask.
+
+It is a port of `attn_flash128_kernel` (`src/poly/kernels.cu`), which already had the tile scaffolding for `dim = 128`, a
+window, a ring and a per-head sink; `INK_MMA_SMEM` is 69,632 B for two buffers of keys and values, and the two caches differ
+only in `ink_tile<Q8>` (a `uint4` copy from the halves, or eight int8 codes dequantized with their block's scale).
+`STRATA_INK_MMA=0` forces the scalar path, so both are measurable on one binary.
+
+Two faults had to be fixed, and neither was in the arithmetic:
+
+- **The key range came from the warp's rows, not the block's.** `hi = pos + r0 + nr` with `r0` the warp's first row makes a
+  warp whose rows run past `rows` fetch one block past the last valid key — which happens whenever the last block of a chunk is
+  short (`rows % 64 != 0`, e.g. 200 rows). The 64-row unit test did not catch it because `cudaMalloc` padding absorbed the
+  overread; in the engine that slice sits inside a shared arena, so it was an **illegal memory access at 3,072 tokens**. `hi`
+  and `lo` are now both computed from the block (`nb = min(64, rows - row0)`).
+- **The `attend q8` check compared two different quantizations.** Its reference was the scalar kernel, which quantizes the query
+  to int8, while the MMA path keeps it in fp32 and only rounds it to fp16, so the 2.989e-02 it reported was the scalar kernel's
+  own error — the MMA path is the more accurate of the two. The gate is now an FP64 reference at the engine's own shape (24 heads
+  over 8 kv heads, 200 rows so the last block is 8 rows, `pos = 128`, `n_keys = 1025`).
+
+One fresh server per row, `--kv q8_0 --ram-experts-mib 10240`, same prompt set as §4.5:
+
+| Prompt tokens | Prefill before | Prefill after | Gain | TTFT before | TTFT after |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8,198 | 165.0 | **346.9** | **2.10×** | 49.7 s | 23.6 s |
+| 32,015 | 94.9 | **328.3** | **3.46×** | 337.3 s | 97.5 s |
+| 130,715 | 35.5 | **247.4** | **6.97×** | 3,678.7 s (61.3 min) | 528.3 s (8.8 min) |
+
+The 8K cell was re-measured on the final binary after a linkage-only cleanup and gave 345.4 tok/s and 23.7 s,
+the same within 0.4%; the table keeps the first figure and the committed `bench/mma-gate/8k` cell is the repeat.
+
+`STRATA_INK_MMA=0` on the same binary reproduces 165.0 tok/s and 49.7 s at 8K exactly, so the gain is the kernel and not
+the rebuild. VRAM stays 6,640 MiB and RSS 11.3 GiB at every length, and the output is coherent at 8.2K, 32K and 130.7K. Decode
+is unchanged (10.0 / 9.7 / 6.3 tok/s), as it should be: a decode step is one row, below `INK_MMA_MIN = 32`, so it keeps the
+scalar and Split-K kernels.
+
+The point that matters is the last row: 130.7K is now **7× faster** and within **1.35× of the 32K figure**, so the quadratic
+wall is gone rather than merely shortened. The plan's Step 4 target of "400+ tok/s at 32K" was not met — the measured figure is
+328.3 — and that target was derived from a three-point analytic fit that put attention at 25% of an 8K prefill, 57% of a 32K one
+and 85% of a 128K one. The fit was wrong: removing attention entirely would have left 37.5 s at 8K, and the measurement is
+23.6 s, so attention was a larger share of prefill than the fit claimed at every length.
 
 ---
 
@@ -247,7 +298,7 @@ attention rewrite; the rewrite and Split-K together bring it in at two thirds of
 | Peak RAM | ≤ 26 GiB | **pass on `f159fe78`** — process RSS 11.20 GiB at 8K and 11.74 at 32K; system peak 25.36/25.25 GiB at 8K/10.9K FP16. The earlier marginal rows (26.2–26.8) were all `ee04f3d7` runs that either took the unpinned path (§8.2) or ran Q8_0 |
 | Decode vs `llama.cpp` | ≥ 1.5× same-day baseline | **not evaluable** — no baseline exists (§6) |
 | Cosine per stage | ≥ 0.999 | **pass** — `blk.6` 0.999988758, `blk.23` 0.999988499, logits 0.999763105; worst layer 0.999971239 (`blk.16`). `UD-Q4_K_XL` holds no `Q4_K` tensors, so the oracle's NVFP4/Q8_0 coverage is enough |
-| Kernel parity | vs FP64 | **pass** — `poly_inkling2_test`, 19 checks |
+| Kernel parity | vs FP64 | **pass** — `poly_inkling2_test`, 23 checks |
 | Long-context coherence | coherent at 8K/32K/128K | **pass** — coherent at 6,185 / 8,233 / 10,281 tokens on controlled prompts, and at 130,715 on the 128K benchmark prompt |
 | Long-context needle | 100% recall at 32K/64K/128K | **not yet run** |
 | Q8_0 KV | FP16 vs Q8_0 agreement ≥ 97% | **pass** — 639/640 = **99.84%**, teacher-forced |

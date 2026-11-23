@@ -45,13 +45,13 @@ std::vector<uint16_t> halves(const std::vector<float>& f) {
 int bad = 0;
 
 // The largest difference of the kernel's result from the reference, relative to the reference's largest value.
-void report(const char* what, const std::vector<float>& got, const std::vector<float>& want) {
+void report(const char* what, const std::vector<float>& got, const std::vector<float>& want, float tol = 1e-4f) {
     float most = 0.f, big = 0.f;
     for (size_t i = 0; i < got.size(); ++i) {
         most = std::max(most, std::fabs(got[i] - want[i]));
         big = std::max(big, std::fabs(want[i]));
     }
-    const bool ok = most <= 1e-4f * std::max(1.f, big);
+    const bool ok = most <= tol * std::max(1.f, big);
     if (!ok) ++bad;
     std::printf("%s %-12s %.3e of %.3f\n", ok ? "ok  " : "FAIL", what, most, big);
 }
@@ -413,6 +413,209 @@ void check_attend(bool ring) {
         cudaFree(do_);
 }
 
+// The tensor cores' prefill attention: dim 128 and rows >= 32 take that kernel's path, so this asks for the same
+// formula check_attend() makes over 64 rows at a 2,048-token position, over both KV caches.  Both products are
+// rounded to halves there, so the tolerance is the plan's 2e-3 rather than the scalar kernel's 1e-4.
+void check_attend_mma(bool q8) {
+    std::mt19937 rng(31);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    const int nh = 8, hd = 128, nkv = 2, chan = nkv * hd, nblk = hd / 32;
+    const int rows = 64;
+    const long long pos = 2048;
+    const int n_keys = int(pos) + rows + 1;
+    const float scale = 1.f / std::sqrt((float) hd);
+    std::vector<float> q(size_t(rows) * nh * hd), kqb(size_t(rows) * nh * n_keys), tau(rows);
+    for (float& x : q) x = 2.f * nd(rng);
+    for (float& x : kqb) x = 0.3f * nd(rng);
+    for (float& x : tau) x = 1.f + 0.1f * std::fabs(nd(rng));
+    std::vector<float> k(size_t(pos + rows) * chan), v(size_t(pos + rows) * chan);
+    for (float& x : k) x = nd(rng);
+    for (float& x : v) x = nd(rng);
+    // The caches hold halves, and q8_0 a code and a scale a 32-value block.  `kd`/`vd` are the values the kernel
+    // itself sees, so the reference reads those and not the fp32 originals.
+    std::vector<float> kd(k.size()), vd(v.size());
+    std::vector<int8_t> kc(k.size()), vc(v.size());
+    std::vector<uint16_t> ksc(size_t(pos + rows) * nkv * nblk), vsc(size_t(pos + rows) * nkv * nblk);
+    for (int j = 0; j < int(pos) + rows; ++j)
+        for (int hkv = 0; hkv < nkv; ++hkv)
+            for (int b = 0; b < nblk; ++b) {
+                const size_t at = size_t(j) * chan + size_t(hkv) * hd + b * 32;
+                float kmost = 0.f, vmost = 0.f;
+                for (int i = 0; i < 32; ++i) {
+                    kmost = std::max(kmost, std::fabs(k[at + i]));
+                    vmost = std::max(vmost, std::fabs(v[at + i]));
+                }
+                const float ks_ = kmost > 0.f ? kmost / 127.f : 0.f;
+                const float vs_ = vmost > 0.f ? vmost / 127.f : 0.f;
+                const uint16_t ksh = __half_as_ushort(__float2half(ks_));
+                const uint16_t vsh = __half_as_ushort(__float2half(vs_));
+                ksc[(size_t(j) * nkv + hkv) * nblk + b] = ksh;
+                vsc[(size_t(j) * nkv + hkv) * nblk + b] = vsh;
+                for (int i = 0; i < 32; ++i) {
+                    if (!q8) {
+                        kd[at + i] = __half2float(__float2half(k[at + i]));
+                        vd[at + i] = __half2float(__float2half(v[at + i]));
+                        continue;
+                    }
+                    const int kq = kmost > 0.f ? (int) std::lround(k[at + i] * 127.f / kmost) : 0;
+                    const int vq = vmost > 0.f ? (int) std::lround(v[at + i] * 127.f / vmost) : 0;
+                    kc[at + i] = (int8_t) std::min(127, std::max(-127, kq));
+                    vc[at + i] = (int8_t) std::min(127, std::max(-127, vq));
+                    kd[at + i] = (float) kc[at + i] * __half2float(__ushort_as_half(ksh));
+                    vd[at + i] = (float) vc[at + i] * __half2float(__ushort_as_half(vsh));
+                }
+            }
+    std::vector<float> want(size_t(rows) * nh * hd);
+    for (int t = 0; t < rows; ++t) {
+        const long long p = pos + t;
+        for (int h = 0; h < nh; ++h) {
+            const int hkv = h / (nh / nkv);
+            std::vector<double> logit;
+            for (long long j = 0; j <= p; ++j) {
+                double s = 0;
+                for (int e = 0; e < hd; ++e)
+                    s += (double) q[(size_t(t) * nh + h) * hd + e] * kd[size_t(j) * chan + size_t(hkv) * hd + e];
+                const long long d = p - j;
+                logit.push_back(s * scale * tau[t] + kqb[(size_t(t) * nh + h) * n_keys + size_t(d < n_keys ? d : n_keys - 1)]);
+            }
+            double best = 0.0;   // the sink's own logit is zero
+            for (double s : logit) best = std::max(best, s);
+            double sum = std::exp(-best);
+            for (double s : logit) sum += std::exp(s - best);
+            for (int e = 0; e < hd; ++e) {
+                double acc = 0;
+                for (size_t j = 0; j < logit.size(); ++j)
+                    acc += std::exp(logit[j] - best) / sum * vd[j * chan + size_t(hkv) * hd + e];
+                want[(size_t(t) * nh + h) * hd + e] = (float) acc;
+            }
+        }
+    }
+    const float* dq = upload(q);
+    const float* db = upload(kqb);
+    const float* dt = upload(tau);
+    float* do_ = nullptr;
+    cudaMalloc(&do_, want.size() * sizeof(float));
+    if (q8) {
+        const int8_t* dkc = upload(kc);
+        const uint16_t* dks = upload(ksc);
+        const int8_t* dvc = upload(vc);
+        const uint16_t* dvs = upload(vsc);
+        ink_attend_rel_q8(dq, dkc, dks, dvc, dvs, db, dt, pos, rows, do_, hd, nh, nkv, scale, 0, n_keys, 0, nullptr);
+        report("attend q8 mma", download(do_, want.size()), want, 2e-3f);
+        cudaFree((void*) dkc), cudaFree((void*) dks), cudaFree((void*) dvc), cudaFree((void*) dvs);
+    } else {
+        const std::vector<uint16_t> kh = halves(kd), vh = halves(vd);
+        const uint16_t* dk = upload(kh);
+        const uint16_t* dv = upload(vh);
+        ink_attend_rel(dq, dk, dv, db, dt, pos, rows, do_, hd, nh, nkv, scale, 0, n_keys, 0, nullptr);
+        report("attend mma", download(do_, want.size()), want, 2e-3f);
+        cudaFree((void*) dk), cudaFree((void*) dv);
+    }
+    cudaFree((void*) dq), cudaFree((void*) db), cudaFree((void*) dt), cudaFree(do_);
+}
+
+// The engine's own shape, against exact arithmetic: 24 heads over 8 kv heads, 200 rows in one chunk (four
+// blocks, the last of them 8 rows rather than 64) at 128.  The 64-row check above validates one block's
+// arithmetic; this one validates the tiling across blocks and the short last block, which is where a block's key
+// range used to run past the cache, and the head-to-kv-head mapping of 3 heads a group.
+void check_attend_ab(bool q8) {
+    std::mt19937 rng(37);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    const int nh = 24, hd = 128, nkv = 8, chan = nkv * hd, nblk = hd / 32;
+    const int rows = 200, n_keys = 1025;   // the engine's bias table: min(extent, context) + 1
+    const long long pos = 128;
+    const float scale = 1.f / std::sqrt((float) hd);
+    std::vector<float> q(size_t(rows) * nh * hd), kqb(size_t(rows) * nh * n_keys), tau(rows);
+    for (float& x : q) x = 2.f * nd(rng);
+    for (float& x : kqb) x = 0.3f * nd(rng);
+    for (float& x : tau) x = 1.f + 0.1f * std::fabs(nd(rng));
+    std::vector<float> k(size_t(pos + rows) * chan), v(size_t(pos + rows) * chan);
+    for (float& x : k) x = nd(rng);
+    for (float& x : v) x = nd(rng);
+    // The caches hold halves, and q8_0 a code and a scale a 32-value block.  `kd`/`vd` are the values the
+    // kernel itself sees, so the reference reads those and not the fp32 originals.
+    std::vector<float> kd(k.size()), vd(v.size());
+    std::vector<int8_t> kc(k.size()), vc(v.size());
+    std::vector<uint16_t> ksc(size_t(pos + rows) * nkv * nblk), vsc(size_t(pos + rows) * nkv * nblk);
+    for (int j = 0; j < int(pos) + rows; ++j)
+        for (int hkv = 0; hkv < nkv; ++hkv)
+            for (int b = 0; b < nblk; ++b) {
+                const size_t at = size_t(j) * chan + size_t(hkv) * hd + b * 32;
+                float kmost = 0.f, vmost = 0.f;
+                for (int i = 0; i < 32; ++i) {
+                    kmost = std::max(kmost, std::fabs(k[at + i]));
+                    vmost = std::max(vmost, std::fabs(v[at + i]));
+                }
+                const float ks_ = kmost > 0.f ? kmost / 127.f : 0.f;
+                const float vs_ = vmost > 0.f ? vmost / 127.f : 0.f;
+                const uint16_t ksh = __half_as_ushort(__float2half(ks_));
+                const uint16_t vsh = __half_as_ushort(__float2half(vs_));
+                ksc[(size_t(j) * nkv + hkv) * nblk + b] = ksh;
+                vsc[(size_t(j) * nkv + hkv) * nblk + b] = vsh;
+                for (int i = 0; i < 32; ++i) {
+                    if (!q8) {
+                        kd[at + i] = __half2float(__float2half(k[at + i]));
+                        vd[at + i] = __half2float(__float2half(v[at + i]));
+                        continue;
+                    }
+                    const int kq = kmost > 0.f ? (int) std::lround(k[at + i] * 127.f / kmost) : 0;
+                    const int vq = vmost > 0.f ? (int) std::lround(v[at + i] * 127.f / vmost) : 0;
+                    kc[at + i] = (int8_t) std::min(127, std::max(-127, kq));
+                    vc[at + i] = (int8_t) std::min(127, std::max(-127, vq));
+                    kd[at + i] = (float) kc[at + i] * __half2float(__ushort_as_half(ksh));
+                    vd[at + i] = (float) vc[at + i] * __half2float(__ushort_as_half(vsh));
+                }
+            }
+    std::vector<float> want(size_t(rows) * nh * hd);
+    for (int t = 0; t < rows; ++t) {
+        const long long p = pos + t;
+        for (int h = 0; h < nh; ++h) {
+            const int hkv = h / (nh / nkv);
+            std::vector<double> logit;
+            for (long long j = 0; j <= p; ++j) {
+                double s = 0;
+                for (int e = 0; e < hd; ++e)
+                    s += (double) q[(size_t(t) * nh + h) * hd + e] * kd[size_t(j) * chan + size_t(hkv) * hd + e];
+                const long long d = p - j;
+                logit.push_back(s * scale * tau[t] +
+                                kqb[(size_t(t) * nh + h) * n_keys + size_t(d < n_keys ? d : n_keys - 1)]);
+            }
+            double best = 0.0;   // the sink's own logit is zero
+            for (double s : logit) best = std::max(best, s);
+            double sum = std::exp(-best);
+            for (double s : logit) sum += std::exp(s - best);
+            for (int e = 0; e < hd; ++e) {
+                double acc = 0;
+                for (size_t j = 0; j < logit.size(); ++j)
+                    acc += std::exp(logit[j] - best) / sum * vd[j * chan + size_t(hkv) * hd + e];
+                want[(size_t(t) * nh + h) * hd + e] = (float) acc;
+            }
+        }
+    }
+    const float* dq = upload(q);
+    const float* db = upload(kqb);
+    const float* dt = upload(tau);
+    float* do_ = nullptr;
+    cudaMalloc(&do_, want.size() * sizeof(float));
+    if (q8) {
+        const int8_t* dkc = upload(kc);
+        const uint16_t* dks = upload(ksc);
+        const int8_t* dvc = upload(vc);
+        const uint16_t* dvs = upload(vsc);
+        ink_attend_rel_q8(dq, dkc, dks, dvc, dvs, db, dt, pos, rows, do_, hd, nh, nkv, scale, 0, n_keys, 0, nullptr);
+        report("attend q8 ab", download(do_, want.size()), want, 2e-3f);
+        cudaFree((void*) dkc), cudaFree((void*) dks), cudaFree((void*) dvc), cudaFree((void*) dvs);
+    } else {
+        const std::vector<uint16_t> kh = halves(kd), vh = halves(vd);
+        const uint16_t* dk = upload(kh);
+        const uint16_t* dv = upload(vh);
+        ink_attend_rel(dq, dk, dv, db, dt, pos, rows, do_, hd, nh, nkv, scale, 0, n_keys, 0, nullptr);
+        report("attend ab", download(do_, want.size()), want, 2e-3f);
+        cudaFree((void*) dk), cudaFree((void*) dv);
+    }
+    cudaFree((void*) dq), cudaFree((void*) db), cudaFree((void*) dt), cudaFree(do_);
+}
+
 // The depth attention: the bank newest first, then cur last, every state RMS-normed without a gain
 void check_depth_mix(int n_states, int n_q) {
     std::mt19937 rng(23);
@@ -635,6 +838,10 @@ int main() {
     check_rel_table();
     check_attend(false);
     check_attend(true);
+    check_attend_mma(false);
+    check_attend_mma(true);
+    check_attend_ab(false);
+    check_attend_ab(true);
     check_attend_split();
     check_attend_q8_split();
     check_depth_mix(kStates, 1);

@@ -1,0 +1,20 @@
+{
+ "exe": "C:\\Users\\zshua\\PolyStrata\\build-poly\\strata-poly.exe",
+ "args": [
+  "--model",
+  "C:/Users/zshua/models/inkling2-mainline/Inkling-2-Mini-UD-Q4_K_XL.gguf",
+  "--max-context",
+  "10240",
+  "--kv",
+  "q8_0",
+  "--threads",
+  "16",
+  "--ram-experts-mib",
+  "10240"
+ ],
+ "cwd": "C:\\Users\\zshua\\PolyStrata",
+ "log": "bench\\mma-8k-off\\engine-Inkling-2-Mini-UD-Q4_K_XL.log",
+ "tokenizer": "C:\\Users\\zshua\\PolyStrata\\bench\\tok-inkling2\\tokenizer",
+ "model_name": "inkling-2-mini-ud-q4_k_xl",
+ "port": 8191
+}

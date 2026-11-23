@@ -827,6 +827,49 @@ takes 61.3 minutes. Replacing it with an MMA tensor-core kernel for `rows >= 32`
    `pos = 2048` (`max abs diff < 2e-3`), then re-measure 32K and 128K prefill (target: 32K from 95 → **400+ tok/s**,
    128K from 61 min → **~8–15 min**).
 
+**Result — done, and the 32K target in point 4 was wrong (`e5b1f0a3`).** The kernel is
+`ink_attend_rel_mma_kernel<Q8>` in `src/poly/inkling2_kernels.cu`: one block takes a head and 64 consecutive rows of it, a
+warp 16 of those rows, and walks the keys 64 at a time with the online softmax in registers, in log2 units. It is a port of
+`attn_flash128_kernel` (kernels.cu), which already had the tile scaffolding for `dim = 128`, a window, a ring and a per-head
+sink, and it keeps `ink_attend_rel_kernel`'s semantics exactly: the sink as `m = 0, l = 1`, `scale * tau[r]` folded into the
+query, the bias added in log2 units, `exp2f` for the weights, and the same window/future mask. `INK_MMA_SMEM` is 69,632 B
+(two buffers × keys × values), and `STRATA_INK_MMA=0` forces the scalar path so that both can be measured on one binary.
+
+Two faults had to be fixed before it was correct, and neither was in the arithmetic:
+
+- **The key range came from the warp's rows, not the block's.** `hi = pos + r0 + nr` with `r0` the warp's first row makes a
+  warp whose rows run past `rows` (the last block of a 1,024-row chunk is short when `rows % 64 != 0`) fetch a key range one
+  block past the last valid key. The 64-row unit test did not catch it because `cudaMalloc` padding absorbed the overread; in the
+  engine that slice sits inside a shared arena, so it was an illegal memory access at 3,072 tokens. Both `hi` and `lo` are now
+  computed from the block (`nb = min(64, rows - row0)`).
+- **The `attend q8` check was comparing two different quantizations.** Its reference was the scalar kernel, which quantizes the
+  query to int8, while the MMA path keeps it in fp32 and only rounds it to fp16 — so the 2.989e-02 it reported was the scalar
+  kernel's own error, and the MMA path is the more accurate of the two. The gate is now an FP64 reference at the engine's own shape
+  (24 heads over 8 kv heads, 200 rows, `pos = 128`, `n_keys = 1025`), which is what point 4 asked for in the first place.
+
+Verification, one fresh server per row, `--kv q8_0 --ram-experts-mib 10240`:
+
+| Prompt tokens | Prefill before | Prefill after | Gain | TTFT before | TTFT after |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8,198 | 165.0 | **346.9** | **2.10×** | 49.7 s | 23.6 s |
+| 32,015 | 94.9 | **328.3** | **3.46×** | 337.3 s | 97.5 s |
+| 130,715 | 35.5 | **247.4** | **6.97×** | 3,678.7 s (61.3 min) | 528.3 s (8.8 min) |
+
+The 8K cell was re-measured on the final binary after a linkage-only cleanup and gave 345.4 tok/s and 23.7 s,
+the same within 0.4%; the table keeps the first figure and the committed `bench/mma-gate/8k` cell is the repeat.
+
+`STRATA_INK_MMA=0` on the same binary reproduces 165.0 tok/s and 49.7 s at 8K exactly, so the gain is the kernel and
+not the rebuild. VRAM stays 6,640 MiB and RSS 11.3 GiB at every length; output is coherent at 8.2K, 32K and 130.7K. The 23
+kernel checks pass, including `attend ab` (5.631e-03 of 3.633) and `attend q8 ab` (5.732e-03 of 3.636) against FP64 at the
+engine's shape.
+
+The 128K target in point 4 (~8–15 min) was met at 8.8 min, and the 32K one (**400+ tok/s**) was not: the measured 328.3 is
+3.46×, not 4.2×. That target came from an analytic fit of the three pre-kernel points that put attention at 25% of an 8K prefill,
+57% of a 32K one and 85% of a 128K one; the fit was wrong, because removing attention entirely would have left 37.5 s at 8K and
+the measurement is 23.6 s. Attention was therefore a larger share of prefill than the fit said at every length, and the 128K
+quadratic wall is now gone rather than merely shortened: 247.4 tok/s at 130.7K is 7× the old figure and within 1.35× of the 32K one.
+
+
 ### Step 5 — Pass-Aware CUDA Graphs (`L.fixed = true`) + Graph Invalidation (+20–30% Decode)
 1. **Close defect §8.3 first** (`src/poly/engine.cpp`):
    - In `shrink_cache()` (`~1409`) and `resize_card_cache()` (`~2118`), invalidate CUDA graphs (destroy `cudaGraphExec_t`
@@ -880,3 +923,68 @@ MoE, speculative verification (`Engine::window(tokens, t)` with `t = 4`) coalesc
      recurrent-state rollback handle the rest automatically).
   5. **Verify**: Run greedy decoding (`--temp 0`) with `--draft-model` (`--window 4`) vs `--no-draft` and confirm
      **byte-identical token output**, then measure acceptance rate and effective decode tok/s at 8K / 32K / 128K.
+
+#### Step 7 — what the reference actually says, and why this is a port and not a flag
+
+Recovered from `ggml-org/llama.cpp` master `src/models/dspark.cpp`, `common/speculative.cpp` (PR #32218), and
+`conversion/inkling2.py` (`Inkling2DSparkModel`). The GGUF's own metadata is `general.architecture = dflash` with
+`dflash.*` keys, so `Inkling2` must learn a **second architecture**, not reuse `Engine`'s draft block.
+
+**Block diffusion, not autoregression.** The drafter decodes a whole trained block of `block_size = 8` positions in
+**one non-causal pass** (`dflash.attention.causal = False`), then the verifier checks up to `n_max` of them:
+- slot 0 is the anchor (the last committed token, `dp.id_last`); slots 1..7 are `mask_token_id` (0);
+- `dflash.sample_from_anchor = False` here, so slot 0 is a bonus token and **7** tokens are drafted (`i_draft_beg = 1`);
+- `dflash.has_confidence_head = False`, so there is no `p_min` truncation; `dflash.has_markov_context` is **absent**,
+  which selects `nextn_masked = true` and the simple `n_block_tokens = n_draft + 1` path;
+- per position the graph is fed an **injected state vector of width `n_embd` (2304)**, not a token embedding:
+  slot 0 gets the target's hidden state for the committed token, the others get `mask_embd` (greedy) or
+  `[u, 1/temp, 0…]` (probabilistic). There is **no `token_embd` table** in this GGUF at all — confirmed: 54 tensors,
+  no embedding matrix.
+
+**Layer stack** (3 layers, `n_embd = 2304`, `n_ff = 9216`, 24 heads / 8 KV heads, `head_dim = 128`,
+`rope_theta = 1e6`, `rms_eps = 1e-6`, `sliding_window_pattern = [True, False, True]` → layers 0 and 2 window at 1024,
+layer 1 global):
+
+```
+x  = injected_state (+ mask_embd on the mask slots)
+for l in 0..2:
+    n   = rms_norm(x, attn_norm[l])
+    q   = rms_norm(reshape(n @ attn_q[l]),  attn_q_norm[l])   # 2304 -> 3072, 24 x 128
+    k   = rms_norm(reshape(n @ attn_k[l]),  attn_k_norm[l])   # 2304 -> 1024,  8 x 128
+    v   = n @ attn_v[l]                                       # 2304 -> 1024
+    kc  = rms_norm(reshape(ctx @ attn_k_ctx[l]), attn_k_ctx_norm[l])   # the DFlash inject path
+    vc  = ctx @ attn_v_ctx[l]                                          # from the fused target state
+    q,k = rope(q, k, pos)                        # non-causal over the block; K/V = [context | block]
+    x  += attn_output[l] @ attend(q, [kc|k], [vc|v])
+    x  += ffn_down[l] @ silu(ffn_gate[l] @ rms_norm(x, ffn_norm[l]) * ffn_up[l] @ …)
+hidden = rms_norm(x, output_norm)               # 2304 per position
+```
+
+**Markov head** (`rnn_hidden`, rank `R = 256`) — this is where this variant diverges from the DSV4 code:
+```
+base   = unembed(hidden)                         # the target's lm_head, borrowed; 201024 logits
+state  = 0
+for i in 1..7:
+    w1_prev = markov_w1[token[i-1]]              # row of the folded matrix, [R]
+    joint   = joint_proj @ [state | w1_prev | hidden[i] | ctx_fused]  + joint_proj.bias   # [3R]
+    gate    = sigmoid(joint[0:R]); cand = tanh(joint[R:2R])
+    state   = gate*state + (1-gate)*cand
+    logits[i] = base[i] + markov_w2 @ tanh(joint[2R:3R])
+```
+`markov_w1` in the GGUF is already **folded**: `conversion/inkling2.py::_fold_markov_chunk` computes
+`unembed[rows] @ dspark_hidden_out.weight`, so `markov_w1 [256, 201024]` is `(unembed ∘ hidden_out)` and needs no
+separate 2304-wide head. `markov_w2` is `[256, n_vocab_draft]` in llama.cpp but this GGUF has only
+`dspark_hidden_out` + `dspark_norm`, so the `w2` bias term is the unfolded path here.
+
+**The discrepancy to resolve before writing code.** llama.cpp declares
+`dspark_joint_proj = {n_embd + 2*rank, 3*rank}` = `[2816, 768]`, and its `joint` is
+`concat(concat(state, w1_prev), hidden)` = `256 + 256 + 2304`. This drafter's tensor is **`[5120, 768]`**, and
+`5120 - 512 = 4608 = 2 × 2304`. So the Inkling 2 variant conditions the Markov chain on **two** 2304-wide vectors —
+the drafter's own block hidden *and* the target's fused hidden (`dspark_fuse [4,4]` over the four tapped layers) —
+which the DSV4/Mistral code does not do. That is the one inference in this spec that must be validated first, and the
+cheapest way is a two-position check: force `joint`'s last 2304 to the target state and compare against the BF16
+reference drafter's own logits.
+
+**Integration points that already exist** (so the port is the forward pass, not the plumbing): `opt_.draft_model` /
+`dg_` (`engine.cpp:2678`), `drafts()`, `guesses_at_once()` (`engine.hpp:313-315`, the block-at-once path DSpark wants),
+`draft_step()` (`engine.hpp:418`), and `window()` / `keep()` / `snap_` which already roll back a rejected block.

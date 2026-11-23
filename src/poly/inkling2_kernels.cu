@@ -13,10 +13,20 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
 namespace strata::poly {
+
+// The tensor-core attention is the default; `STRATA_INK_MMA=0` turns it off so that the two can be measured
+// and compared on one binary, which is the only way to attribute a difference to it rather than to a rebuild.
+// Read on every call rather than cached, so that one process can measure both paths over the same data.
+static bool ink_mma_on() {
+    const char* e = std::getenv("STRATA_INK_MMA");
+    return !(e && e[0] == '0');
+}
+
 namespace {
 
 constexpr int INK_THREADS = 256;
@@ -926,6 +936,279 @@ void ink_conv(const float* x, float* state, const float* w, const float* dyn, fl
         throw std::runtime_error(std::string("ink_conv state: ") + cudaGetErrorString(e));
 }
 
+// ---- The tensor cores' prefill attention -------------------------------------------------------------
+// A prompt's rows are many and its keys are all of them, so Q.K and P.V are where a long prompt's reading goes:
+// the scalar kernels above spend a full FMA per (row, key, dimension) of both products, which is the quadratic wall:
+// removing it is worth 2.10x of an 8K prefill's time, 3.46x of a 32K one and 6.97x of a 128K one (§4.6 of the
+// progress report).  This kernel runs both products on the tensor cores'
+// m16n8k16 step, as attn_flash128_kernel (kernels.cu) does for Flint, and keeps everything else exactly as
+// ink_attend_rel_kernel has it: the bias by distance, the per-row tau, the zero-logit sink, the window and the ring.
+//
+// A block takes one head and INK_MMA_ROWS consecutive rows of it, a warp 16 of those rows, and walks the keys
+// INK_MMA_KEYS at a time with the online softmax in the registers, in log2 units.  The fragment layouts are PTX's
+// for mma.m16n8k16: a thread holds rows gid and gid + 8, columns 2 tig and 2 tig + 1 of each block of 8.
+#if defined(__HIPCC__) || (defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750)
+#define INK_MMA 0
+#else
+#define INK_MMA 1
+#endif
+
+constexpr int INK_MMA_ROWS = 64;               // the rows a block takes
+constexpr int INK_MMA_KEYS = 64;               // the keys a tile walks
+constexpr int INK_MMA_DIM = 128;               // the head dim it is for
+constexpr int INK_MMA_ROW = INK_MMA_DIM + 8;   // a shared row of halves, 16-byte aligned
+constexpr int INK_MMA_THREADS = 4 * 32;
+constexpr int INK_MMA_MIN = 32;                // fewer rows than this keep the scalar kernels
+// the keys and the values, two buffers each: one is worked on while the next is copied in
+constexpr int INK_MMA_SMEM = 2 * 2 * INK_MMA_KEYS * INK_MMA_ROW * (int) sizeof(half);
+
+namespace {
+
+#if INK_MMA
+__device__ __forceinline__ void ink_mma(float* c, const uint32_t* a, const uint32_t* b) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(b[0]));
+    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[2]), "r"(a[3]), "r"(b[1]));
+#else
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#endif
+}
+
+__device__ __forceinline__ void ink_ldmatrix(uint32_t* r, const half* p, bool trans) {
+    const unsigned a = (unsigned) __cvta_generic_to_shared(p);
+    if (trans)
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                     : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+    else
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                     : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+
+__device__ __forceinline__ uint32_t ink_half2(float lo, float hi) {
+    const __half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+// 16 bytes from global to shared, or zeros where `whole` is false: asynchronous from Ampere on (a thread's copies
+// are a group from ink_commit() on, waited for by ink_wait()), a plain load and store on Turing.
+__device__ __forceinline__ void ink_copy(half* dst, const half* src, bool whole) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 :: "r"((unsigned) __cvta_generic_to_shared(dst)), "l"(src), "r"(whole ? 16 : 0));
+#else
+    *reinterpret_cast<uint4*>(dst) = whole ? *reinterpret_cast<const uint4*>(src) : make_uint4(0, 0, 0, 0);
+#endif
+}
+
+__device__ __forceinline__ void ink_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
+
+template <int ahead> __device__ __forceinline__ void ink_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(ahead));
+#endif
+}
+
+// A key or value tile into the shared buffer: 8 halves a thread, the Q8_0 codes dequantized with their block's
+// scale.  `at` is the element offset of the first of the eight, so the two caches' element sizes do not matter here.
+template <bool Q8>
+__device__ __forceinline__ void ink_tile(half* dst, const void* base, size_t at, const half* sc, bool whole) {
+    if (!whole) {
+        *reinterpret_cast<uint4*>(dst) = make_uint4(0, 0, 0, 0);
+        return;
+    }
+    if constexpr (Q8) {
+        const int8_t* s8 = reinterpret_cast<const int8_t*>(base) + at;
+        const float k = __half2float(*sc);
+        for (int e = 0; e < 8; ++e) dst[e] = __float2half_rn((float) s8[e] * k);
+    } else {
+        ink_copy(dst, reinterpret_cast<const half*>(base) + at, whole);
+    }
+}
+
+// The Q.K and P.V products on the tensor cores, the softmax and the bias as ink_attend_rel_kernel has them.
+template <bool Q8>
+__global__ void __launch_bounds__(INK_MMA_THREADS)
+ink_attend_rel_mma_kernel(const float* __restrict__ q, const void* __restrict__ kc,
+                          const uint16_t* __restrict__ ks, const void* __restrict__ vc,
+                          const uint16_t* __restrict__ vs, const float* __restrict__ kqb,
+                          const float* __restrict__ tau, long long pos, int rows, float* __restrict__ out,
+                          int n_head, int kv_heads, float scale, int window, int n_keys, int ring) {
+#if INK_MMA
+    constexpr int DIM = INK_MMA_DIM, KEYS = INK_MMA_KEYS, ROW = INK_MMA_ROW;
+    extern __shared__ __align__(16) half sm[];
+    half(*kb)[KEYS][ROW] = reinterpret_cast<half(*)[KEYS][ROW]>(sm);
+    half(*vb)[KEYS][ROW] = reinterpret_cast<half(*)[KEYS][ROW]>(sm + 2 * KEYS * ROW);
+    const int h = blockIdx.x, row0 = blockIdx.y * INK_MMA_ROWS;
+    const int nr = rows - row0 < INK_MMA_ROWS ? rows - row0 : INK_MMA_ROWS;
+    if (nr <= 0) return;
+    const int per = n_head / kv_heads, hkv = h / per;
+    const size_t krow = (size_t) kv_heads * DIM, srow = (size_t) kv_heads * (DIM >> 5);
+    const int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int gid = lane >> 2, tig = lane & 3;
+    const int r0 = row0 + w * 16;          // the warp's first row
+    const int ra = r0 + gid, rb = r0 + gid + 8;   // the two rows a thread holds
+    const float sl = scale * 1.44269504f;    // the scores' base, in log2 units
+
+    // the queries: rounded to halves once, each row scaled by its own tau
+    uint32_t qa[8][4];
+    for (int k = 0; k < 8; ++k)
+        for (int i = 0; i < 2; ++i) {
+            const int r = i == 0 ? ra : rb;
+            const float f = r < rows && tau ? tau[r] * sl : sl;
+            for (int hi = 0; hi < 2; ++hi) {
+                float2 x = make_float2(0.0f, 0.0f);
+                if (r < rows)
+                    x = *reinterpret_cast<const float2*>(q + ((size_t) r * n_head + h) * DIM + 16 * k + 8 * hi + 2 * tig);
+                qa[k][i + 2 * hi] = ink_half2(x.x * f, x.y * f);
+            }
+        }
+
+    // The block's keys: from its first row's window to its last row's own position.  Both come from the
+    // block and not from this warp's rows, so that a warp whose rows run past `rows` (a block whose last
+    // rows are short) reads the block's range and not one beyond it -- the mask drops its own logits.
+    const int nb = rows - row0 < INK_MMA_ROWS ? rows - row0 : INK_MMA_ROWS;
+    const long long hi = pos + row0 + nb;
+    const long long lo = window > 0 ? (pos + row0 - window + 1 > 0 ? pos + row0 - window + 1 : 0) : 0;
+    const auto crow = [&](long long j) { return (size_t) (ring > 0 ? j % ring : j); };
+
+    const auto fetch = [&](int buf, long long k0) {
+        for (int i = threadIdx.x; i < KEYS * DIM / 8; i += INK_MMA_THREADS) {
+            const int r = i / (DIM / 8), c = 8 * (i % (DIM / 8));
+            const long long key = k0 + r;
+            const bool whole = key >= lo && key < hi;   // the others are zeros, which no weight reads
+            const size_t cr = crow(key), at = cr * krow + (size_t) hkv * DIM + c;
+            const size_t sb = cr * srow + (size_t) hkv * (DIM >> 5) + (c >> 5);
+            const half* sp = Q8 ? reinterpret_cast<const half*>(ks) + sb : nullptr;
+            const half* vp = Q8 ? reinterpret_cast<const half*>(vs) + sb : nullptr;
+            ink_tile<Q8>(&kb[buf][r][c], kc, at, sp, whole);
+            ink_tile<Q8>(&vb[buf][r][c], vc, at, vp, whole);
+        }
+        ink_commit();
+    };
+    const long long first = lo / KEYS * KEYS;
+    fetch(0, first);
+    int buf = 0;
+    // the sink's logit is zero and it carries no value, so a row starts there: largest 0, denominator 1
+    float m[2] = {0.0f, 0.0f}, l[2] = {1.0f, 1.0f}, o[16][4];
+    for (int n = 0; n < 16; ++n) o[n][0] = o[n][1] = o[n][2] = o[n][3] = 0.0f;
+    for (long long k0 = first; k0 < hi; k0 += KEYS, buf ^= 1) {
+        __syncthreads();   // the buffer the last tile was worked on in is free
+        if (k0 + KEYS < hi) {
+            fetch(buf ^ 1, k0 + KEYS);
+            ink_wait<1>();
+        } else {
+            ink_wait<0>();
+        }
+        __syncthreads();
+        float s[8][4];
+        for (int n = 0; n < 8; ++n) {
+            s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
+            for (int k = 0; k < 8; k += 2) {
+                uint32_t b[4];   // keys 8 n.., values 16 k.. and 16 (k + 1)..
+                ink_ldmatrix(b, &kb[buf][8 * n + lane % 8][16 * k + 8 * (lane / 8)], false);
+                ink_mma(s[n], qa[k], b);
+                ink_mma(s[n], qa[k + 1], b + 2);
+            }
+        }
+        // the bias by distance and the mask, a row's own position being the one its keys end at
+        for (int i = 0; i < 2; ++i) {
+            const int r = i == 0 ? ra : rb;
+            const long long own = pos + r;
+            float mx = -INFINITY;
+            for (int n = 0; n < 8; ++n)
+                for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                    const long long key = k0 + 8 * n + 2 * tig + j % 2;
+                    if (r >= rows || key > own || (window > 0 && key <= own - window)) {
+                        s[n][j] = -INFINITY;
+                    } else {
+                        const long long d = own - key;
+                        s[n][j] += 1.44269504f *
+                                   kqb[((size_t) r * n_head + h) * n_keys + (size_t) (d < n_keys ? d : n_keys - 1)];
+                    }
+                    mx = fmaxf(mx, s[n][j]);
+                }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 2));
+            const float now = fmaxf(m[i], mx), base = now == -INFINITY ? 0.0f : now;
+            const float f = exp2f(m[i] - base);
+            m[i] = now;
+            l[i] *= f;
+            for (int n = 0; n < 16; ++n) {
+                o[n][2 * i] *= f;
+                o[n][2 * i + 1] *= f;
+            }
+            for (int n = 0; n < 8; ++n)
+                for (int j = 2 * i; j < 2 * i + 2; ++j) {
+                    s[n][j] = exp2f(s[n][j] - base);
+                    l[i] += s[n][j];
+                }
+        }
+        for (int k = 0; k < 4; ++k) {   // keys 16 k..: the weights as an A fragment
+            const uint32_t pa[4] = {ink_half2(s[2 * k][0], s[2 * k][1]), ink_half2(s[2 * k][2], s[2 * k][3]),
+                                    ink_half2(s[2 * k + 1][0], s[2 * k + 1][1]),
+                                    ink_half2(s[2 * k + 1][2], s[2 * k + 1][3])};
+            for (int n = 0; n < 16; n += 2) {
+                uint32_t b[4];   // keys 16 k.., values 8 n.. and 8 (n + 1)..
+                ink_ldmatrix(b, &vb[buf][16 * k + lane % 8 + 8 * (lane / 8 % 2)][8 * n + 8 * (lane / 16)], true);
+                ink_mma(o[n], pa, b);
+                ink_mma(o[n + 1], pa, b + 2);
+            }
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 1);
+        l[i] += __shfl_xor_sync(0xffffffffu, l[i], 2);
+        const int r = i == 0 ? ra : rb;
+        if (r >= rows) continue;
+        float* y = out + ((size_t) r * n_head + h) * DIM + 2 * tig;
+        for (int n = 0; n < 16; ++n)
+            *reinterpret_cast<float2*>(y + 8 * n) = make_float2(o[n][2 * i] / l[i], o[n][2 * i + 1] / l[i]);
+    }
+#else
+    (void) q, (void) kc, (void) ks, (void) vc, (void) vs, (void) kqb, (void) tau, (void) pos, (void) rows,
+        (void) out, (void) n_head, (void) kv_heads, (void) scale, (void) window, (void) n_keys, (void) ring;
+#endif
+}
+#endif
+
+}  // namespace
+
+template <bool Q8>
+void ink_attend_rel_mma_launch(const float* q, const void* kc, const uint16_t* ks, const void* vc,
+                               const uint16_t* vs, const float* kqb, const float* tau, int64_t pos, int rows,
+                               float* out, int n_head, int kv_heads, float scale, int window, int n_keys, int ring,
+                               void* stream) {
+    if (rows <= 0) return;
+#if INK_MMA
+    static bool room = false;
+    if (!room) {
+        cudaFuncSetAttribute((const void*) ink_attend_rel_mma_kernel<Q8>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, INK_MMA_SMEM);
+        room = true;
+    }
+    const unsigned blocks = (unsigned) ((rows + INK_MMA_ROWS - 1) / INK_MMA_ROWS);
+    ink_attend_rel_mma_kernel<Q8><<<dim3((unsigned) n_head, blocks), INK_MMA_THREADS, INK_MMA_SMEM, cs(stream)>>>(
+        q, kc, ks, vc, vs, kqb, tau, pos, rows, out, n_head, kv_heads, scale, window, n_keys, ring);
+    if (const cudaError_t e = cudaGetLastError(); e != cudaSuccess)
+        throw std::runtime_error(std::string("ink_attend_rel mma: ") + cudaGetErrorString(e));
+#else
+    (void) q, (void) kc, (void) ks, (void) vc, (void) vs, (void) kqb, (void) tau, (void) pos, (void) rows,
+        (void) out, (void) n_head, (void) kv_heads, (void) scale, (void) window, (void) n_keys, (void) ring,
+        (void) stream;   // a card without the tensor cores' steps never launches it
+#endif
+}
+
 void ink_rel_table(const float* bias, int n_rel, const float* rcur, const float* sinks, const float* tau,
                    float* kqb, int rows, int n_head, int n_keys, void* stream) {
     const int64_t n = (int64_t) rows * n_head * n_keys;
@@ -940,6 +1223,12 @@ void ink_attend_rel(const float* q, const uint16_t* kc, const uint16_t* vc, cons
                     int64_t pos, int rows, float* out, int dim, int n_head, int kv_heads, float scale,
                     int window, int n_keys, int ring, void* stream) {
     if (rows <= 0) return;
+    // A prompt's rows are many: the tensor cores carry both products, and the scalar kernel the rest.
+    if (dim == INK_MMA_DIM && rows >= INK_MMA_MIN && ink_mma_on()) {
+        ink_attend_rel_mma_launch<false>(q, kc, nullptr, vc, nullptr, kqb, tau, pos, rows, out, n_head, kv_heads,
+                                          scale, window, n_keys, ring, stream);
+        return;
+    }
     // one accumulator a thread holds its dimension of the running sum in, so a dimension takes a thread
     if (dim <= 0 || dim > INK_THREADS)
         throw std::runtime_error("ink_attend_rel: the head dim must be 1 to " + std::to_string(INK_THREADS));
@@ -955,6 +1244,11 @@ void ink_attend_rel_q8(const float* q, const int8_t* kc, const uint16_t* ks, con
                        const float* kqb, const float* tau, int64_t pos, int rows, float* out, int dim, int n_head,
                        int kv_heads, float scale, int window, int n_keys, int ring, void* stream) {
     if (rows <= 0) return;
+    if (dim == INK_MMA_DIM && rows >= INK_MMA_MIN && ink_mma_on()) {
+        ink_attend_rel_mma_launch<true>(q, kc, ks, vc, vs, kqb, tau, pos, rows, out, n_head, kv_heads, scale,
+                                         window, n_keys, ring, stream);
+        return;
+    }
     if (dim <= 0 || dim > INK_THREADS || (dim % 32) != 0)
         throw std::runtime_error("ink_attend_rel_q8: head dim must be a multiple of 32 in 32.." +
                                  std::to_string(INK_THREADS));
