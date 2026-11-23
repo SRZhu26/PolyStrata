@@ -19,7 +19,8 @@ Companion documents: [inkling2.md](inkling2.md) (architecture and measured resul
 | --- | --- | --- |
 | `main` | `8d812d5c` | untouched |
 | `add-inkling2-mini` (PR head) | `59f21100` | untouched — the PR to `main` is unaffected by this work |
-| `inkling2-engine-local` | `9e33d64c` (plan build note), engine head `f159fe78` | **this work**, pushed to `origin` as its own branch |
+| `inkling2-engine-local` | `d5a21a41` (merge), engine `122cc988` | **this work**, pushed to `origin` as its own branch |
+| `inkling2-layer-major-wip` | `4a39c701` | the layer-major read, solved at 1.01× and off (§3.1) |
 
 `origin` is `https://github.com/SRZhu26/PolyStrata.git`, the user's own repository; there is no second remote. The engine
 work was committed to `inkling2-engine-local` precisely so it does not appear in the `add-inkling2-mini` → `main` pull
@@ -37,7 +38,7 @@ redirect.
 - Model under test: `Inkling-2-Mini-UD-Q4_K_XL.gguf`, 17,629,760,736 B (17.6 GB / 16.42 GiB), 24 physical layers.
 - KV cache: FP16 and `--kv q8_0` both measured (§4); Q8_0 is numerically sound (99.79% agreement) but slower at
   8K and 32K, and only pays off with `--kv-whole` at very long context.
-- Kernel unit tests: `poly_inkling2_test.exe`, **17/17 pass** against FP64 on the current binary.
+- Kernel unit tests: `poly_inkling2_test.exe`, **19/19 pass** against FP64 on the current binary (incl. `attend split`, `attend q8 spl`).
 - Tokenizer: `bench/tok-inkling2/tokenizer` (converted from the GGUF), used by the server.
 
 ---
@@ -78,7 +79,7 @@ weights, so its layer index does not name its KV. Window layers get a `ring = mi
 `seq_alloc`; the 8 full-context visits get a row at a time from the growing `kv_alloc` arena. This is why the KV arena
 grows during a long prefill (`cover()` at `end=1` → `rows=4096`, `end=5120` → `rows=8192`, `end=9216` → `rows=12288`).
 
-### 3.1 A layer-major read — attempted, off until the `blk 6` fault is fixed
+### 3.1 A layer-major read — solved, and measured at 1.01×, so off
 
 `Engine::read()` takes a prompt in calls of `rows_` (1,024) tokens, and with the experts outside the card each call copies
 every layer's experts through the staging buffer: 128 calls of 1,024 tokens at 128K copy all 14 GB **128 times**. So `read()`
@@ -86,16 +87,21 @@ has a layer-major path that runs layer 0 over every call, then layer 1 over ever
 layer's experts where the first one's copy left them (`moe_rows()`): the model is copied once for the whole read.
 
 `Inkling2` does **not** take it: `read_layer_major()` returns `false`. The four things that cross a call's layers — the depth
-attention's bank, the pass before's blocks and output, and the prelude's output — were staged per call in pinned host memory
-(`read_calls()` / `read_call()`), and the result **diverges from the call-at-a-time read at `blk 6`**: cosine 0.9969295 at
-`pos 0` and 0.9844632 at `pos 1024` on a 2,048-token prompt, growing to 0.8658 by `blk 22`. The prelude (`blk 0..5`) is
-clean at 0.99997, so the fault is a *fixed* error at the core entry, not chaotic amplification — the pass restart, the
-`n_bank_ = n_prelude_blocks_` cut, or `pass_messages()`, one of the three. Two layer-major runs agree exactly, so it is
-deterministic. The staging is 1.09–1.13× on prefill, which is why it is not worth holding the branch for.
+attention's bank, the pass before's blocks and output, and the prelude's output — are staged per call in pinned host memory
+(`read_calls()` / `read_call()`), and the result diverged from the call-at-a-time read at `blk 6` (cosine 0.9969295 at `pos 0`,
+0.9844632 at `pos 1024`, 0.8658 by `blk 22`).
 
-The whole attempt is kept on branch `inkling2-layer-major-wip` (`bb51e87a`), with `tools/layer_major_ab.py` and
-`STRATA_NO_LAYER_MAJOR` to reproduce the A/B. Re-land it only with the `blk 6` fault fixed and a cosine ≥ 0.99999 at
-`blk 6` and `blk 22` on both `pos 0` and `pos 1024`.
+**That fault was two sizing errors, not a state bug** (`4a39c701` on `inkling2-layer-major-wip`):
+1. `read_rows_` was clamped to `kReadCallSlots * rows_` (4,096) while every per-token scratch buffer in `assign_scratch()` is
+   sized for `rows_` and `bank_`'s stride is `rows_ * n_embd_` — so a 4,096-row call wrote past all of them.
+2. Even sized correctly the two reads chunk differently: layer-major read 8,192 as **8 calls of 1,024** where call-at-a-time took
+   **one call of 8,192**. The conv history and the window ring differ at 1 ulp between chunkings, and the looped core (3 passes
+   over `[6,18)`) amplifies that to a different token.
+
+With `read_rows_ = rows_` on both paths the two reads are **byte-identical** over 128 generated tokens at 8,192
+(`bench/lm-fix8k-b`: 163.6 vs 161.4 tok/s prefill, 9.7 vs 9.8 decode), so layer-major is **1.01×** — the 1.09–1.13× that
+motivated it was an artifact of the 4,096-row calls the buffers could not hold. **1% is not worth the staging memory**, so the
+path stays off; the complete attempt, `tools/layer_major_ab.py` and `tools/dump_diff.py` are on `inkling2-layer-major-wip`.
 
 ---
 

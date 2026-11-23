@@ -789,6 +789,21 @@ here — Step 4 (Tensor-Core MMA prefill) is the 5–10× prefill win. If you do
 3. **Verify**: Dump `l_out` at `blk 6` (passes 0, 1, 2) and `blk 22` on a 2,048-token prompt; cosine vs call-at-a-time
    must be **`>= 0.99999`** on both `pos 0` and `pos 1024`, and greedy text must match character-for-character.
 
+**Result — done, inside the cap, and the premise was wrong twice over (`4a39c701` on `inkling2-layer-major-wip`).**
+The fault was **not** the shared `n_bank_` / `prev_bank_` state the guess above describes. It was two sizing errors:
+1. `read_rows_` was clamped to `kReadCallSlots * rows_` (4,096), but every per-token scratch buffer in `assign_scratch()`
+   is sized for `rows_`, and `bank_`'s stride is `rows_ * n_embd_`. A 4,096-row call therefore wrote past them.
+2. Even sized correctly, the two reads chunk differently: layer-major read 8,192 as **8 calls of 1,024** where call-at-a-time
+   took **one call of 8,192**. The conv history and the window ring differ at 1 ulp between chunkings, and the looped core
+   (3 passes over `[6,18)`) amplifies that to a different token.
+
+With `read_rows_ = rows_` on both paths the two reads are **byte-identical** over 128 generated tokens at 8,192
+(`bench/lm-fix8k-b`, 163.6 vs 161.4 tok/s prefill, decode 9.7 vs 9.8), and layer-major is **1.01×**. The 1.09–1.13×
+that motivated this step was an artifact of the 4,096-row calls the buffers could not hold — those calls were faster
+precisely because they were wrong. **Conclusion: the layer-major path is correct and worth 1%, so it stays off**
+(`read_layer_major()` returns `false`; the attempt, `tools/layer_major_ab.py`, and `tools/dump_diff.py` are on
+`inkling2-layer-major-wip`). This closes Step 3.
+
 ### Step 4 — Tensor-Core MMA Prefill Attention (Biggest Prefill Win: 5–10× at 32K–128K)
 Right now, `ink_attend_rel` / `ink_attend_rel_q8` uses scalar FP32 FMA for `Q·K` and `P·V`, which is why 128K prefill
 takes 61.3 minutes. Replacing it with an MMA tensor-core kernel for `rows >= 32` removes the quadratic wall:
