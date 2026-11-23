@@ -134,6 +134,22 @@ and 2.5 GiB of RSS at 8K.
 A faster Q8_0 path is a kernel problem, not a format problem: an `__dp4a` integer dot over the per-32-block scales, as
 `quantize.cpp`'s vec dot does, instead of `__half2float` per element.
 
+### Step 4 — Re-measured after `f159fe78` (2026-11-23 09:44, FP16 KV)
+
+The `f159fe78` attention rewrite (Q cached in shared memory, one dimension per thread in the value pass, hoisted Q8_0
+scales, one Q8_1 quantization shared by `wq`/`rel`/`w_gate`/`sink_proj`) was built with
+`tools/build_poly_cuda_local.sh` (`BUILD_OK`) and all 17 FP64 kernel checks pass.
+
+| Context | Prefill (before → after) | Decode (before → after) | RSS (before → after) |
+| ---: | --- | --- | --- |
+| 8,198 | 136.3 → **171.3** (+25.7%) | 8.1 → **10.3** (+27.2%) | 12.46 → 11.20 GiB |
+| 32,015 | 77.3 → **97.5** (+26.1%) | 8.7 → **9.5** (+9.2%) | 14.88 → 11.74 GiB |
+
+Same 791 experts resident and the same 6,640 MiB VRAM in every row. The 8K pair is a clean A/B (both pinned a RAM pool);
+the 32K pair is confounded, because the `ee04f3d7` run took the unpinned path (defect §8.2) and the new one pinned
+10,319 MiB. This moves the decode baseline from 8.1 to **10.3 tok/s at 8K** and from 8.7 to **9.5 at 32K**; the
+`1.5×` vs `llama.cpp` gate is still undefined (no baseline exists), so §4's absolute floors should be re-based on these.
+
 ### Step 5 — Next High-Impact Speedups (After Step 4 Numbers)
 1. **Enable `read_layer_major()`** (move per-call depth-bank/message scratch to host): eliminates re-reading experts
    on every 1,024-token chunk (**4–10× faster 32K/128K prefill**).

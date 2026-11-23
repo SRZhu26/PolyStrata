@@ -19,7 +19,7 @@ Companion documents: [inkling2.md](inkling2.md) (architecture and measured resul
 | --- | --- | --- |
 | `main` | `8d812d5c` | untouched |
 | `add-inkling2-mini` (PR head) | `59f21100` | untouched — the PR to `main` is unaffected by this work |
-| `inkling2-engine-local` | `c4c87bd6`, then the commit that carries this document | **this work**, pushed to `origin` as its own branch |
+| `inkling2-engine-local` | `9e33d64c` (plan build note), engine head `f159fe78` | **this work**, pushed to `origin` as its own branch |
 
 `origin` is `https://github.com/SRZhu26/PolyStrata.git`, the user's own repository; there is no second remote. The engine
 work was committed to `inkling2-engine-local` precisely so it does not appear in the `add-inkling2-mini` → `main` pull
@@ -81,9 +81,9 @@ grows during a long prefill (`cover()` at `end=1` → `rows=4096`, `end=5120` �
 
 ## 4. Measured results
 
-All numbers: `UD-Q4_K_XL`, experts streamed from disk, RTX 5060 Laptop, one fresh server per row, same binary
-(`build-poly/strata-poly.exe` after the four fixes in §2). The FP16 and Q8_0 rows share the prompt, the context and the
-binary, so each pair is a clean A/B on the KV format alone.
+All numbers: `UD-Q4_K_XL`, experts streamed from disk, RTX 5060 Laptop, one fresh server per row. The FP16 and Q8_0 rows
+share the prompt, the context and the binary, so each pair is a clean A/B on the KV format alone. The tables in §4 and §4.3
+were measured on `ee04f3d7`; §4.4 re-measures the current binary (`f159fe78`) and supersedes them for speed.
 
 | Prompt tokens | KV | Prefill tok/s | Decode tok/s | VRAM peak | RSS peak | Experts in VRAM |
 | ---: | --- | ---: | ---: | ---: | ---: | ---: |
@@ -169,6 +169,28 @@ Q8_0 frees VRAM, so 38 more experts are resident and `outside_bytes_` drops just
 So a third of the Q8_0 decode loss is not the kernel at all: it is the heuristic taking the unpinned path because the freed VRAM
 moved it across a threshold. Pinning the budget recovers 0.4 tok/s and 2.5 GiB of RSS. This is defect §8.2.
 
+### 4.4 The `f159fe78` attention rewrite: +26% prefill, +27% decode at 8K
+
+`f159fe78` caches each block's queries in shared memory instead of re-reading them per key, makes the value pass one
+dimension per thread, hoists the Q8_0 block scales, and reuses one Q8_1 quantization of the layer input across `wq`, `rel`,
+`w_gate` and `sink_proj`. Re-measured on the rebuilt binary against the `ee04f3d7` numbers above, same prompt, same
+context, same 791 resident experts, same 6,640 MiB VRAM:
+
+| Context | Prefill (before → after) | Decode (before → after) | RSS (before → after) |
+| ---: | --- | --- | --- |
+| 8,198 | 136.3 → **171.3** (+25.7%) | 8.1 → **10.3** (+27.2%) | 12.46 → 11.20 GiB |
+| 32,015 | 77.3 → **97.5** (+26.1%) | 8.7 → **9.5** (+9.2%) | 14.88 → 11.74 GiB |
+
+The 8K pair is the clean one: both runs pinned a RAM expert pool (11,187 vs 9,913 MiB) and held the same 791 experts
+in the same 6,640 MiB, so the gain is the kernel. The 32K pair is **confounded** — the `ee04f3d7` run took the
+unpinned path (no pool, defect §8.2) and the `f159fe78` run pinned 10,319 MiB, so part of its +9.2% decode and its
+3.14 GiB RSS drop is the pool, not the rewrite. The RSS differences in both rows track the pool size rather than the kernel.
+
+The 17 FP64 kernel checks pass on the new binary, including `attend` (7.153e-07 of 2.364) and `attend ring` (5.364e-07 of
+2.908), which is the direct validation of the rewritten attention. End-to-end coherence was confirmed on the varied 6,185-token
+prompt (`bench/smoke-after-f159fe78`: 181.3 prefill / 9.7 decode, coherent reasoning). The synthetic repeated-passage
+prompts still loop at 8K and 32K, exactly as documented in §8.1 — that is content-driven, not a regression.
+
 ---
 
 ## 5. Gates against the plan's criteria
@@ -176,7 +198,7 @@ moved it across a threshold. Pinning the budget recovers 0.4 tok/s and 2.5 GiB o
 | Gate | Criterion | Result |
 | --- | --- | --- |
 | Peak VRAM | ≤ 7.5 GiB (7,680 MiB) | **pass** — 6,640 MiB in every run |
-| Peak RAM | ≤ 26 GiB | **marginal** — 25.36 at 8K FP16 and 25.25 at 10.9K FP16 pass; 26.46 at 8K Q8_0, 26.35/26.79 at 32K and 26.23 at 10.9K Q8_0 exceed it by < 1 GiB. The gate is on system RAM including the file cache, so it moves with what the OS keeps warm, not with the engine alone |
+| Peak RAM | ≤ 26 GiB | **pass on `f159fe78`** — process RSS 11.20 GiB at 8K and 11.74 at 32K; system peak 25.36/25.25 GiB at 8K/10.9K FP16. The earlier marginal rows (26.2–26.8) were all `ee04f3d7` runs that either took the unpinned path (§8.2) or ran Q8_0 |
 | Decode vs `llama.cpp` | ≥ 1.5× same-day baseline | **not evaluable** — no baseline exists (§6) |
 | Cosine per stage | ≥ 0.999 | **blocked** — the FP64 oracle dequantizes only NVFP4 and Q8_0 (`ref_blk0.py:44,85`) and the only weights on disk are `UD-Q4_K_XL` (Q4_K) |
 | Kernel parity | vs FP64 | **pass** — `poly_inkling2_test`, 17 checks |
