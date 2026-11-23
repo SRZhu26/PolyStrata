@@ -5,6 +5,7 @@
 // anything and does not use the tensor cores: each kernel is the plain arithmetic the graph describes, so
 // that a mismatch against the reference is a bug in this code and not in an optimization.
 #include "strata/poly/kernels.hpp"
+#include "strata/kernels/dp4a.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -338,13 +339,16 @@ __global__ void ink_attend_rel_kernel(const float* __restrict__ q, const half* _
 }
 
 // Same online-softmax relative-position attention, reading Q8_0 K/V caches (32 int8 codes + 1 fp16 scale per block).
+// Quantizes the block's queries to int8 per 32-element block once into shared memory and uses STRATA_DP4A (4 int8
+// MACs/instruction, 128-byte coalesced warp loads of K) for the Q.K sweep.
 __global__ void ink_attend_rel_q8_kernel(const float* __restrict__ q, const int8_t* __restrict__ kc,
                                          const half* __restrict__ ks, const int8_t* __restrict__ vc,
                                          const half* __restrict__ vs, const float* __restrict__ kqb,
                                          const float* __restrict__ tau, long long pos, int rows,
                                          float* __restrict__ out, int dim, int n_head, int kv_heads, float scale,
                                          int window, int n_keys, int ring) {
-    __shared__ float qs[INK_ATTEND_ROWS][INK_THREADS];
+    __shared__ int qq4[INK_ATTEND_ROWS][INK_THREADS / 4];
+    __shared__ float qscale[INK_ATTEND_ROWS][INK_THREADS / 32];
     __shared__ float sc[INK_ATTEND_ROWS][INK_ATTEND_TILE];
     __shared__ float wt[INK_ATTEND_ROWS][INK_ATTEND_TILE];
     __shared__ float corr_of[INK_ATTEND_ROWS];
@@ -361,9 +365,19 @@ __global__ void ink_attend_rel_q8_kernel(const float* __restrict__ q, const int8
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int nwarps = int(blockDim.x) >> 5;
 
-    for (int r = 0; r < nr; ++r) {
-        const float* qr = q + ((size_t) (row0 + r) * n_head + h) * dim;
-        if (threadIdx.x < dim) qs[r][threadIdx.x] = qr[threadIdx.x];
+    // Quantize each 32-element block of this block's queries to int8 once before the key-tile loop.
+    for (int rb = warp; rb < nr * blocks_per_head; rb += nwarps) {
+        const int r = rb / blocks_per_head;
+        const int b = rb - r * blocks_per_head;
+        const int d = (b << 5) + lane;
+        const float v = q[((size_t) (row0 + r) * n_head + h) * dim + d];
+        const float amax = ink_warp_max(fabsf(v));
+        const float qsc = amax > 0.0f ? amax / 127.0f : 0.0f;
+        const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+        int qv = __float2int_rn(v * inv);
+        qv = qv > 127 ? 127 : (qv < -127 ? -127 : qv);
+        ((int8_t*) qq4[r])[d] = (int8_t) qv;
+        if (lane == 0) qscale[r][b] = qsc;
     }
     __syncthreads();
 
@@ -390,6 +404,7 @@ __global__ void ink_attend_rel_q8_kernel(const float* __restrict__ q, const int8
         sum_of[r] = 1.0f;
     }
 
+    const int words_per_head = dim >> 2;   // 32 int32 words for dim = 128 (1 iteration per warp)
     const int last = hi[nr - 1];
     for (int64_t j0 = lo[0]; j0 <= last; j0 += INK_ATTEND_TILE) {
         const long long left = (long long) last + 1 - j0;
@@ -402,13 +417,14 @@ __global__ void ink_attend_rel_q8_kernel(const float* __restrict__ q, const int8
                 continue;
             }
             const size_t cr = crow(j);
-            const int8_t* kr = kc + cr * krow + (size_t) hkv * dim;
+            const int* kr4 = (const int*) (kc + cr * krow + (size_t) hkv * dim);
+            const int* qr4 = qq4[r];
             const half* ksr = ks + cr * srow + (size_t) hkv * blocks_per_head;
-            const float* qr = qs[r];
             float s = 0.0f;
-            for (int b = 0; b < blocks_per_head; ++b) {
-                const int d = (b << 5) + lane;
-                s += (qr[d] * (float) kr[d]) * __half2float(ksr[b]);
+            for (int w = lane; w < words_per_head; w += 32) {
+                const int b = w >> 3;   // 8 int32 words = 32 int8 elements = 1 Q8_0 block
+                const int dp = STRATA_DP4A(qr4[w], kr4[w], 0);
+                s += (float) dp * (qscale[r][b] * __half2float(ksr[b]));
             }
             s = ink_warp_sum(s);
             if (lane == 0) {

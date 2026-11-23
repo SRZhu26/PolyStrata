@@ -555,3 +555,115 @@ python tools/test_strata_mcp.py
     RTX 20/30/40 fall back to their existing MMA/`dp4a` paths automatically.
   - AMD HIP wavefront (32 vs 64 lanes) and dot-product intrinsics need thin `#if defined(__HIPCC__)` guards in the
     `inkling2` kernels, which they do not have yet.
+
+---
+
+## 7. 128K Agentic Coding Optimization Playbook (RTX 5060 Laptop — 8 GB VRAM, 32 GB RAM)
+
+Agentic coding (Cursor / Claude Code / Cline / pi / OpenHands) has a different profile from synthetic 128K single-turn
+benchmarks: Turn 1 prefills the system prompt + repo context (4K–16K), and Turns 2..50 are incremental appends of
+200–2,000 tokens reusing the cached KV prefix (`--pinned-session` / conversation cache). However, at **128K filled
+context** on an 8 GB VRAM card, **FP16 KV takes 4.31 GiB and evicts 100% of experts from VRAM (`0 of 3,072`)**,
+whereas **Q8_0 KV takes 2.29 GiB and keeps ~405–550 experts (~1.9–2.1 GiB) resident**.
+
+The goal is therefore: **make `--kv q8_0` as fast as or faster than FP16**, maximize VRAM expert hit rate, and remove
+the remaining prefill/decode walls.
+
+### 7.1 `__dp4a` Integer Dot Product in `ink_attend_rel_q8_kernel` *(Implemented)*
+- **What changed** (`src/poly/inkling2_kernels.cu`, includes `include/strata/kernels/dp4a.hpp`):
+  - Before the key-tile loop, each warp quantizes its block's `nr` queries into shared memory (`__shared__ int qq4[8][64]`
+    and `__shared__ float qscale[8][8]`, 32-element blocks, using **8× less shared memory** than FP32 `qs`).
+  - Inside the `Q·K` loop, each lane loads one 32-bit packed word (`4 × int8_t`, 128-byte coalesced warp transaction
+    for `dim = 128`), executes **`STRATA_DP4A(qr4[w], kr4[w], 0)`** (1 instruction for 4 MACs), multiplies by
+    `qscale[r][b] * __half2float(ksr[b])`, and reduces across the warp.
+  - For `dim = 128`, the `Q·K` inner loop runs **1 iteration per key** instead of 4 scalar iterations.
+- **Verify after rebuild**:
+  ```powershell
+  # 1. Rebuild (in x64 Native Tools Command Prompt for VS if reg.exe is blocked in agent shell):
+  cmake --build build-poly --config Release --target strata-poly poly_inkling2_test -j
+  .\build-poly\poly_inkling2_test.exe
+
+  # 2. Verify Q8_0 vs FP16 agreement (>= 97%) after int8 query quantization:
+  python tools/kv_agree.py --model <gguf> --bin build-poly\strata-poly.exe `
+    --ref fp16 --kv q8_0 --prompts 5 --max-new 128 --max-context 2048 --min-agree 0.97
+
+  # 3. Clean A/B with pinned RAM pool (--ram-experts-mib avoids the §8.2 auto -1 flip):
+  python tools/bench_128k_local.py --out bench/dp4a-q8-8k  --models q4xl=<gguf> --engines strata `
+    --prompt bench/prompt-8k.txt  --context 8192  --kv q8_0 --ram-experts-mib 10240 --gen 256
+  python tools/bench_128k_local.py --out bench/dp4a-q8-32k --models q4xl=<gguf> --engines strata `
+    --prompt bench/prompt-32k.txt --context 32768 --kv q8_0 --ram-experts-mib 10240 --gen 256
+  ```
+
+### 7.2 Expert Caching, Swapping & Quantization Levers (Highest Decode ROI — Zero C++ Changes)
+At ~10 tok/s decode on `UD-Q4_K_XL`, ~65–70% of decode time is cold expert streaming from RAM/swap (only 791 of 3,072
+experts = 25.7% resident).
+
+1. **Switch from `UD-Q4_K_XL` (17.63 GB) → `UD-IQ4_XS` (15.73 GB, KLD 0.0109, 0 non-NVFP4 scales)**:
+   - Eliminates the 0.7 GiB Windows swap, reduces RAM pressure by ~2 GB, fits ~12–15% more experts in VRAM, and reads
+     11% fewer bytes per CPU miss.
+   - For maximum speed, also test `UD-Q3_K_XL` (13.63 GB; note 8 non-NVFP4 `.scale` layers — bind them in
+     `Inkling2::load_layer()` after `load_moe(il, false)` if their values are != 1.0).
+2. **Warm-seed the VRAM cache with a coding routing profile (`--profile`)**:
+   - Inkling's core layers `blk.6..17` run 3× per token so `Engine::use_[]` naturally weights them 3×.
+   - Record a coding session profile (`--profile bench/inkling2_code.profile`) and pass it on server startup so the
+     8 GB VRAM cache starts pre-populated with hot coding experts instead of warming up from scratch (ninfer-all
+     reached **76.7%** VRAM hit rate and **33.1 tok/s** on desktop RTX 5060 8 GB with `UD-IQ4_XS` + profile).
+3. **Always pin `--ram-experts-mib` (e.g. `10240`) and test `--vram-pool` + `--pinned-session`**:
+   - `--ram-experts-mib 10240` avoids the §8.2 knife-edge flip to `-1` (keeps the pinned RAM pool + 8 prefetch threads).
+   - `--vram-pool` lets KV and the expert cache trade pages cleanly inside one pool as a 128K session grows.
+   - `--pinned-session` keeps the coding agent's system prompt + tool definitions pinned across turns.
+4. **Optional `--skip-weight` tuning**:
+   - With 384 expert evaluations/token (48 visits × top-8), test small `--skip-weight` values (e.g. `0.02`–`0.05`) on
+     coding prompts to skip tiny-weight cold CPU misses while checking that coding accuracy does not regress.
+
+### 7.3 Split-K Flash-Decoding for `rows == 1` at 64K–128K (How to Implement)
+- **Bottleneck**: During decode (`rows = 1`, `nr = 1`), `ink_attend_rel` / `ink_attend_rel_q8` launches only
+  **24 blocks total** (`gridDim = (24, 1)`), leaving most RTX 5060 SMs idle while each head scans up to 131,072 keys
+  serially.
+- **How to implement** (`src/poly/inkling2_kernels.cu` + `src/poly/inkling2.cpp`):
+  1. In `Inkling2::assign_scratch()`, allocate a tiny split scratch buffer:
+     - `constexpr int kAttnSplits = 16;`
+     - `split_out_ = fbuf((size_t) kAttnSplits * n_head_ * head_dim_);` (192 KB)
+     - `split_ml_  = fbuf((size_t) kAttnSplits * n_head_ * 2);` (`max`, `sum` per split, 3 KB)
+  2. When `rows == 1 && !B.swa && pos >= 2048`:
+     - **Kernel 1 (`ink_attend_rel_q8_split_kernel`)**: Launch `dim3(n_head, kAttnSplits)` (384 blocks!). Block `(h, sp)`
+       scans keys `[sp * chunk, min((sp + 1) * chunk, pos + 1))` using the exact same `__dp4a` inner loop (with the
+       sink's `m = 0, sum = 1` applied **only** on `sp == 0`, and `m = -INFINITY, sum = 0` on `sp > 0`), writing
+       `(m_sp, sum_sp)` to `split_ml_` and unnormalized `acc_sp` to `split_out_`.
+     - **Kernel 2 (`ink_attend_split_reduce_kernel`)**: Launch `n_head` blocks of 128 threads; compute global
+       `m_all = max_sp(m_sp)`, rescale each split by `expf(m_sp - m_all)`, sum `acc_sp` and `sum_sp`, write `out`.
+  3. **Verify**: Compare split output vs non-split output in `poly_inkling2_test` at `pos = 4096` (max abs diff `< 1e-5`).
+
+### 7.4 Enabling `read_layer_major()` (3–6× Faster 32K/128K Prefill — How to Implement)
+- **Bottleneck**: With `read_layer_major() == false`, a 128K prompt runs 128 separate 1,024-token `eval()` calls,
+  re-reading all 14–16 GB of experts from RAM **128 times** (~2 TB of traffic).
+- **How to implement**:
+  1. In `Inkling2`, each call's cross-layer state (beside `r_`) is `bank_` (`5 × rows × 2304 × 4 B ≈ 45 MB`),
+     `prev_bank_` (`45 MB`), and `prev_out_` (`9 MB`) — ~100 MB per call at `rows = 1024`.
+  2. In `Engine::read()` (or an `Inkling2` hook called around `layer(il, call.m)` in `read()`), allocate a pinned host
+     slot per call (`n_calls` up to e.g. 4–8 calls = 400–800 MB host RAM) to save/restore `(bank_, prev_bank_, prev_out_,
+     n_bank_, n_prev_bank_)` alongside `r_` on the async copy stream `rs_`.
+  3. Return `true` from `Inkling2::read_layer_major()` (capping `read_rows_` to e.g. `4 * rows_` = 4,096 tokens so host
+     staging stays under 400 MB) and verify identical output vs `read_layer_major() == false` on an 8,192-token prompt.
+
+### 7.5 Tensor-Core MMA Prefill + Pass-Aware CUDA Graphs (`L.fixed = true`)
+1. **Pass-aware CUDA Graphs (`L.fixed = true`)**:
+   - Add `virtual int tail_key() const { return 0; }` on `Engine` (`steps_[cur_step_].pass` in `Inkling2`), key
+     `L.tail` / `L.shared` / `L.card_moe` by `rec + tail_key() * recs`, and combine `head_key` with `room_key(n)` on
+     global layers as `pass * (max_room_key + 1) + room_key(n)`.
+   - **Close defect §8.3 first**: invalidate recorded CUDA graphs (`passes_.clear()` / destroy `cudaGraphExec_t` handles
+     in `L.heads`, `L.tail`, `L.card_moe`) inside `shrink_cache()` and `resize_card_cache()` on CUDA (currently only
+     done under `#if defined(STRATA_GPU_METAL)`).
+2. **Tensor-Core MMA Prefill Attention**:
+   - Replace scalar FP32 `Q·K` / `P·V` in `ink_attend_rel` for `rows >= 64` with a FlashAttention-style MMA tile
+     (following `src/poly/fattn_mma.cuh`), folding the `kqb` relative-position bias into the `S` accumulator tile
+     before softmax.
+
+### 7.6 Agentic Correctness Gates (Before Daily-Driving on Real Repos)
+1. **End-to-end cosine gate on `UD-Q4_K_XL`**: `UD-Q4_K_XL` has **zero `Q4_K` tensors** (pure `NVFP4`/`Q8_0` experts
+   and `Q8_0`/`BF16`/`F32` non-experts), so `STRATA_DUMP_BIN` + `tools/dump_cos.py` vs `tools/ref_core.py` is **not**
+   blocked — run it now to confirm cosine `>= 0.999` at `blk.6`, `blk.23`, and final logits.
+2. **Tokenizer parity**: Verify `tools/strata_tokenizer.py` (`GPT4O_PATTERN`) byte-for-byte on 20 mixed coding strings
+   (Python/C++/TS, JSON, Unicode, tabs/indent) against `transformers` or `llama-tokenize`.
+3. **Tool-call & reasoning parsing**: Add tests in `serve/test_models.py` confirming `<|content_thinking|>` maps to
+   `reasoning_content` and `<|content_invoke_tool_json|>` maps cleanly to OpenAI `tool_calls`.

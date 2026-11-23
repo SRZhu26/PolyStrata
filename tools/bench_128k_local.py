@@ -162,7 +162,10 @@ def run_one(engine, model, a, prompt, out):
                "-np", "1", "--no-webui", "--jinja", "-c", str(a.context),
                "-ctk", kv, "-ctv", kv, "-fa", "on", "--fit-target", "1024"] + a.llama_args
     else:
-        cfg = strata_config(model, out, a.tokenizer, a.context, a.kv, a.threads, a.strata_args)
+        strata_args = list(a.strata_args)
+        if a.ram_experts_mib is not None and "--ram-experts-mib" not in strata_args:
+            strata_args += ["--ram-experts-mib", str(a.ram_experts_mib)]
+        cfg = strata_config(model, out, a.tokenizer, a.context, a.kv, a.threads, strata_args)
         cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata",
                "--config", str(cfg), "--port", str(PORT)]
     env = dict(os.environ, PYTHONIOENCODING="utf-8",
@@ -212,6 +215,8 @@ def main() -> int:
                     help="sampling temperature; 0 is the engine's greedy default")
     ap.add_argument("--kv", default="q8_0")
     ap.add_argument("--threads", type=int, default=16)
+    ap.add_argument("--ram-experts-mib", type=int, default=None,
+                    help="explicit --ram-experts-mib for strata-poly (avoids the auto -1 unpinned flip on Q8_0)")
     ap.add_argument("--llama-args", nargs="*", default=[])
     ap.add_argument("--strata-args", nargs="*", default=[])
     a = ap.parse_args()
