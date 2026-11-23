@@ -1,0 +1,14 @@
+[
+ {
+  "prompt_batch": 2048,
+  "prompt_n": 32015,
+  "prompt_ms": 82246.0,
+  "prompt_tps": 389.3,
+  "pred_n": 4,
+  "pred_tps": 8.8,
+  "vram_peak_mib": 6638,
+  "rss_peak_gib": 10.37,
+  "load_s": 12.2,
+  "status": "ok"
+ }
+]

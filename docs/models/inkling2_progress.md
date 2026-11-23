@@ -288,6 +288,33 @@ wall is gone rather than merely shortened. The plan's Step 4 target of "400+ tok
 and 85% of a 128K one. The fit was wrong: removing attention entirely would have left 37.5 s at 8K, and the measurement is
 23.6 s, so attention was a larger share of prefill than the fit claimed at every length.
 
+### 4.7 Where the remaining 23.6 s goes: `--prompt-batch` separates arithmetic from expert movement
+
+The MMA kernel removed attention as the wall; what is left is the rest of the pass, and the one binary that separates its two
+candidates is `--prompt-batch` — a per-chunk copy of the experts is amortized over more tokens by a wider batch, arithmetic is
+not. One prompt, one fresh server per cell, four generated tokens (`tools/ink_prefill_probe.py`):
+
+| `--prompt-batch` | 8K prefill tok/s | ms/token | 32K prefill tok/s | VRAM peak |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 246.1 | 4.06 | — | 6,638 MiB |
+| 1,024 (default) | 298.1 / 322.2 | 3.36 / 3.10 | 328.3 | 6,638 MiB |
+| 2,048 | **378.2** | **2.64** | **389.3** | 6,638 MiB |
+| 4,096 (the flag's maximum) | 352.1 | 2.84 | — | 6,636 MiB |
+
+`t(b) = 2.17 ms of arithmetic + 0.95 ms × (1024 / b) of expert movement` fits the 512 and 2,048 cells to 0.5% and
+predicts the 1,024 cell at 3.12 ms, which the second 1,024 run measured at 3.10. So at the default batch **about 30% of an 8K
+prefill is the experts moving over PCIe and 70% is arithmetic**, and the movement halves each time the batch doubles. `--prompt-batch
+2048` is therefore a free **1.17× at 8K and 1.19× at 32K** with no VRAM cost; 4,096 is slower (2.84 ms), and 8,192 is
+rejected at startup (`a prompt batch is 1 to 4096 tokens`).
+
+The arithmetic that is left is not a kernel to swap in: it is the MoE and dense GEMMs running at ≈ 4.4 TFLOPS effective (the pass
+needs ≈ 9.6 GFLOPs a token from the shapes in the plan's §1.3, 6.1 of them routed experts at top-8 of 128). That is the next
+prefill item, and it is worth more than attention was before the MMA kernel.
+
+Decode is untouched by all of this, and it is at a different wall: with 791 of 3,072 physical experts resident, a token reads ≈ 1.2 GB
+of non-resident experts plus ≈ 0.64 GB of dense weights, and 10 tok/s is ≈ 18 GB/s — the PCIe 4.0 x8 ceiling of a laptop card. So
+decode cannot be fixed by a faster kernel; only by reading fewer bytes a token (DSpark, Step 7) or holding more experts.
+
 ---
 
 ## 5. Gates against the plan's criteria

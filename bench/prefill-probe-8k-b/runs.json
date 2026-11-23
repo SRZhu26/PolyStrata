@@ -1,0 +1,26 @@
+[
+ {
+  "prompt_batch": 2048,
+  "prompt_n": 8198,
+  "prompt_ms": 21673.5,
+  "prompt_tps": 378.2,
+  "pred_n": 4,
+  "pred_tps": 9.3,
+  "vram_peak_mib": 6638,
+  "rss_peak_gib": 10.12,
+  "load_s": 13.7,
+  "status": "ok"
+ },
+ {
+  "prompt_batch": 1024,
+  "prompt_n": 8198,
+  "prompt_ms": 25440.1,
+  "prompt_tps": 322.2,
+  "pred_n": 4,
+  "pred_tps": 8.8,
+  "vram_peak_mib": 6638,
+  "rss_peak_gib": 9.47,
+  "load_s": 13.7,
+  "status": "ok"
+ }
+]

@@ -1,0 +1,25 @@
+[
+ {
+  "prompt_batch": 4096,
+  "prompt_n": 8198,
+  "prompt_ms": 23282.2,
+  "prompt_tps": 352.1,
+  "pred_n": 4,
+  "pred_tps": 7.3,
+  "vram_peak_mib": 6636,
+  "rss_peak_gib": 11.27,
+  "load_s": 12.2,
+  "status": "ok"
+ },
+ {
+  "prompt_batch": 8192,
+  "prompt_n": null,
+  "prompt_ms": null,
+  "prompt_tps": null,
+  "pred_n": null,
+  "pred_tps": null,
+  "vram_peak_mib": null,
+  "rss_peak_gib": null,
+  "status": "failed: server exited rc=1 (see C:\\Users\\zshua\\PolyStrata\\bench\\prefill-probe-8k-c\\server-pb8192-1795444985.log)"
+ }
+]

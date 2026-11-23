@@ -869,6 +869,27 @@ The 128K target in point 4 (~8–15 min) was met at 8.8 min, and the 32K one (**
 the measurement is 23.6 s. Attention was therefore a larger share of prefill than the fit said at every length, and the 128K
 quadratic wall is now gone rather than merely shortened: 247.4 tok/s at 130.7K is 7× the old figure and within 1.35× of the 32K one.
 
+**Where the remaining time goes, and the first free win (`tools/ink_prefill_probe.py`).** `--prompt-batch` separates the
+two candidates for what is left, because a per-chunk copy of the experts is amortized over more tokens by a wider batch and
+arithmetic is not. One prompt, four generated tokens, one fresh server per cell:
+
+| `--prompt-batch` | 8K prefill tok/s | ms/token | 32K prefill tok/s |
+| ---: | ---: | ---: | ---: |
+| 512 | 246.1 | 4.06 | — |
+| 1,024 (default) | 298.1 / 322.2 | 3.36 / 3.10 | 328.3 |
+| 2,048 | **378.2** | **2.64** | **389.3** |
+| 4,096 (the flag's maximum) | 352.1 | 2.84 | — |
+
+`t(b) = 2.17 ms of arithmetic + 0.95 ms × (1024 / b) of expert movement` fits the 512 and 2,048 cells and predicts the
+1,024 cell at 3.12 ms (measured 3.10). So ≈ 30% of an 8K prefill at the default batch is the experts moving over PCIe and 70%
+is arithmetic, and **`--prompt-batch 2048` is a free 1.17× at 8K and 1.19× at 32K** (VRAM unchanged, 6,638 MiB). 4,096 is
+slower and 8,192 is rejected at startup, so 2,048 is the ceiling of this knob.
+
+The arithmetic left is the MoE and dense GEMMs at ≈ 4.4 TFLOPS effective (≈ 9.6 GFLOPs a token from §1.3's shapes, 6.1 of
+them routed experts), which is now the largest prefill item. Decode is at a different wall entirely: ≈ 1.2 GB of non-resident expert
+weights plus 0.64 GB of dense weights a token against 10 tok/s is ≈ 18 GB/s, the PCIe 4.0 x8 ceiling, so only fewer bytes a token
+(DSpark) or more resident experts can move it.
+
 
 ### Step 5 — Pass-Aware CUDA Graphs (`L.fixed = true`) + Graph Invalidation (+20–30% Decode)
 1. **Close defect §8.3 first** (`src/poly/engine.cpp`):
