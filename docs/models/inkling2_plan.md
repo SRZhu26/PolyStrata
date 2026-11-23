@@ -976,14 +976,41 @@ for i in 1..7:
 separate 2304-wide head. `markov_w2` is `[256, n_vocab_draft]` in llama.cpp but this GGUF has only
 `dspark_hidden_out` + `dspark_norm`, so the `w2` bias term is the unfolded path here.
 
-**The discrepancy to resolve before writing code.** llama.cpp declares
+**The `joint_proj` width, resolved from the file's own tensor list.** llama.cpp declares
 `dspark_joint_proj = {n_embd + 2*rank, 3*rank}` = `[2816, 768]`, and its `joint` is
-`concat(concat(state, w1_prev), hidden)` = `256 + 256 + 2304`. This drafter's tensor is **`[5120, 768]`**, and
-`5120 - 512 = 4608 = 2 × 2304`. So the Inkling 2 variant conditions the Markov chain on **two** 2304-wide vectors —
-the drafter's own block hidden *and* the target's fused hidden (`dspark_fuse [4,4]` over the four tapped layers) —
-which the DSV4/Mistral code does not do. That is the one inference in this spec that must be validated first, and the
-cheapest way is a two-position check: force `joint`'s last 2304 to the target state and compare against the BF16
-reference drafter's own logits.
+`concat(concat(state, w1_prev), hidden)` = `256 + 256 + 2304`. This drafter's is **`[5120, 768]`**, and
+`5120 = 2304 + 2304 + 512 = 2·n_embd + 2·rank`. So the Inkling 2 variant conditions the joint projection on
+**two** 2304-wide vectors plus the 512-wide Markov state, which the DSV4/Mistral code does not do. The output is
+`768 = 3·rank` = (gate 256, cand 256, Markov-in 256), exactly as llama.cpp's `build_dspark_markov_head` splits it.
+
+The full inventory (54 tensors, 402,278,560 B, `dflash` arch, `Q8_0` blocks + `F32` norms + `BF16` linears) is what
+resolves it — this drafter is **not** the variant `src/models/dspark.cpp` implements, and it carries five tensors that file
+neither loads nor names:
+
+| Tensor | Shape | What it is |
+| --- | --- | --- |
+| `dspark_fuse.weight` | `[4, 4]` | the learned fusion of the four tapped target layers' hidden states |
+| `joint_proj.{weight,bias}` | `[5120, 768]`, `[768]` | the joint projection: **5120 = 2·2304 + 2·256** in, `3·256` out |
+| `markov_w1.weight` | `[256, 201024]` | `(unembed ∘ hidden_out)`, the folded Markov input |
+| `markov_w1` / `dspark_hidden_out` / `dspark_norm` | `[256,2304]`, `[2304]`, `[2304]` | the folded head and its norm |
+| `mask_embd.weight` | `[2304]` | the masked-token embedding (there is no `token_embd` table) |
+| `output_norm.weight` | `[2304]` | the block stack's final norm |
+| `blk.N.attn_{q,k,v,output}` | `[2304,3072]`, `[2304,1024]` ×2, `[3072,2304]` | 24 heads over 8 kv, `head_dim` 128 |
+| `blk.N.attn_{q,k}_norm` | `[128]` | per-head RMS on q and k |
+| `blk.N.attn_{k,v}_ctx` | `[2304, 1024]` ×2 | **the context KV projections the reference does not have** |
+| `blk.N.attn_k_ctx_norm` | `[128]` | per-head RMS on the context key |
+| `blk.N.dflare_norm.weight` | `[2304]` | **the norm on the fused target context the reference does not have** |
+| `blk.N.ffn_{gate,up,down}` | `[2304,9216]` ×2, `[9216,2304]` | SwiGLU, `intermediate_size` 9216 |
+
+`dspark.attention.causal = False` and `sliding_window_pattern = [True, False, True]` confirm block diffusion: layer 1 is
+global, layers 0 and 2 are windowed at 1,024, and a block's 8 positions attend each other. `final_logit_softcapping = 30.0`
+must be applied to the drafter's logits, and `sample_from_anchor = False` with `has_confidence_head = False` means the
+7 non-anchor positions are sampled from the head rather than accepted on a confidence score.
+
+**So Step 7 is a port of a variant this repo has no reference for.** The two candidate routes are (a) find the
+Inkling-2-Mini DSpark reference upstream, or (b) validate the `joint_proj` split empirically first, since it is the only
+inference left: force `joint`'s second 2304 to the target state, its third block to the `dflare_norm` output, and compare the
+drafter's logits at two positions against the BF16 reference drafter.
 
 **Integration points that already exist** (so the port is the forward pass, not the plumbing): `opt_.draft_model` /
 `dg_` (`engine.cpp:2678`), `drafts()`, `guesses_at_once()` (`engine.hpp:313-315`, the block-at-once path DSpark wants),
