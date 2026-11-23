@@ -689,6 +689,11 @@ Do **not** hold back working Split-K behind the broken `read_layer_major()` path
    git push fork inkling2-engine-local
    ```
 
+**Done** — `122cc988`, merged with this plan's `b0e88f70`+`412dc796`. The 19 checks pass (`attend split` 3.278e-07 of
+0.449, `attend q8 spl` 2.086e-07 of 0.423); the layer-major attempt is on `inkling2-layer-major-wip` (`bb51e87a`) and
+`read_layer_major()` returns `false`. The pass-restart fix (every pass after the first starts from the prelude's output) went in
+with it, as did the end-to-end cosine gate (§4.5, `blk.6` 0.999988758).
+
 ### Step 2 — Maximize Dedicated dGPU VRAM Utilization + `UD-IQ4_XS` + `--expert-profile` (Biggest Immediate Decode Win)
 **Why VRAM stopped at 6,640 / 8,151 MiB (~1,511 MiB unused):**
 On this laptop, Windows desktop/display runs on the Intel Core Ultra 9 275HX iGPU, so the RTX 5060 dGPU (8,151 MiB)
@@ -733,6 +738,39 @@ python tools/bench_128k_local.py --out bench/iq4xs-128k-prof --models iq4xs=<pat
 
 *(Optional extra decode test)*: test `--strata-args ... --skip-weight 0.03` on coding prompts to see if skipping tiny
 cold CPU experts adds +15–30% decode with no quality drop.
+
+**Result — measured, and the premise is half wrong.**
+
+`UD-IQ4_XS` **cannot load**, so the model half of Step 2 is blocked:
+
+```
+strata-poly: the GGUF has no tensor blk.6.loop_msg_query.weight
+```
+
+The file on disk is the pinned 15,733,755,232 B `unsloth/Inkling-2-Mini-GGUF` quant, but it is an *older* conversion: its
+per-block loop tensors are named `loop_attn_{down,forget,gain}`, `loop_k_*`, `loop_v_*`, `loop_mlp_*` (12 a block), where
+`UD-Q4_K_XL` has `loop_{q,k,v,ffn}_ctrl_*` (12) plus `loop_msg_query` (13), and IQ4_XS has **no `msg` tensor at all**
+(734 vs 744 tensors, and the 146 names that differ are exactly those). Without `loop_msg_query` the looped core cannot compute
+its messages, so this is a converter difference, not a flag: IQ4_XS needs either a re-quantization from the Q4_K_XL source or
+`Inkling2` taught the older name scheme. Not attempted — it is a correctness change, not a benchmark.
+
+The flag half **was** measured, on `UD-Q4_K_XL` (same model as the baseline, so the delta is the flags alone),
+`--kv q8_0 --ram-experts-mib 10240`, one fresh server a row:
+
+| Flags | Prompt | Prefill | Decode | VRAM | Experts |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| baseline (`6,640 MiB` peak) | 8,198 | 165.0 | 10.1 | 6,640 MiB | 791 |
+| `--vram-reserve-mib 256` | 8,198 | **168.4** (+2.1%) | **10.1** (±0) | 6,896 MiB | **951** |
+| `--vram-reserve-mib 256` | 32,015 | **97.4** (+2.6%) | **9.1** (±0) | 6,896 MiB | **951** |
+| `--vram-pool --vram-reserve-mib 256` | 8,198 | **fails at 4,096 tokens** | — | — | 1,002 |
+
+So the **residency prediction is right** (791 → 951, +160 experts) and the **speed prediction is wrong**: +2% prefill and
+*no* decode change at either 8K or 32K. With a 10,240 MiB pinned RAM pool the experts come from RAM fast enough that
+more of them on the card buys nothing — the pool, not residency, is the decode path. Step 2 is therefore not the "biggest
+immediate decode win"; it is a ~2% prefill win and 256 MiB of VRAM.
+
+`--vram-pool` is **not usable here**: it claims 15,770 MiB of virtual VRAM and leaves the lazy KV arena nothing, so the
+first 4,096-token call dies with `no VRAM for the attention cache (2 MiB more)`. Do not pass it with a lazily growing KV.
 
 ### Step 3 — Optional (Cap at 30 min): Fixing the `blk 6` Fault in `read_layer_major()`
 Because `read_layer_major()` only measured **+9–13% prefill** (1.09–1.13×), do **not** spend more than ~30 minutes

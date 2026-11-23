@@ -218,7 +218,8 @@ def main() -> int:
     ap.add_argument("--ram-experts-mib", type=int, default=None,
                     help="explicit --ram-experts-mib for strata-poly (avoids the auto -1 unpinned flip on Q8_0)")
     ap.add_argument("--llama-args", nargs="*", default=[])
-    ap.add_argument("--strata-args", nargs="*", default=[])
+    # REMAINDER: the extra args are engine flags, so they start with -- and nargs="*" would refuse them
+    ap.add_argument("--strata-args", nargs=argparse.REMAINDER, default=[])
     a = ap.parse_args()
     out = Path(a.out)
     (out / "raw").mkdir(parents=True, exist_ok=True)
