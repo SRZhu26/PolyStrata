@@ -12,6 +12,11 @@ live on `inkling2-engine-local` (never push directly to `origin/main`).
 > `2a28df0f9b` or Unsloth `b12588-mix-c0c3de8`). For quick iteration on this RTX 5060 Laptop, use the focused
 > `--kv q8_0` test plan in Section 0 below.
 
+> **Speed, as measured on 2026-11-24:** prefill **345.4 / 328.3 / 247.4 tok/s** at 8K / 32K / 130.7K and decode
+> **10.0 / 9.7 / 6.3**. **§4b** decomposes what is left in both: ≈ 70% of a prefill is arithmetic at ≈ 4.4 TFLOPS and
+> ≈ 30% is experts moving over PCIe (so `--prompt-batch 2048` is a free 1.17×), while decode is bound by the ≈ 1.2–1.4 GB of
+> expert weights a token and not by a kernel. §4b.3 lists what has never been tried; §4b.5 orders the work.
+
 ---
 
 ## 0. Quick Test Plan — RTX 5060 Laptop (8 GB VRAM, 32 GB RAM Offloading, `--kv q8_0`)
@@ -869,26 +874,83 @@ The 128K target in point 4 (~8–15 min) was met at 8.8 min, and the 32K one (**
 the measurement is 23.6 s. Attention was therefore a larger share of prefill than the fit said at every length, and the 128K
 quadratic wall is now gone rather than merely shortened: 247.4 tok/s at 130.7K is 7× the old figure and within 1.35× of the 32K one.
 
-**Where the remaining time goes, and the first free win (`tools/ink_prefill_probe.py`).** `--prompt-batch` separates the
-two candidates for what is left, because a per-chunk copy of the experts is amortized over more tokens by a wider batch and
-arithmetic is not. One prompt, four generated tokens, one fresh server per cell:
+### Step 4b — The Measured Headroom After the MMA Kernel (2026-11-24)
 
-| `--prompt-batch` | 8K prefill tok/s | ms/token | 32K prefill tok/s |
-| ---: | ---: | ---: | ---: |
-| 512 | 246.1 | 4.06 | — |
-| 1,024 (default) | 298.1 / 322.2 | 3.36 / 3.10 | 328.3 |
-| 2,048 | **378.2** | **2.64** | **389.3** |
-| 4,096 (the flag's maximum) | 352.1 | 2.84 | — |
+Where the two phases stand after Step 4, and what is left in each. Measured on the laptop, one fresh server a cell,
+`--kv q8_0 --ram-experts-mib 10240`, the same prompt set as §4.6; the byte counts in §4b.4 are arithmetic from §1.3's shapes and
+are labelled as such.
 
-`t(b) = 2.17 ms of arithmetic + 0.95 ms × (1024 / b) of expert movement` fits the 512 and 2,048 cells and predicts the
-1,024 cell at 3.12 ms (measured 3.10). So ≈ 30% of an 8K prefill at the default batch is the experts moving over PCIe and 70%
-is arithmetic, and **`--prompt-batch 2048` is a free 1.17× at 8K and 1.19× at 32K** (VRAM unchanged, 6,638 MiB). 4,096 is
-slower and 8,192 is rejected at startup, so 2,048 is the ceiling of this knob.
+| Phase | 8,198 tokens | 32,015 | 130,715 |
+| --- | ---: | ---: | ---: |
+| Prefill tok/s (before Step 4 → after) | 165.0 → **345.4** | 94.9 → **328.3** | 35.5 → **247.4** |
+| Decode tok/s | 10.0 | 9.7 | 6.3 |
 
-The arithmetic left is the MoE and dense GEMMs at ≈ 4.4 TFLOPS effective (≈ 9.6 GFLOPs a token from §1.3's shapes, 6.1 of
-them routed experts), which is now the largest prefill item. Decode is at a different wall entirely: ≈ 1.2 GB of non-resident expert
-weights plus 0.64 GB of dense weights a token against 10 tok/s is ≈ 18 GB/s, the PCIe 4.0 x8 ceiling, so only fewer bytes a token
-(DSpark) or more resident experts can move it.
+#### 4b.1 `--prompt-batch` separates arithmetic from expert movement — and buys 1.17× for free
+
+A per-chunk copy of the experts is amortized over more tokens by a wider prompt batch; arithmetic is not. That makes one flag a
+test for what the remaining 23.6 s of an 8K prefill is made of (`tools/ink_prefill_probe.py`: one prompt, four generated tokens,
+one fresh server per cell, only `--prompt-batch` changed):
+
+| `--prompt-batch` | 8K prefill tok/s | ms/token | 32K prefill tok/s | VRAM peak |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 246.1 | 4.06 | — | 6,638 MiB |
+| 1,024 (default) | 298.1 / 322.2 | 3.36 / 3.10 | 328.3 | 6,638 MiB |
+| 2,048 | **378.2** | **2.64** | **389.3** | 6,638 MiB |
+| 4,096 (the flag's maximum) | 352.1 | 2.84 | — | 6,636 MiB |
+
+`t(b) = 2.17 ms of arithmetic + 0.95 ms × (1024 / b) of expert movement` fits the 512 and 2,048 cells to 0.5% and predicts
+the 1,024 cell at 3.12 ms, which a repeat measured at 3.10. So at the default batch **≈ 70% of an 8K prefill is arithmetic and
+≈ 30% is the experts moving over PCIe**, and the movement halves each time the batch doubles.
+
+**Adopt `--prompt-batch 2048`: 1.17× at 8K and 1.19× at 32K, VRAM unchanged.** 4,096 is the flag's maximum and is *slower*
+(2.84 ms), because the scratch it takes comes out of the expert cache; 8,192 is refused at startup (`a prompt batch is 1 to 4096
+tokens`). The probe's own 1,024 cell measured 298.1 and 322.2 on two runs, so this laptop's run-to-run spread is ±7%: the 1.17× is
+outside it, but every absolute figure here and in §4.6 should be read as ±10%.
+
+#### 4b.2 The 70% that is arithmetic: the expert GEMM at ≈ 4.4 TFLOPS
+
+The pass needs ≈ 9.6 GFLOPs a token from §1.3's shapes — 6.1 routed experts (48 logical layers × 8 experts ×
+(2304×2304 + 1152×2304) MACs), 2.6 dense attention projections, 0.9 the 201k-row head — and the arithmetic half of the prefill is
+2.17 ms a token, so the GEMMs run at **≈ 4.4 TFLOPS effective**, a few percent of what the card's int8 tensor cores can do. The
+cause is structural, not a missing kernel: `mmq` is already the path (`Engine::moe`, `mmq_->mul`), but at a 2,048-token call each of a
+layer's 128 experts gets ≈ 128 rows, which is one MMA tile tall at best, and the 128 experts are 128 separate matrices, so the call is
+128 small GEMMs with no reuse between them and each expert's weights are read once per call whatever the row count. Raising that is the
+largest prefill item left, worth an estimated **1.5–2×** if it reaches even a third of the card's tensor throughput; a grouped GEMM over
+the experts a call routes to (sorted by expert, one slab of pointers) is the shape of the fix, and it is kernel work, not a flag.
+
+#### 4b.3 Never tried at all
+
+- **int8 MMA in the attention kernel.** The Q8 KV path dequantizes K and V tiles to fp16 before `mma.m16n8k16`; `mma.m16n8k32.s8`
+  would halve the 69,632 B of shared memory and double the tensor throughput on the K half. Never attempted.
+- **K/V tile reuse across a kv head's 3 query heads.** The kernel takes one head and 64 rows, so the same K/V tile is loaded three
+  times per kv head; a block owning the kv head and its three query heads would cut that traffic 3×.
+- **`Bc = 128` key tiles and a deeper `cp.async` pipeline** than the current two stages: fewer online-softmax rescales, more latency hidden.
+- **Decode attention.** A step is one row, below `INK_MMA_MIN = 32`, so it keeps the scalar and Split-K kernels; the split count
+  (`kAttnSplits = 16`, `kAttnSplitMin = 2048`) has not been re-tuned since the prefill kernel changed.
+- **Continuous batching.** `--batch` has never been measured above one session. Two sessions share one weight read, which is the same
+  multiplier as a drafter without the drafter.
+- **`UD-Q3_K_XL`.** 13.63 GB against 15.73 GB is 15% fewer bytes a token; decode is byte-bound (§4b.4), so that is close to linear.
+  Never measured end to end on this engine.
+- **Step 5** (pass-aware CUDA graphs, +20–30% decode) and **Step 7** (DSpark, 2–2.8× decode) are still unimplemented.
+
+#### 4b.4 Decode is bound by bytes a token, not by a kernel
+
+791 of 3,072 physical experts are resident, so of the 8 a logical layer routes ≈ 5.9 are outside VRAM at ≈ 4.5–5.8 MB each
+(`ffn_gate_up_exps` + `ffn_down_exps`, NVFP4/Q8_0 on `UD-Q4_K_XL`): **≈ 1.2–1.4 GB of expert weights a token** over 48 logical
+layers. At 10 tok/s that is ≈ 12–14 GB/s of host→device traffic — about half of what this card's PCIe 5.0 ×8 link can do
+(`nvidia-smi` reports gen 5, width 8) — and the same bytes are what the 16 CPU threads compute for their share of the offloaded experts
+(`--cpu-share`, default "as the times say"). **Which of the two binds is unmeasured** and is the first thing to settle: `--cpu-share 0`
+(all copied) against `--cpu-share 1` (all on the CPU) on the same binary. Either way the cost scales with bytes a token, so the fixes are
+DSpark (3 tokens a pass), more resident experts, or a smaller quant — not a faster kernel, and not the launch gaps that CUDA graphs remove.
+
+#### 4b.5 Order of work
+
+1. **`--prompt-batch 2048`** — free, measured, 1.17× / 1.19×. Done, `d26d77a1`.
+2. **Step 7, DSpark** — 2–2.8× on decode, which is where the engine is slowest (10 tok/s against 345 prefill), and the GGUF is on disk.
+3. **`--cpu-share` / `--expert-swaps` sweep on decode** — cheap, and it says whether §4b.4's wall is the copy or the CPU threads.
+4. **Step 5, pass-aware CUDA graphs** — +20–30% decode, independent of the wall.
+5. **Grouped expert GEMM** — the 1.5–2× prefill item in §4b.2, the most work of anything left.
+6. **Attention second order** (§4b.3) — 1.1–1.3× at 32K and above, after the above.
 
 
 ### Step 5 — Pass-Aware CUDA Graphs (`L.fixed = true`) + Graph Invalidation (+20–30% Decode)

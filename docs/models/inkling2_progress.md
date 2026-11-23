@@ -19,7 +19,7 @@ Companion documents: [inkling2.md](inkling2.md) (architecture and measured resul
 | --- | --- | --- |
 | `main` | `8d812d5c` | untouched |
 | `add-inkling2-mini` (PR head) | `59f21100` | untouched — the PR to `main` is unaffected by this work |
-| `inkling2-engine-local` | `d5a21a41` (merge), engine `122cc988`; then the tensor-core attention (§4.6) | **this work**, pushed to `origin` as its own branch |
+| `inkling2-engine-local` | `d26d77a1` — engine `0b1d7dd4`; docs `2d61bfda`, `5c214d73`, `d26d77a1` | **this work**: tensor-core attention (§4.6) and the prompt-batch probe (§4.7), pushed to `origin` as its own branch |
 | `inkling2-layer-major-wip` | `4a39c701` | the layer-major read, solved at 1.01× and off (§3.1) |
 
 `origin` is `https://github.com/SRZhu26/PolyStrata.git`, the user's own repository; there is no second remote. The engine
@@ -311,9 +311,11 @@ The arithmetic that is left is not a kernel to swap in: it is the MoE and dense 
 needs ≈ 9.6 GFLOPs a token from the shapes in the plan's §1.3, 6.1 of them routed experts at top-8 of 128). That is the next
 prefill item, and it is worth more than attention was before the MMA kernel.
 
-Decode is untouched by all of this, and it is at a different wall: with 791 of 3,072 physical experts resident, a token reads ≈ 1.2 GB
-of non-resident experts plus ≈ 0.64 GB of dense weights, and 10 tok/s is ≈ 18 GB/s — the PCIe 4.0 x8 ceiling of a laptop card. So
-decode cannot be fixed by a faster kernel; only by reading fewer bytes a token (DSpark, Step 7) or holding more experts.
+Decode is untouched by all of this and is bound by bytes a token rather than by a kernel: with 791 of 3,072 physical experts resident, ≈ 5.9
+of the 8 experts a logical layer routes are outside VRAM at ≈ 4.5–5.8 MB each, so a token moves **≈ 1.2–1.4 GB** of expert weights over 48
+logical layers. At 10 tok/s that is ≈ 12–14 GB/s — about half of the card's PCIe 5.0 ×8 link, and the same bytes are what the 16 CPU
+threads compute for their share of the offloaded experts. Which of the two binds is unmeasured; either way the fixes are DSpark, more resident
+experts or a smaller quant, not a faster kernel. The plan's §4b has the full list of what has never been tried and the order of work.
 
 ---
 
@@ -506,24 +508,34 @@ the same VRAM, which is exactly the pressure under which the corruption appears.
 
 ## 11. Next actions, in priority order
 
+Re-ordered on 2026-11-24 by the decomposition in §4.7: prefill's arithmetic is the largest remaining prefill item, decode is bound by
+bytes a token, and two of the earlier entries are closed.
+
 1. ~~**Run the end-to-end cosine gate**~~ — **done.** `STRATA_DUMP_BIN` + `tools/dump_cos.py` against `tools/ref_core.py`
    reads `blk.6` 0.999988758, `blk.23` 0.999988499 and the logits 0.999763105 against a 0.999 gate. It was never
    blocked on weights: `UD-Q4_K_XL` contains no `Q4_K` tensors, only `Q8_0`/`F32`/`BF16`/`NVFP4`.
-2. **Fix the `blk 6` fault in `read_layer_major()`** (§3.1). The staging is written and kept on branch
-   `inkling2-layer-major-wip`, but it diverges from the call-at-a-time read at the core entry, so it is off. It is worth
-   1.09–1.13× on prefill — fix it only if that is the cheapest available win.
-3. **Make the Q8_0 attention kernel pay for itself or drop it.** It is 6–13% slower than FP16 and buys 38 resident
-   experts below 32K. Either an `__dp4a` integer dot with the per-32-block scales (as `quantize.cpp`'s dot does) or keep
-   FP16 as the default and select Q8_0 only for `--kv-whole` at 128K, where it keeps 405 experts instead of 0.
-4. **Fix the RAM heuristic** (§8.2) so a VRAM win cannot silently cost the prefetch pool.
-5. **Measure coherence and needle recall above 32K.** Coherence is proven to 10.3K on controlled prompts (§8.1) and the
-   prefill is now measured at 32K and 128K (§4), but needle recall at 32K/64K/128K is still unrun.
-6. **Close the CUDA-graph invalidation gap** in `shrink_cache()` / `resize_card_cache()` before `L.card` ever becomes 1.
-7. **Re-define the speed gate** against something that exists, since the `llama.cpp` comparison is undefined (§6).
-8. **A tensor-core MMA prefill attention** (§7.5 of the plan): `ink_attend_rel` is still scalar FP32 `Q·K` and `P·V` at
-   `rows >= 64`, which is what leaves the prefill at ≈ 95 tok/s at 32K.
-9. Decide whether the `STRATA_MMQ_LOG` and `STRATA_GROW_LOG` probes stay. Both are `getenv`-gated and off by default, so
-   they are inert in normal use.
+2. ~~**Tensor-core MMA prefill attention**~~ — **done** (`0b1d7dd4`, §4.6): 2.10× at 8K, 3.46× at 32K, 6.97× at 130.7K.
+3. ~~**Fix the `blk 6` fault in `read_layer_major()`**~~ — **closed at 1.01×**, so it stays off (§3.1).
+4. ~~**Raise the prompt batch**~~ — **done and measured** (§4.7): `--prompt-batch 2048` is 1.17× at 8K and 1.19× at 32K with no VRAM
+   cost. Put it in the daily-drive config; 4,096 is slower and 8,192 is refused.
+5. **Settle what decode's ≈ 1.2–1.4 GB a token is bound by** (§4.7): `--cpu-share 0` (everything copied) against `--cpu-share 1`
+   (everything on the CPU) on one binary says whether the PCIe copy or the 16 CPU threads set the 10 tok/s. It is the cheapest measurement
+   left and it decides whether Step 7 or Step 5 is worth more.
+6. **Step 7, DSpark speculative decoding** — 2–2.8× on decode, the largest win left, and the drafter is on disk and SHA-verified.
+7. **Step 5, pass-aware CUDA graphs** — +20–30% on decode, independent of the byte wall.
+8. **Grouped expert GEMM** — the 1.5–2× prefill item in plan §4b.2: a 2,048-token call gives each of a layer's 128 experts ≈ 128 rows,
+   so the call is 128 small GEMMs at ≈ 4.4 TFLOPS effective.
+9. **Make the Q8_0 attention kernel pay for itself or drop it.** It is 6–13% slower than FP16 and buys 38 resident experts below 32K.
+   `__dp4a` on the per-32-block scales (as `quantize.cpp`'s dot does) is the untried half of this.
+10. **Attention, second order** (plan §4b.3): `mma.m16n8k32.s8` for the Q8 KV path, K/V tile reuse across a kv head's three query heads,
+    and `Bc = 128` key tiles. Worth an estimated 1.1–1.3× at 32K and above.
+11. **Fix the RAM heuristic** (§8.2) so a VRAM win cannot silently cost the prefetch pool.
+12. **Measure coherence and needle recall above 32K.** Coherence is proven to 10.3K on controlled prompts (§8.1) and the prefill is
+    measured at 32K and 128K (§4), but needle recall at 32K/64K/128K is still unrun.
+13. **Close the CUDA-graph invalidation gap** in `shrink_cache()` / `resize_card_cache()` before `L.card` ever becomes 1.
+14. **Re-define the speed gate** against something that exists, since the `llama.cpp` comparison is undefined (§6).
+15. Decide whether the `STRATA_MMQ_LOG` and `STRATA_GROW_LOG` probes stay. Both are `getenv`-gated and off by default, so
+    they are inert in normal use.
 
 ---
 

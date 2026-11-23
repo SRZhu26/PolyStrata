@@ -100,6 +100,12 @@ same GGUF.
 
 ## Measured results (RTX 5060 Laptop, `UD-Q4_K_XL` 17.6 GB, FP16 KV, streaming experts)
 
+> **These are the bring-up figures, before the tensor-core prefill kernel and before `--prompt-batch 2048`.** Current, on the
+> same machine with `--kv q8_0`: **prefill 345.4 / 328.3 / 247.4 tok/s at 8,198 / 32,015 / 130,715 tokens** and decode
+> 10.0 / 9.7 / 6.3 tok/s (progress §4.6, `0b1d7dd4`), rising to **378.2 at 8K and 389.3 at 32K** with `--prompt-batch 2048`
+> (progress §4.7). The table below is kept as the pre-kernel baseline it is; [inkling2_plan.md](inkling2_plan.md) §4b has the
+> measured decomposition of what is left and the ranked list of what has never been tried.
+
 | Prompt | Prefill tok/s | Decode tok/s | VRAM peak | RSS peak |
 | --- | ---: | ---: | ---: | ---: |
 | 8,198 | 71.7 | 5.0 | 7,498 MiB | 11.53 GiB |
