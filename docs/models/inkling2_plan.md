@@ -1126,3 +1126,88 @@ must live on the same devices as the target.
 **Integration points that already exist** (so the port is the forward pass, not the plumbing): `opt_.draft_model` /
 `dg_` (`engine.cpp:2678`), `drafts()`, `guesses_at_once()` (`engine.hpp:313-315`, the block-at-once path DSpark wants),
 `draft_step()` (`engine.hpp:418`), and `window()` / `keep()` / `snap_` which already roll back a rejected block.
+
+---
+
+## 9. Decode Sprint Plan (10 tok/s → 35–55+ tok/s on RTX 5060 Laptop)
+
+Prefill is already fast (**378–389 tok/s** at 8K/32K, **247 tok/s** at 128K with `--prompt-batch 2048`). Decode
+(**10.0 / 9.7 / 6.3 tok/s** at 8K / 32K / 128K) is now the sole bottleneck, with four untapped multipliers. Execute
+these four sprints in exact order:
+
+### Sprint 1 — Zero-Code Decode Diagnosis & Warm-Profile Sweep (~15 min)
+1. **Settle PCIe copy vs CPU thread wall (`--cpu-share` sweep on 8K Q8_0)**:
+   ```powershell
+   python tools/bench_128k_local.py --out bench/cpushare-0    --models m=<gguf> --engines strata `
+     --prompt bench/prompt-8k-inkling2.txt --context 8192 --kv q8_0 --ram-experts-mib 10240 --gen 256 `
+     --strata-args --prompt-batch 2048 --vram-reserve-mib 256 --cpu-share 0
+   python tools/bench_128k_local.py --out bench/cpushare-1    --models m=<gguf> --engines strata `
+     --prompt bench/prompt-8k-inkling2.txt --context 8192 --kv q8_0 --ram-experts-mib 10240 --gen 256 `
+     --strata-args --prompt-batch 2048 --vram-reserve-mib 256 --cpu-share 1
+   python tools/bench_128k_local.py --out bench/cpushare-auto --models m=<gguf> --engines strata `
+     --prompt bench/prompt-8k-inkling2.txt --context 8192 --kv q8_0 --ram-experts-mib 10240 --gen 256 `
+     --strata-args --prompt-batch 2048 --vram-reserve-mib 256
+   ```
+2. **Test `UD-IQ4_XS` (15.73 GB, 0 swap) + warm `--expert-profile` + `--vram-reserve-mib 256 --vram-pool`**:
+   ```powershell
+   # Download UD-IQ4_XS if not already on disk:
+   python setup.py --family inkling2 --model UD-IQ4_XS --vision no --yes --no-start
+
+   # Pass 1: warm-up & record coding routing profile (creates bench/inkling2-code.profile):
+   python tools/bench_128k_local.py --out bench/iq4xs-8k-warm --models iq4xs=<UD-IQ4_XS.gguf> --engines strata `
+     --prompt bench/prompt-8k-inkling2.txt --context 8192 --kv q8_0 --ram-experts-mib 10240 --gen 256 `
+     --strata-args --prompt-batch 2048 --vram-reserve-mib 256 --vram-pool --expert-profile bench/inkling2-code.profile
+
+   # Pass 2: measure 8K, 32K, and 128K with the warm profile + reclaimed VRAM:
+   python tools/bench_128k_local.py --out bench/iq4xs-8k-prof   --models iq4xs=<UD-IQ4_XS.gguf> --engines strata `
+     --prompt bench/prompt-8k-inkling2.txt   --context 8192   --kv q8_0 --ram-experts-mib 10240 --gen 256 `
+     --strata-args --prompt-batch 2048 --vram-reserve-mib 256 --vram-pool --expert-profile bench/inkling2-code.profile
+   python tools/bench_128k_local.py --out bench/iq4xs-32k-prof  --models iq4xs=<UD-IQ4_XS.gguf> --engines strata `
+     --prompt bench/prompt-32k-inkling2.txt  --context 32768  --kv q8_0 --ram-experts-mib 10240 --gen 256 `
+     --strata-args --prompt-batch 2048 --vram-reserve-mib 256 --vram-pool --expert-profile bench/inkling2-code.profile
+   python tools/bench_128k_local.py --out bench/iq4xs-128k-prof --models iq4xs=<UD-IQ4_XS.gguf> --engines strata `
+     --prompt bench/prompt-128k-inkling2.txt --context 131072 --kv q8_0 --ram-experts-mib 10240 --gen 256 `
+     --strata-args --prompt-batch 2048 --vram-reserve-mib 256 --vram-pool --expert-profile bench/inkling2-code.profile
+   ```
+   - Optional: test `--skip-weight 0.03` on the 8K/32K run and check output quality + decode gain.
+   - **Target**: **15–22 tok/s** at 8K/32K, **0.0 GiB swap**, **~1,050–1,200 resident experts**.
+
+### Sprint 2 — Pass-Aware CUDA Graphs (`L.fixed = true`) + Graph Invalidation (Step 5)
+1. **Close defect §8.3** in `src/poly/engine.cpp`: destroy recorded `cudaGraphExec_t` handles (`passes_`, `tail_`, and
+   every `Layer`'s `heads`, `tail`, `shared`, `card_moe`, `rows_heads`) inside `shrink_cache()` and
+   `resize_card_cache()` on CUDA (mirroring Metal).
+2. Add `virtual int tail_key() const { return 0; }` to `Engine` (`engine.hpp`/`engine.cpp`), indexing `L.tail` /
+   `L.shared` / `L.card_moe` by `(size_t) tail_key() * recs + rec` (default `0` leaves all other models byte-identical).
+3. In `Inkling2`: override `tail_key()` → `steps_[cur_step_].pass`, combine `head_key()` with `room_key(n)` on global
+   layers as `pass * (max_room_key + 1) + room_key(n)`, and set `L.fixed = true`.
+4. **Verify**: exact greedy match with graphs on vs `--no-graphs`, then re-measure 8K/32K/128K decode (+20–30%,
+   targeting **18–25 tok/s** without DSpark).
+
+### Sprint 3 — DSpark Block-Diffusion Drafter (Step 7 — Biggest 2.0–2.8× Decode Multiplier)
+Target file: **`dspark-Inkling-2-Mini-BF16-mainline.gguf`** (749 MB, 58 tensors, `has_markov_context = True`,
+`markov_w2 [256, 200058]`, 7 per-position `mask_embd [2304, 7]`, `joint_proj [5120, 768]`; pair with
+`--vram-reserve-mib 256` to offset its 749 MB VRAM footprint).
+1. **Capture tapped target states** in `Inkling2`: save hidden states at logical steps `[5, 23, 41, 48]` into a small
+   device scratch buffer (`4 × rows_ × 2304` floats).
+2. **Load drafter from `dg_`** (`--draft-model`): load the 3 dense RoPE+SwiGLU layers (`blk.0..2`), per-block
+   `ctx_mix`/`ctx_norm` and `attn_{k,v}_ctx`/`attn_k_ctx_norm`, `mask_embd [2304, 7]`, `joint_proj [5120, 768]`,
+   `markov_ctx_mix`/`markov_ctx_norm`, `markov_w1`, `markov_w2 [256, 200058]` + bias; borrow target's `token_embd`
+   and `lm_head` (`final_logit_softcapping = 30.0`, mask 966 padding rows).
+3. **Wire block-at-once drafting**: implement the 8-slot non-causal forward pass (`slot 0` = anchor, `slots 1..7` =
+   drafted tokens) + rank-256 Markov RNN head in `Inkling2::draft_step()` / `guesses_at_once()` (`engine.hpp:313-315,
+   418`), relying on `Engine::window()` / `keep()` / `snap_` for verification and conv-state rollback.
+4. **Verify**:
+   - Greedy decoding (`--temp 0`) with `--draft-model` (`--window 4` / `--window 8`) must be **byte-identical** to
+     `--no-draft`.
+   - Record acceptance rate and effective decode tok/s at 8K / 32K / 128K (**target: 35–55+ tok/s** at 8K/32K,
+     **20–35 tok/s** at 128K).
+
+### Sprint 4 — Agentic Coding Correctness Gates (Before Daily-Driving)
+1. **Long-context needle recall**:
+   ```powershell
+   python tools/needle_bench.py --url http://127.0.0.1:8080 --lengths 32k,64k,128k --depths 10,50,90 --out bench/inkling2_needle.json
+   ```
+2. **Tokenizer byte-for-byte parity**: compare `tools/strata_tokenizer.py` on 20 mixed coding strings against
+   `AutoTokenizer.from_pretrained("thinkingmachines/Inkling-2-Mini")`.
+3. **Tool-call & reasoning tests**: add tests in `serve/test_models.py` confirming `<|content_thinking|>` →
+   `reasoning_content` and `<|content_invoke_tool_json|>` → OpenAI `tool_calls`.
